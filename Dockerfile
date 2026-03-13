@@ -120,7 +120,6 @@ RUN set -eux; \
 
 COPY src/*.ts ./src/
 COPY tsconfig.json ./tsconfig.json
-COPY local-mcp-relay.config.json ./local-mcp-relay.config.json
 
 ENV NODE_ENV=production
 ENV CODEX_HOME=/root/.codex

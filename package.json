@@ -4,9 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --import tsx src/agent.ts",
-    "relay:mcp": "node --import tsx src/local-mcp-relay.ts",
-    "relay:mcp:local": "node --import tsx src/local-mcp-relay.ts"
+    "start": "node --import tsx src/agent.ts"
   },
   "dependencies": {
     "@openai/codex-sdk": "^0.104.0",

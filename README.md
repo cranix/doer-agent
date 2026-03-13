@@ -1,6 +1,6 @@
 # doer-agent
 
-`agent/`는 doer의 리버스 폴링 에이전트 및 로컬 MCP 릴레이를 위한 독립 실행 디렉토리입니다.
+`agent/`는 doer의 리버스 폴링 에이전트를 위한 독립 실행 디렉토리입니다.
 
 ## 준비
 
@@ -55,39 +55,3 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/tasks' \
 ```
 
 - 컨테이너 내부에서 `docker` 명령이 필요하면 Docker socket 마운트가 필요합니다.
-
-## 로컬 MCP 릴레이 실행
-
-1. 릴레이 시크릿 발급:
-
-```bash
-curl -X POST 'http://localhost:2020/api/users/<userId>/mcp-relay/secret' \
-  -H 'Content-Type: application/json' \
-  --cookie 'doer_session=<session-cookie>' \
-  -d '{"label":"my-mcp-relay"}'
-```
-
-2. 로컬 config 파일 작성 (`local-mcp-relay.config.json`):
-
-```json
-{
-  "servers": [
-    {
-      "serverKey": "playwright",
-      "name": "Playwright MCP",
-      "command": "npx",
-      "args": ["-y", "@playwright/mcp"]
-    }
-  ]
-}
-```
-
-3. 릴레이 실행:
-
-```bash
-npm run relay:mcp -- --server http://localhost:2020 --user-id <userId> --relay-secret <SECRET> --config ./local-mcp-relay.config.json
-```
-
-4. doer MCP tool 호출 시 동적 툴 이름:
-
-- `local_<serverKey>__<toolName>`
