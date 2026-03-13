@@ -9,7 +9,6 @@ interface PollResponse {
     id: string;
     command: string;
     cwd: string | null;
-    timeoutMs: number | null;
     cancelRequested: boolean;
   } | null;
   error?: string;
@@ -826,7 +825,6 @@ async function runTask(args: {
   taskId: string;
   command: string;
   cwd: string | null;
-  timeoutMs: number | null;
   userId: string;
   agentToken: string;
   pendingEventQueuePath: string;
@@ -881,7 +879,6 @@ async function runTask(args: {
       startedAt: formatLocalTimestamp(),
       command: args.command,
       cwd: args.cwd,
-      timeoutMs: args.timeoutMs,
       shell: shellPath,
       ...(runtimeConfig?.meta ?? { runtimeConfigSynced: false }),
       ...(codexAuth?.meta ?? { codexAuthSynced: false }),
@@ -892,8 +889,7 @@ async function runTask(args: {
   });
 
   try {
-    let terminationReason: "cancel" | "timeout" | null = null;
-    let timeoutKillTimer: NodeJS.Timeout | null = null;
+    let terminationReason: "cancel" | null = null;
     let cancelStage1Timer: NodeJS.Timeout | null = null;
     let cancelStage2Timer: NodeJS.Timeout | null = null;
     let stopCancelPolling = false;
@@ -948,21 +944,6 @@ async function runTask(args: {
       });
     });
 
-    const hardTimeout =
-      typeof args.timeoutMs === "number" && Number.isFinite(args.timeoutMs) && args.timeoutMs > 0 ? args.timeoutMs : null;
-    const timeoutHandle =
-      hardTimeout !== null
-        ? setTimeout(() => {
-            terminationReason = terminationReason ?? "timeout";
-            sendSignalToTaskProcess(child, "SIGTERM");
-            timeoutKillTimer = setTimeout(() => {
-              sendSignalToTaskProcess(child, "SIGKILL");
-            }, 2000);
-            timeoutKillTimer.unref?.();
-          }, hardTimeout)
-        : null;
-    timeoutHandle?.unref?.();
-
     const cancelPoller = (async () => {
       while (!stopCancelPolling) {
         await sleep(1500);
@@ -1000,12 +981,6 @@ async function runTask(args: {
       });
     }).finally(() => {
       stopCancelPolling = true;
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-      }
-      if (timeoutKillTimer) {
-        clearTimeout(timeoutKillTimer);
-      }
       if (cancelStage1Timer) {
         clearTimeout(cancelStage1Timer);
       }
@@ -1035,9 +1010,7 @@ async function runTask(args: {
       finishedAt: formatLocalTimestamp(),
       error:
         status === "failed"
-          ? terminationReason === "timeout"
-            ? `Command timed out after ${hardTimeout ?? "unknown"}ms`
-            : `Command exited with code ${result.code ?? "null"}`
+          ? `Command exited with code ${result.code ?? "null"}`
           : null,
     } satisfies Record<string, unknown>;
     await recordAgentEvent({
@@ -1122,7 +1095,6 @@ async function main() {
         taskId: task.id,
         command: task.command,
         cwd: task.cwd,
-        timeoutMs: task.timeoutMs,
         userId,
         agentToken,
         pendingEventQueuePath,
