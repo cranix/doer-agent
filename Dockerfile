@@ -41,6 +41,9 @@ RUN apt-get update && \
   wget \
   xdg-utils \
   fonts-noto-color-emoji \
+  fonts-noto-cjk \
+  fonts-nanum \
+  fontconfig \
   libnspr4 \
   libnss3 \
   libatk1.0-0 \
