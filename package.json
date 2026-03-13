@@ -1,0 +1,21 @@
+{
+  "name": "doer-agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx src/agent.ts",
+    "relay:mcp": "node --import tsx src/local-mcp-relay.ts",
+    "relay:mcp:local": "node --import tsx src/local-mcp-relay.ts"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "^0.104.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@playwright/mcp": "0.0.68"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}

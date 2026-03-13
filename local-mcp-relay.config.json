@@ -1,0 +1,10 @@
+{
+  "servers": [
+    {
+      "serverKey": "playwright",
+      "name": "Playwright MCP",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp"]
+    }
+  ]
+}
