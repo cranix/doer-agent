@@ -37,13 +37,13 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/secret' \
 npm run start -- --server http://localhost:2020 --user-id <userId> --agent-secret <SECRET>
 ```
 
-3. 원격 명령 전송:
+3. 원격 Codex 실행 전송:
 
 ```bash
-curl -X POST 'http://localhost:2020/api/users/<userId>/agent/tasks' \
+curl -X POST 'http://localhost:2020/api/users/<userId>/agent/codex-tasks' \
   -H 'Content-Type: application/json' \
   --cookie 'doer_session=<session-cookie>' \
-  -d '{"agentId":"agent_...","command":"pwd && ls -la"}'
+  -d '{"agentId":"agent_...","prompt":"현재 작업 디렉토리와 파일 목록을 요약해줘"}'
 ```
 
 ## Docker 실행
