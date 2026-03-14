@@ -14,6 +14,11 @@ interface PollResponse {
   error?: string;
 }
 
+interface SseEnvelope {
+  event: string;
+  data: string;
+}
+
 type AgentEventType = "stdout" | "stderr" | "status" | "meta";
 
 interface PendingAgentEvent {
@@ -585,6 +590,177 @@ function resolvePollWaitMs(): number {
   return 5000;
 }
 
+function buildAgentStreamUrl(args: {
+  serverBaseUrl: string;
+  userId: string;
+  agentToken: string;
+  waitMs: number;
+}): string {
+  const url = new URL("/api/agent/stream", `${args.serverBaseUrl}/`);
+  url.searchParams.set("userId", args.userId);
+  url.searchParams.set("agentToken", args.agentToken);
+  url.searchParams.set("waitMs", String(args.waitMs));
+  return url.toString();
+}
+
+async function consumeTaskStream(args: {
+  serverBaseUrl: string;
+  userId: string;
+  agentToken: string;
+  waitMs: number;
+  onOpen?: () => void;
+  onTask: (task: NonNullable<PollResponse["task"]>) => Promise<void>;
+}): Promise<void> {
+  const streamUrl = buildAgentStreamUrl({
+    serverBaseUrl: args.serverBaseUrl,
+    userId: args.userId,
+    agentToken: args.agentToken,
+    waitMs: args.waitMs,
+  });
+
+  const res = await fetch(streamUrl, {
+    method: "GET",
+    headers: {
+      Accept: "text/event-stream",
+      "Cache-Control": "no-cache",
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let message = `HTTP ${res.status}`;
+    if (text) {
+      try {
+        const parsed = JSON.parse(text) as { error?: unknown };
+        if (typeof parsed.error === "string" && parsed.error.trim()) {
+          message = parsed.error.trim();
+        }
+      } catch {
+        // no-op
+      }
+    }
+    throw new Error(message);
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    throw new Error("SSE response body is unavailable");
+  }
+
+  args.onOpen?.();
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventName = "message";
+  const dataLines: string[] = [];
+
+  const handleEvent = async (event: SseEnvelope): Promise<void> => {
+    if (!event.data.trim()) {
+      return;
+    }
+    if (event.event === "keepalive") {
+      return;
+    }
+    if (event.event === "error") {
+      let message = event.data;
+      try {
+        const parsed = JSON.parse(event.data) as { error?: unknown };
+        if (typeof parsed.error === "string" && parsed.error.trim()) {
+          message = parsed.error.trim();
+        }
+      } catch {
+        // no-op
+      }
+      throw new Error(message || "SSE stream error");
+    }
+
+    if (event.event !== "task" && event.event !== "message") {
+      return;
+    }
+
+    let parsed: { task?: PollResponse["task"] } = {};
+    try {
+      parsed = JSON.parse(event.data) as { task?: PollResponse["task"] };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Invalid SSE payload: ${message}`);
+    }
+
+    const task = parsed.task;
+    if (task) {
+      await args.onTask(task);
+    }
+  };
+
+  const dispatchEvent = async (): Promise<void> => {
+    if (dataLines.length === 0) {
+      eventName = "message";
+      return;
+    }
+    const data = dataLines.join("\n");
+    const event = eventName || "message";
+    eventName = "message";
+    dataLines.length = 0;
+    await handleEvent({ event, data });
+  };
+
+  const processLine = async (line: string): Promise<void> => {
+    if (line === "") {
+      await dispatchEvent();
+      return;
+    }
+    if (line.startsWith(":")) {
+      return;
+    }
+
+    const separator = line.indexOf(":");
+    const field = separator < 0 ? line : line.slice(0, separator);
+    let value = separator < 0 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) {
+      value = value.slice(1);
+    }
+
+    if (field === "event") {
+      eventName = value || "message";
+      return;
+    }
+    if (field === "data") {
+      dataLines.push(value);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      buffer += decoder.decode();
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+
+    while (true) {
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex < 0) {
+        break;
+      }
+      let line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line.endsWith("\r")) {
+        line = line.slice(0, -1);
+      }
+      await processLine(line);
+    }
+  }
+
+  if (buffer.length > 0) {
+    const trailing = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+    if (trailing.length > 0) {
+      await processLine(trailing);
+    }
+  }
+
+  await dispatchEvent();
+  throw new Error("SSE stream closed by server");
+}
 function resolveShellPath(): string {
   if (process.platform === "win32") {
     return process.env.ComSpec || "cmd.exe";
@@ -1047,7 +1223,7 @@ async function main() {
   process.stdout.write(`\n[doer-agent]\n`);
   process.stdout.write(`- server: ${serverBaseUrl}\n`);
   process.stdout.write(`- userId: ${userId}\n`);
-  process.stdout.write(`\n- pollWaitMs: ${pollWaitMs}\n\n`);
+  process.stdout.write(`\n- streamWaitMs: ${pollWaitMs}\n\n`);
   if (requestedServerBaseUrl !== serverBaseUrl) {
     writeAgentInfo(
       `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
@@ -1064,71 +1240,70 @@ async function main() {
     agentToken,
   });
 
-  let isPollConnected = false;
+  let isStreamConnected = false;
   let hasConnectedBefore = false;
-  let consecutivePollErrors = 0;
+  let consecutiveStreamErrors = 0;
 
   while (true) {
     try {
-      const polled = await postJson<PollResponse>(`${serverBaseUrl}/api/agent/poll`, {
+      await consumeTaskStream({
+        serverBaseUrl,
         userId,
         agentToken,
         waitMs: pollWaitMs,
-      });
-      consecutivePollErrors = 0;
-      if (!isPollConnected) {
-        const statusText = hasConnectedBefore ? "reconnected" : "connected";
-        writeAgentInfo(
-          `${statusText} to server (poll ok) at=${formatLocalTimestamp()} userId=${userId} server=${serverBaseUrl}`,
-        );
-        hasConnectedBefore = true;
-      }
-      isPollConnected = true;
-      const task = polled.task;
-      if (!task) {
-        continue;
-      }
-
-      writeAgentInfo(`run task=${task.id} command=${task.command}`);
-      await runTask({
-        serverBaseUrl,
-        taskId: task.id,
-        command: task.command,
-        cwd: task.cwd,
-        userId,
-        agentToken,
-        pendingEventQueuePath,
-      }).catch(async (error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`task=${task.id} run failed: ${message}`);
-        const failPayload = {
-          status: "failed",
-          error: message,
-          finishedAt: formatLocalTimestamp(),
-        } satisfies Record<string, unknown>;
-        await recordAgentEvent({
-          queuePath: pendingEventQueuePath,
-          serverBaseUrl,
-          taskId: task.id,
-          userId,
-          type: "status",
-          seq: reserveNextEventSeq(task.id),
-          payload: failPayload,
-        });
+        onOpen: () => {
+          consecutiveStreamErrors = 0;
+          if (!isStreamConnected) {
+            const statusText = hasConnectedBefore ? "reconnected" : "connected";
+            writeAgentInfo(
+              `${statusText} to server (SSE ok) at=${formatLocalTimestamp()} userId=${userId} server=${serverBaseUrl}`,
+            );
+            hasConnectedBefore = true;
+          }
+          isStreamConnected = true;
+        },
+        onTask: async (task) => {
+          writeAgentInfo(`run task=${task.id} command=${task.command}`);
+          await runTask({
+            serverBaseUrl,
+            taskId: task.id,
+            command: task.command,
+            cwd: task.cwd,
+            userId,
+            agentToken,
+            pendingEventQueuePath,
+          }).catch(async (error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            writeAgentError(`task=${task.id} run failed: ${message}`);
+            const failPayload = {
+              status: "failed",
+              error: message,
+              finishedAt: formatLocalTimestamp(),
+            } satisfies Record<string, unknown>;
+            await recordAgentEvent({
+              queuePath: pendingEventQueuePath,
+              serverBaseUrl,
+              taskId: task.id,
+              userId,
+              type: "status",
+              seq: reserveNextEventSeq(task.id),
+              payload: failPayload,
+            });
+          });
+        },
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      consecutivePollErrors += 1;
-      if (isPollConnected) {
+      consecutiveStreamErrors += 1;
+      if (isStreamConnected) {
         writeAgentError(`disconnected from server at=${formatLocalTimestamp()} reason=${message}`);
       }
-      isPollConnected = false;
-      writeAgentError(`poll loop error: ${message} (retry in 2s, attempt=${consecutivePollErrors})`);
+      isStreamConnected = false;
+      writeAgentError(`stream loop error: ${message} (retry in 2s, attempt=${consecutiveStreamErrors})`);
       await sleep(2000);
     }
   }
 }
-
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   writeAgentError(`fatal: ${message}`);
