@@ -57,6 +57,7 @@ const PLAYWRIGHT_BROWSERS_PATH = "/ms-playwright";
 const PLAYWRIGHT_SKIP_BROWSER_GC = "1";
 const PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS_DEFAULT = 10800;
 const PLAYWRIGHT_MCP_DAEMON_SIGNATURE_VERSION = "2026-03-15";
+const DOER_MCP_PROXY_DEFAULT_PATH = "/app/.runtime/bin/doer-mcp-proxy";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 
@@ -105,13 +106,16 @@ function parseEnvInteger(value: string | undefined, fallback: number): number {
 }
 
 function resolvePlaywrightMcpProxyPath(): string {
-  const candidates = ["/doer/.runtime/bin/doer-mcp-proxy", "/workspace/bin/jail/doer-mcp-proxy"];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
+  const explicitProxyPath = pickFirstNonEmpty([process.env.DOER_MCP_PROXY_PATH]);
+  if (explicitProxyPath && existsSync(explicitProxyPath)) {
+    return explicitProxyPath;
   }
-  return "";
+  if (existsSync(DOER_MCP_PROXY_DEFAULT_PATH)) {
+    return DOER_MCP_PROXY_DEFAULT_PATH;
+  }
+  throw new Error(
+    `doer-mcp-proxy binary not found; set DOER_MCP_PROXY_PATH to an existing file or install ${DOER_MCP_PROXY_DEFAULT_PATH}`,
+  );
 }
 
 function resolvePlaywrightMcpDaemonStatePaths() {
@@ -1489,9 +1493,6 @@ async function main() {
       `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
     );
   }
-  process.stdout.write(
-    `시작 커맨드 예시: npm run start -- --server ${serverBaseUrl} --user-id ${userId} --agent-secret <SECRET>\n`,
-  );
 
   startPendingEventUploader({
     queuePath: pendingEventQueuePath,

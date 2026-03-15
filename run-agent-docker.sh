@@ -3,7 +3,7 @@ set -euo pipefail
 
 IMAGE_TAG="${DOER_AGENT_IMAGE_TAG:-doer-agent:latest}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AGENT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+AGENT_DIR="${SCRIPT_DIR}"
 WORKSPACE_DIR="$PWD"
 
 AGENT_ID=""
