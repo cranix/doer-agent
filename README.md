@@ -46,12 +46,89 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/codex-tasks' \
   -d '{"agentId":"agent_...","prompt":"현재 작업 디렉토리와 파일 목록을 요약해줘"}'
 ```
 
-## Docker 실행
+## Docker로 기본 실행
 
-`agent/` 디렉토리에서:
+기본 실행은 퍼블릭 이미지 `cranix/doer-agent:latest`를 직접 사용합니다.
 
 ```bash
-./bin/run-agent-docker.sh --server http://<doer-host>:2020 --user-id <userId> --agent-secret <SECRET>
+docker run --rm -it \
+  -v "${PWD}:/workspace" \
+  cranix/doer-agent:latest \
+  --server http://<doer-host>:2020 \
+  --user-id <userId> \
+  --agent-secret <SECRET>
 ```
 
-- 컨테이너 내부에서 `docker` 명령이 필요하면 Docker socket 마운트가 필요합니다.
+PowerShell:
+
+```powershell
+docker run --rm -it `
+  -v "${PWD}:/workspace" `
+  cranix/doer-agent:latest `
+  --server http://<doer-host>:2020 `
+  --user-id <userId> `
+  --agent-secret <SECRET>
+```
+
+- 다른 이미지를 쓰려면 `cranix/doer-agent:latest` 부분만 원하는 태그로 바꾸면 됩니다.
+- 기본 실행은 Docker socket을 마운트하지 않습니다.
+- 따라서 컨테이너 내부의 중첩 `docker` 사용은 기본 실행 범위에 포함되지 않습니다.
+
+## Agent 이미지 퍼블리시
+
+배포용 agent 이미지는 `agent/` 디렉토리에서 `./bin/publish-agent.sh`로 빌드하고 퍼블리시합니다. 이 스크립트는 `.` 컨텍스트와 `./Dockerfile`을 기본값으로 사용하며, 기본 퍼블리시 대상 이미지는 `cranix/doer-agent`입니다. `docker buildx build` 기준으로 동작합니다.
+
+```bash
+./bin/publish-agent.sh --push
+./bin/publish-agent.sh --tag v1.2.3 --push --also-latest
+./bin/publish-agent.sh --image docker.io/example/doer-agent --tag v1.2.3 --push
+```
+
+퍼블리시한 이미지는 직접 `docker run`으로 지정해 사용합니다.
+
+```bash
+docker run --rm -it \
+  -v "${PWD}:/workspace" \
+  ghcr.io/example/doer-agent:v1.2.3 \
+  --server http://<doer-host>:2020 \
+  --user-id <userId> \
+  --agent-secret <SECRET>
+```
+
+## Docker Compose로 개발 실행
+
+개발 실행은 `agent/docker-compose.dev.yml` 기준으로 합니다. 이 파일은 로컬 이미지 `doer-agent:latest`를 빌드하고, `/workspace`와 `/var/run/docker.sock`를 함께 마운트합니다.
+
+```bash
+export DOER_AGENT_SERVER=http://<doer-host>:2020
+export DOER_AGENT_USER_ID=<userId>
+export DOER_AGENT_SECRET=<SECRET>
+# 선택: 다른 작업 디렉토리를 마운트하려면 지정
+# export DOER_AGENT_WORKSPACE=/absolute/path/to/workspace
+
+docker compose -f docker-compose.dev.yml up --build agent-dev
+```
+
+백그라운드 실행:
+
+```bash
+docker compose -f docker-compose.dev.yml up --build -d agent-dev
+docker compose -f docker-compose.dev.yml logs -f agent-dev
+```
+
+정리:
+
+```bash
+docker compose -f docker-compose.dev.yml down
+```
+
+- compose 파일은 `agent/` 디렉토리에서 실행하는 기준입니다.
+- `DOER_AGENT_SERVER`, `DOER_AGENT_USER_ID`, `DOER_AGENT_SECRET`는 필수입니다.
+- `DOER_AGENT_WORKSPACE`를 지정하지 않으면 기본값으로 저장소 루트(`..`)가 `/workspace`에 마운트됩니다.
+
+## Windows 권장 사항
+
+- Windows에서는 Docker Desktop의 `Linux containers` 모드가 필요합니다.
+- 로컬 개발 환경은 Docker Desktop의 WSL2 백엔드를 권장합니다.
+- Windows 네이티브 PowerShell보다 WSL2 셸에서 직접 `docker compose`를 실행하는 쪽이 더 직접적일 수 있습니다.
+- PowerShell에서 `/var/run/docker.sock` 마운트 가능 여부는 Docker Desktop 설정과 실행 환경에 따라 다릅니다.

@@ -114,12 +114,8 @@ RUN set -eux; \
   test -d "${PLAYWRIGHT_BROWSERS_PATH}"; \
   node node_modules/playwright-core/cli.js --version; \
   find "${PLAYWRIGHT_BROWSERS_PATH}" -maxdepth 1 -mindepth 1 -type d | tee /tmp/pw-list.txt; \
-  if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
-    grep -Eiq '/chromium-[0-9]+' /tmp/pw-list.txt; \
-  else \
-    grep -Eiq '/chromium-[0-9]+' /tmp/pw-list.txt; \
-    grep -Eiq '/chrome-[^/]+' /tmp/pw-list.txt; \
-  fi
+  # Chromium is required for agent browser automation across all target architectures.
+  grep -Eiq '/chromium-[0-9]+' /tmp/pw-list.txt
 
 COPY src/*.ts ./src/
 COPY tsconfig.json ./tsconfig.json
