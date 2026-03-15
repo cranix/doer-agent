@@ -333,6 +333,11 @@ async function resolvePlaywrightMcpCommand(): Promise<{ command: string; args: s
     daemonArgs = [...daemonArgs, "--browser", "chromium"];
   }
 
+  const hasNoSandboxOption = daemonArgs.some((arg) => arg === "--no-sandbox");
+  if (typeof process.getuid === "function" && process.getuid() === 0 && !hasNoSandboxOption) {
+    daemonArgs = [...daemonArgs, "--no-sandbox"];
+  }
+
   const proxyPath = resolvePlaywrightMcpProxyPath();
   if (!proxyPath) {
     throw new Error("playwright mcp daemon mode requires doer-mcp-proxy binary");

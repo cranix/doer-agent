@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const net = require("node:net");
+import net from "node:net";
 
 function debugLog(...parts) {
   const now = new Date().toISOString();
