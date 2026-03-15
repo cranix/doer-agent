@@ -10,7 +10,8 @@ RUN npm init -y >/dev/null 2>&1 && \
   npm i --no-save \
   pw@npm:playwright-core@${PW_PLAYWRIGHT_CORE_VERSION}
 
-RUN ARCH="$(uname -m)" \
+RUN mkdir -p /opt/google/chrome \
+  && ARCH="$(uname -m)" \
   && if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
       node node_modules/pw/cli.js install chromium; \
     else \
@@ -108,6 +109,8 @@ RUN /app/node_modules/.bin/codex --version >/dev/null
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_GC=1
 COPY --from=playwright-browsers /ms-playwright /ms-playwright
+COPY --from=playwright-browsers /opt/google/chrome /opt/google/chrome
+RUN if [ -x /opt/google/chrome/chrome ]; then ln -sf /opt/google/chrome/chrome /usr/bin/google-chrome; fi
 
 RUN set -eux; \
   ARCH="$(uname -m)"; \
@@ -115,7 +118,11 @@ RUN set -eux; \
   node node_modules/playwright-core/cli.js --version; \
   find "${PLAYWRIGHT_BROWSERS_PATH}" -maxdepth 1 -mindepth 1 -type d | tee /tmp/pw-list.txt; \
   # Chromium is required for agent browser automation across all target architectures.
-  grep -Eiq '/chromium-[0-9]+' /tmp/pw-list.txt
+  grep -Eiq '/chromium-[0-9]+' /tmp/pw-list.txt; \
+  # amd64 runtime should have Chrome channel binary available as well.
+  if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then \
+    test -x /opt/google/chrome/chrome; \
+  fi
 
 COPY src/*.ts ./src/
 COPY tsconfig.json ./tsconfig.json
