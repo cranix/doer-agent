@@ -51,7 +51,7 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/codex-tasks' \
 `agent/` 디렉토리에서:
 
 ```bash
-./bin/run-agent-docker.sh --agent-id <agentId> --server http://<doer-host>:2020 --user-id <userId> --agent-secret <SECRET>
+./bin/run-agent-docker.sh --server http://<doer-host>:2020 --user-id <userId> --agent-secret <SECRET>
 ```
 
 - 컨테이너 내부에서 `docker` 명령이 필요하면 Docker socket 마운트가 필요합니다.
