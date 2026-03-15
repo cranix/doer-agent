@@ -1281,8 +1281,9 @@ async function runTask(args: {
     ...(runtimeConfig?.envPatch ?? {}),
     ...(codexAuth?.envPatch ?? {}),
   };
+  const taskCwd = args.cwd;
   const taskGitEnv = await prepareTaskGitEnv({
-    cwd: args.cwd || process.cwd(),
+    cwd: taskCwd || process.cwd(),
     baseEnvPatch: baseTaskEnvPatch,
   });
   const codexHome = pickFirstNonEmpty([baseTaskEnvPatch.CODEX_HOME, process.env.CODEX_HOME, resolveCodexHomePath()]);
@@ -1313,7 +1314,7 @@ async function runTask(args: {
       pid: process.pid,
       startedAt: formatLocalTimestamp(),
       command: args.command,
-      cwd: args.cwd,
+      cwd: taskCwd,
       shell: shellPath,
       ...(runtimeConfig?.meta ?? { runtimeConfigSynced: false }),
       ...(codexAuth?.meta ?? { codexAuthSynced: false }),
@@ -1330,7 +1331,7 @@ async function runTask(args: {
     let stopCancelPolling = false;
 
     const child = spawn(args.command, {
-      cwd: args.cwd || process.cwd(),
+      cwd: taskCwd || process.cwd(),
       shell: shellPath,
       detached: process.platform !== "win32",
       env: {
