@@ -1,0 +1,39 @@
+#!/usr/bin/env node
+
+const net = require("node:net");
+
+function debugLog(...parts) {
+  const now = new Date().toISOString();
+  process.stderr.write(`[doer-mcp-proxy][${now}] ${parts.join(" ")}\n`);
+}
+
+const socketPath = (process.env.DOER_MCP_SOCKET || "").trim();
+
+if (!socketPath) {
+  process.stderr.write("doer-mcp-proxy error: DOER_MCP_SOCKET is not set\n");
+  process.exit(1);
+}
+
+debugLog("connecting", `socket=${socketPath}`);
+const socket = net.createConnection(socketPath);
+
+socket.on("connect", () => {
+  debugLog("connected");
+  process.stdin.pipe(socket);
+  socket.pipe(process.stdout);
+});
+
+socket.on("error", (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`doer-mcp-proxy error: ${message}\n`);
+  process.exit(1);
+});
+
+socket.on("close", () => {
+  debugLog("closed");
+  process.exit(0);
+});
+
+process.stdin.on("error", () => {
+  socket.destroy();
+});

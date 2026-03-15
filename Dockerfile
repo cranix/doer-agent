@@ -124,6 +124,9 @@ RUN set -eux; \
 COPY src/*.ts ./src/
 COPY tsconfig.json ./tsconfig.json
 
+COPY runtime /app/.runtime
+RUN find /app/.runtime/bin -type f -exec chmod +x {} +
+
 ENV NODE_ENV=production
 ENV CODEX_HOME=/root/.codex
 
