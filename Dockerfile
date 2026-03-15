@@ -123,14 +123,11 @@ RUN set -eux; \
 
 COPY src/*.ts ./src/
 COPY tsconfig.json ./tsconfig.json
-COPY runtime ./.runtime
-RUN chown -R root:root /app/.runtime && \
-  chmod -R 0555 /app/.runtime
 
 ENV NODE_ENV=production
 ENV CODEX_HOME=/root/.codex
 
-# RUN mkdir -p /workspace
-# WORKDIR /workspace
+RUN mkdir -p /workspace
+WORKDIR /workspace
 
 ENTRYPOINT ["/app/node_modules/.bin/tsx", "/app/src/agent.ts"]
