@@ -74,15 +74,27 @@ docker run --rm -it `
 - 기본 실행은 Docker socket을 마운트하지 않습니다.
 - 따라서 컨테이너 내부의 중첩 `docker` 사용은 기본 실행 범위에 포함되지 않습니다.
 
-## Agent 이미지 퍼블리시
+## Agent 이미지 빌드/퍼블리시
 
-배포용 agent 이미지는 `agent/` 디렉토리에서 `./bin/publish-agent.sh`로 빌드하고 퍼블리시합니다. 이 스크립트는 `.` 컨텍스트와 `./Dockerfile`을 기본값으로 사용하며, 기본 퍼블리시 대상 이미지는 `cranix/doer-agent`입니다. `docker buildx build` 기준으로 동작합니다.
+배포용 agent 이미지는 `agent/` 디렉토리에서 `build`와 `publish` 스크립트로 분리해 사용합니다. 두 스크립트 모두 `.` 컨텍스트와 `./Dockerfile`을 기본값으로 사용하며, 기본 이미지 리포지토리는 `cranix/doer-agent`입니다.
+
+로컬 빌드(load):
 
 ```bash
-./bin/publish-agent.sh --push
-./bin/publish-agent.sh --tag v1.2.3 --push --also-latest
-./bin/publish-agent.sh --image docker.io/example/doer-agent --tag v1.2.3 --push
+./scripts/build.sh
+./scripts/build.sh --tag v1.2.3 --also-latest
+./scripts/build.sh --image docker.io/example/doer-agent --platform linux/amd64
 ```
+
+레지스트리 퍼블리시(push):
+
+```bash
+./scripts/publish.sh
+./scripts/publish.sh --tag v1.2.3
+./scripts/publish.sh --image docker.io/example/doer-agent --tag v1.2.3
+```
+
+`publish.sh`는 태그 기반 퍼블리시 시 `:<tag>`와 `:latest`를 함께 push합니다.
 
 퍼블리시한 이미지는 직접 `docker run`으로 지정해 사용합니다.
 

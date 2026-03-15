@@ -105,7 +105,7 @@ function parseEnvInteger(value: string | undefined, fallback: number): number {
 }
 
 function resolvePlaywrightMcpProxyPath(): string {
-  const candidates = ["/doer/.runtime/bin/doer-mcp-proxy", "/workspace/bin/jail/doer-mcp-proxy"];
+  const candidates = ["/app/.runtime/bin/doer-mcp-proxy"];
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
       return candidate;
