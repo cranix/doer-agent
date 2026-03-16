@@ -16,7 +16,7 @@ Build the agent image with docker buildx build and load it locally.
 
 Options:
   --image <name>               Target image repository (default: cranix/doer-agent)
-  --tag <tag>                  Image tag (default: current git short SHA, fallback: latest)
+  --tag <tag>                  Image tag (default: latest)
   --platform <platform>        Docker target platform (default: linux/amd64)
   --context <dir>              Docker build context (default: .)
   --dockerfile <path>          Dockerfile path (default: ./Dockerfile)
@@ -38,15 +38,11 @@ require_command() {
 }
 
 image_name="cranix/doer-agent"
-tag="$(git rev-parse --short HEAD 2>/dev/null || true)"
+tag="latest"
 platform="linux/amd64"
 context_dir="."
 dockerfile="./Dockerfile"
 also_latest="false"
-
-if [[ -z "$tag" ]]; then
-  tag="latest"
-fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

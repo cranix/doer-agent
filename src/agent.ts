@@ -5,6 +5,7 @@ import net from "node:net";
 import { arch, homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, type JetStreamClient, type JetStreamManager, type NatsConnection } from "nats";
 
 interface PollResponse {
   task: {
@@ -16,25 +17,7 @@ interface PollResponse {
   error?: string;
 }
 
-interface SseEnvelope {
-  event: string;
-  data: string;
-}
-
 type AgentEventType = "stdout" | "stderr" | "status" | "meta";
-
-interface PendingAgentEvent {
-  id: string;
-  serverBaseUrl: string;
-  userId: string;
-  taskId: string;
-  type: AgentEventType;
-  seq: number;
-  payload: Record<string, unknown>;
-  createdAt: string;
-  lastAttemptAt: string | null;
-  attempts: number;
-}
 
 interface CodexAuthBundleResponse {
   taskId?: string;
@@ -53,6 +36,20 @@ interface RuntimeConfigBundleResponse {
   meta?: Record<string, unknown> | null;
 }
 
+interface AgentNatsBootstrapResponse {
+  servers?: unknown;
+  auth?: {
+    token?: unknown;
+  } | null;
+  agentId?: unknown;
+  tasks?: {
+    stream?: unknown;
+    subject?: unknown;
+    durable?: unknown;
+  } | null;
+  pendingTaskIds?: unknown;
+}
+
 const PLAYWRIGHT_BROWSERS_PATH = "/ms-playwright";
 const PLAYWRIGHT_SKIP_BROWSER_GC = "1";
 const PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS_DEFAULT = 10800;
@@ -60,19 +57,166 @@ const PLAYWRIGHT_MCP_DAEMON_SIGNATURE_VERSION = "2026-03-15";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 
-let pendingEventQueueLock = Promise.resolve();
-
-async function withPendingEventQueueLock<T>(fn: () => Promise<T>): Promise<T> {
-  const run = pendingEventQueueLock.then(fn, fn);
-  pendingEventQueueLock = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
+interface AgentEventEnvelope {
+  serverBaseUrl: string;
+  userId: string;
+  taskId: string;
+  type: AgentEventType;
+  seq: number;
+  payload: Record<string, unknown>;
 }
 
-function resolvePendingEventQueuePath(): string {
-  return path.join(resolveAgentStateDir(), "pending-events.json");
+interface AgentJetStreamContext {
+  nc: NatsConnection;
+  js: JetStreamClient;
+  jsm: JetStreamManager;
+  codec: ReturnType<typeof JSONCodec<AgentEventEnvelope>>;
+  taskCodec: ReturnType<typeof JSONCodec<AgentTaskDispatchEnvelope>>;
+  subject: string;
+  stream: string;
+  durable: string;
+  servers: string[];
+  taskStream: string;
+  taskSubject: string;
+  taskDurable: string;
+}
+
+interface AgentTaskDispatchEnvelope {
+  userId: string;
+  agentId: string;
+  taskId: string;
+  createdAt: string;
+}
+
+interface ActiveTaskLogContext {
+  jetstream: AgentJetStreamContext;
+  serverBaseUrl: string;
+  taskId: string;
+  userId: string;
+}
+
+let activeTaskLogContext: ActiveTaskLogContext | null = null;
+
+function sanitizeUserId(userId: string): string {
+  const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
+  return normalized.length > 0 ? normalized : "anonymous";
+}
+
+function normalizeNatsServers(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === "string").map((v) => v.trim()).filter((v) => v.length > 0);
+}
+
+function parseBootstrapTaskConfig(value: unknown): { stream: string; subject: string; durable: string } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const task = value as Record<string, unknown>;
+  const stream = typeof task.stream === "string" ? task.stream.trim() : "";
+  const subject = typeof task.subject === "string" ? task.subject.trim() : "";
+  const durable = typeof task.durable === "string" ? task.durable.trim() : "";
+  if (!stream || !subject || !durable) {
+    return null;
+  }
+  return { stream, subject, durable };
+}
+
+function normalizeTaskIds(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const id = item.trim();
+    if (!id) {
+      continue;
+    }
+    out.push(id);
+  }
+  return out;
+}
+
+function normalizeNatsToken(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const auth = value as Record<string, unknown>;
+  const token = typeof auth.token === "string" ? auth.token.trim() : "";
+  return token.length > 0 ? token : null;
+}
+
+async function ensureJetStreamInfra(args: {
+  jsm: JetStreamManager;
+  stream: string;
+  subject: string;
+  durable?: string;
+}): Promise<void> {
+  const streamInfo = await args.jsm.streams.info(args.stream).catch(() => null);
+  if (!streamInfo) {
+    await args.jsm.streams.add({
+      name: args.stream,
+      subjects: [args.subject],
+      storage: StorageType.File,
+      retention: RetentionPolicy.Limits,
+    });
+  }
+
+  if (args.durable) {
+    const consumerInfo = await args.jsm.consumers.info(args.stream, args.durable).catch(() => null);
+    if (!consumerInfo) {
+      await args.jsm.consumers.add(args.stream, {
+        durable_name: args.durable,
+        ack_policy: AckPolicy.Explicit,
+        deliver_policy: DeliverPolicy.All,
+        filter_subject: args.subject,
+        ack_wait: 30_000_000_000,
+      });
+    }
+  }
+}
+
+async function initJetStreamContext(args: {
+  userId: string;
+  servers: string[];
+  token: string | null;
+  taskStream: string;
+  taskSubject: string;
+  taskDurable: string;
+}): Promise<AgentJetStreamContext> {
+  const sanitized = sanitizeUserId(args.userId);
+  const stream = `DOER_AGENT_EVENTS_${sanitized}`;
+  const subject = `doer.agent.events.${sanitized}`;
+  const durable = `doer-agent-uploader-${sanitized}`;
+
+  const nc = await connect(args.token ? { servers: args.servers, token: args.token } : { servers: args.servers });
+  const jsm = await nc.jetstreamManager();
+  await ensureJetStreamInfra({ jsm, stream, subject, durable });
+  await ensureJetStreamInfra({
+    jsm,
+    stream: args.taskStream,
+    subject: args.taskSubject,
+    durable: args.taskDurable,
+  });
+
+  return {
+    nc,
+    js: nc.jetstream(),
+    jsm,
+    codec: JSONCodec<AgentEventEnvelope>(),
+    taskCodec: JSONCodec<AgentTaskDispatchEnvelope>(),
+    subject,
+    stream,
+    durable,
+    servers: args.servers,
+    taskStream: args.taskStream,
+    taskSubject: args.taskSubject,
+    taskDurable: args.taskDurable,
+  };
 }
 
 function resolveCodexHomePath(): string {
@@ -587,182 +731,11 @@ async function prepareTaskRuntimeConfig(args: {
   };
 }
 
-async function readPendingAgentEvents(queuePath: string): Promise<PendingAgentEvent[]> {
-  try {
-    const raw = await readFile(queuePath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed.filter((row): row is PendingAgentEvent => {
-      if (!row || typeof row !== "object") {
-        return false;
-      }
-      const item = row as Record<string, unknown>;
-      return (
-        typeof item.id === "string" &&
-        typeof item.serverBaseUrl === "string" &&
-        typeof item.userId === "string" &&
-        typeof item.taskId === "string" &&
-        (item.type === "stdout" || item.type === "stderr" || item.type === "status" || item.type === "meta") &&
-        typeof item.seq === "number" &&
-        Number.isInteger(item.seq) &&
-        item.seq > 0 &&
-        item.payload !== null &&
-        typeof item.payload === "object"
-      );
-    });
-  } catch {
-    return [];
-  }
-}
-
-async function writePendingAgentEvents(queuePath: string, events: PendingAgentEvent[]): Promise<void> {
-  const dir = path.dirname(queuePath);
-  await mkdir(dir, { recursive: true });
-  const tmpPath = `${queuePath}.tmp`;
-  const handle = await open(tmpPath, "w");
-  try {
-    await handle.writeFile(JSON.stringify(events), "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await rename(tmpPath, queuePath);
-}
-
-async function findMaxPendingEventSeq(args: {
-  queuePath: string;
-  serverBaseUrl: string;
-  userId: string;
-  taskId: string;
-}): Promise<number> {
-  const events = await readPendingAgentEvents(args.queuePath);
-  let maxSeq = 0;
-  for (const event of events) {
-    if (event.serverBaseUrl !== args.serverBaseUrl || event.userId !== args.userId || event.taskId !== args.taskId) {
-      continue;
-    }
-    if (typeof event.seq === "number" && Number.isInteger(event.seq) && event.seq > maxSeq) {
-      maxSeq = event.seq;
-    }
-  }
-  return maxSeq;
-}
-
-async function enqueuePendingAgentEvent(args: {
-  queuePath: string;
-  serverBaseUrl: string;
-  userId: string;
-  taskId: string;
-  type: AgentEventType;
-  seq: number;
-  payload: Record<string, unknown>;
-}): Promise<void> {
-  await withPendingEventQueueLock(async () => {
-    const events = await readPendingAgentEvents(args.queuePath);
-    const next: PendingAgentEvent = {
-      id: `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-      serverBaseUrl: args.serverBaseUrl,
-      userId: args.userId,
-      taskId: args.taskId,
-      type: args.type,
-      seq: args.seq,
-      payload: args.payload,
-      createdAt: formatLocalTimestamp(),
-      lastAttemptAt: null,
-      attempts: 0,
-    };
-    events.push(next);
-    await writePendingAgentEvents(args.queuePath, events);
-  });
-}
-
-async function flushPendingAgentEvents(args: {
-  queuePath: string;
-  serverBaseUrl: string;
-  userId: string;
-  agentToken: string;
-  maxCount?: number;
-}): Promise<{ delivered: number; remaining: number }> {
-  return withPendingEventQueueLock(async () => {
-    const events = await readPendingAgentEvents(args.queuePath);
-    if (events.length === 0) {
-      return { delivered: 0, remaining: 0 };
-    }
-    const maxCount =
-      typeof args.maxCount === "number" && Number.isFinite(args.maxCount) && args.maxCount > 0 ? Math.floor(args.maxCount) : 200;
-    const scoped = events.filter((event) => event.serverBaseUrl === args.serverBaseUrl && event.userId === args.userId);
-    const scopedIds = new Set(scoped.map((event) => event.id));
-    const retained = events.filter((event) => !scopedIds.has(event.id));
-    let delivered = 0;
-    let processed = 0;
-
-    const byTask = new Map<string, PendingAgentEvent[]>();
-    for (const event of scoped) {
-      const bucket = byTask.get(event.taskId);
-      if (bucket) {
-        bucket.push(event);
-      } else {
-        byTask.set(event.taskId, [event]);
-      }
-    }
-
-    for (const taskEvents of byTask.values()) {
-      taskEvents.sort((a, b) => a.seq - b.seq || a.createdAt.localeCompare(b.createdAt));
-    }
-
-    for (const taskEvents of byTask.values()) {
-      for (let i = 0; i < taskEvents.length; i += 1) {
-        const event = taskEvents[i];
-        if (typeof event.seq === "number" && Number.isInteger(event.seq) && event.seq > 0) {
-          bumpNextEventSeq(event.taskId, event.seq + 1);
-        }
-        if (processed >= maxCount) {
-          retained.push(event);
-          continue;
-        }
-        processed += 1;
-        try {
-          await emitEvent({
-            serverBaseUrl: args.serverBaseUrl,
-            taskId: event.taskId,
-            userId: args.userId,
-            agentToken: args.agentToken,
-            type: event.type,
-            seq: event.seq,
-            payload: event.payload,
-          });
-          delivered += 1;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const match = /Out-of-order event seq:\s*expected\s+(\d+),\s*got\s+(\d+)/.exec(message);
-          if (match) {
-            const expected = Number(match[1]);
-            const got = Number(match[2]);
-            if (Number.isFinite(expected) && Number.isFinite(got) && expected > got) {
-              // Server already acknowledged this or later seq; drop stale event and continue.
-              writeTaskUpload(event.taskId, `drop-stale type=${event.type} seq=${event.seq} reason=${message}`);
-              continue;
-            }
-          }
-          writeTaskUpload(event.taskId, `retry type=${event.type} seq=${event.seq} nextAttempt=${event.attempts + 1} reason=${message}`);
-          retained.push({
-            ...event,
-            attempts: event.attempts + 1,
-            lastAttemptAt: formatLocalTimestamp(),
-          });
-          for (let j = i + 1; j < taskEvents.length; j += 1) {
-            retained.push(taskEvents[j]);
-          }
-          break;
-        }
-      }
-    }
-
-    await writePendingAgentEvents(args.queuePath, retained);
-    return { delivered, remaining: retained.length };
-  });
+function fatalExit(message: string, error?: unknown): never {
+  const detail = error instanceof Error ? error.message : typeof error === "string" ? error : error ? String(error) : "";
+  const full = detail ? `${message}: ${detail}` : message;
+  writeAgentError(`fatal: ${full}`);
+  process.exit(1);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -771,10 +744,20 @@ function sleep(ms: number): Promise<void> {
 
 function writeAgentInfo(message: string): void {
   process.stdout.write(`[doer-agent] ${message}\n`);
+  emitAgentMetaLog("info", message);
 }
 
 function writeAgentError(message: string): void {
   process.stderr.write(`[doer-agent] ${message}\n`);
+  emitAgentMetaLog("error", message);
+}
+
+function writeAgentInfraError(message: string): void {
+  try {
+    process.stderr.write(`[doer-agent] ${message}\n`);
+  } catch {
+    // Keep heartbeat/connectivity failures non-fatal.
+  }
 }
 
 function writeTaskStream(taskId: string, stream: "stdout" | "stderr", chunk: string): void {
@@ -791,6 +774,30 @@ function writeTaskStream(taskId: string, stream: "stdout" | "stderr", chunk: str
 
 function writeTaskUpload(taskId: string, message: string): void {
   process.stdout.write(`[doer-agent][task=${taskId}][upload] ${message}\n`);
+}
+
+function isLikelyNatsAuthError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    message.includes("auth")
+    || message.includes("authorization")
+    || message.includes("authentication")
+    || message.includes("permission")
+    || message.includes("jwt")
+    || message.includes("token")
+  );
+}
+
+function isLikelyNatsReconnectError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    message.includes("connection_closed")
+    || message.includes("connection closed")
+    || message.includes("closed connection")
+    || message.includes("disconnected")
+    || message.includes("timeout")
+    || message.includes("no responders")
+  );
 }
 
 function sendSignalToTaskProcess(child: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
@@ -810,21 +817,64 @@ function sendSignalToTaskProcess(child: ReturnType<typeof spawn>, signal: NodeJS
   }
 }
 
+function resolveLogTimeZone(): string {
+  const configured = process.env.DOER_AGENT_LOG_TIMEZONE?.trim() || process.env.TZ?.trim();
+  return configured && configured.length > 0 ? configured : "Asia/Seoul";
+}
+
+function resolveTimeZoneOffsetString(date: Date, timeZone: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      timeZoneName: "shortOffset",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(date);
+    const token = parts.find((part) => part.type === "timeZoneName")?.value || "GMT+0";
+    const matched = token.match(/GMT([+-]\d{1,2})(?::?(\d{2}))?/i);
+    if (!matched) {
+      return "+00:00";
+    }
+    const hourRaw = matched[1] || "+0";
+    const minuteRaw = matched[2] || "00";
+    const sign = hourRaw.startsWith("-") ? "-" : "+";
+    const absHour = String(Math.abs(Number.parseInt(hourRaw, 10))).padStart(2, "0");
+    const absMinute = String(Math.abs(Number.parseInt(minuteRaw, 10))).padStart(2, "0");
+    return `${sign}${absHour}:${absMinute}`;
+  } catch {
+    return "+00:00";
+  }
+}
+
 function formatLocalTimestamp(date = new Date()): string {
-  const pad = (value: number, size = 2) => String(value).padStart(size, "0");
-  const year = date.getFullYear();
-  const month = pad(date.getMonth() + 1);
-  const day = pad(date.getDate());
-  const hours = pad(date.getHours());
-  const minutes = pad(date.getMinutes());
-  const seconds = pad(date.getSeconds());
-  const ms = pad(date.getMilliseconds(), 3);
-  const offsetMinutes = -date.getTimezoneOffset();
-  const sign = offsetMinutes >= 0 ? "+" : "-";
-  const absOffset = Math.abs(offsetMinutes);
-  const offsetHour = pad(Math.floor(absOffset / 60));
-  const offsetMinute = pad(absOffset % 60);
-  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${ms}${sign}${offsetHour}:${offsetMinute}`;
+  const timeZone = resolveLogTimeZone();
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).formatToParts(date);
+    const pick = (type: Intl.DateTimeFormatPartTypes): string => {
+      return parts.find((part) => part.type === type)?.value || "00";
+    };
+    const year = pick("year");
+    const month = pick("month");
+    const day = pick("day");
+    const hours = pick("hour");
+    const minutes = pick("minute");
+    const seconds = pick("second");
+    const ms = String(date.getMilliseconds()).padStart(3, "0");
+    const offset = resolveTimeZoneOffsetString(date, timeZone);
+    return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${ms}${offset}`;
+  } catch {
+    return date.toISOString();
+  }
 }
 
 function parseArgs(argv: string[]): Record<string, string> {
@@ -845,186 +895,6 @@ function parseArgs(argv: string[]): Record<string, string> {
   return out;
 }
 
-function resolvePollWaitMs(): number {
-  const raw = process.env.DOER_LOCAL_AGENT_POLL_WAIT_MS?.trim() ?? "";
-  const parsed = raw ? Number(raw) : NaN;
-  if (Number.isFinite(parsed) && parsed >= 1000) {
-    return Math.floor(parsed);
-  }
-  return 5000;
-}
-
-function buildAgentStreamUrl(args: {
-  serverBaseUrl: string;
-  userId: string;
-  agentToken: string;
-  waitMs: number;
-}): string {
-  const url = new URL("/api/agent/stream", `${args.serverBaseUrl}/`);
-  url.searchParams.set("userId", args.userId);
-  url.searchParams.set("agentToken", args.agentToken);
-  url.searchParams.set("waitMs", String(args.waitMs));
-  return url.toString();
-}
-
-async function consumeTaskStream(args: {
-  serverBaseUrl: string;
-  userId: string;
-  agentToken: string;
-  waitMs: number;
-  onOpen?: () => void;
-  onTask: (task: NonNullable<PollResponse["task"]>) => Promise<void>;
-}): Promise<void> {
-  const streamUrl = buildAgentStreamUrl({
-    serverBaseUrl: args.serverBaseUrl,
-    userId: args.userId,
-    agentToken: args.agentToken,
-    waitMs: args.waitMs,
-  });
-
-  const res = await fetch(streamUrl, {
-    method: "GET",
-    headers: {
-      Accept: "text/event-stream",
-      "Cache-Control": "no-cache",
-    },
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    let message = `HTTP ${res.status}`;
-    if (text) {
-      try {
-        const parsed = JSON.parse(text) as { error?: unknown };
-        if (typeof parsed.error === "string" && parsed.error.trim()) {
-          message = parsed.error.trim();
-        }
-      } catch {
-        // no-op
-      }
-    }
-    throw new Error(message);
-  }
-
-  const reader = res.body?.getReader();
-  if (!reader) {
-    throw new Error("SSE response body is unavailable");
-  }
-
-  args.onOpen?.();
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let eventName = "message";
-  const dataLines: string[] = [];
-
-  const handleEvent = async (event: SseEnvelope): Promise<void> => {
-    if (!event.data.trim()) {
-      return;
-    }
-    if (event.event === "keepalive") {
-      return;
-    }
-    if (event.event === "error") {
-      let message = event.data;
-      try {
-        const parsed = JSON.parse(event.data) as { error?: unknown };
-        if (typeof parsed.error === "string" && parsed.error.trim()) {
-          message = parsed.error.trim();
-        }
-      } catch {
-        // no-op
-      }
-      throw new Error(message || "SSE stream error");
-    }
-
-    if (event.event !== "task" && event.event !== "message") {
-      return;
-    }
-
-    let parsed: { task?: PollResponse["task"] } = {};
-    try {
-      parsed = JSON.parse(event.data) as { task?: PollResponse["task"] };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Invalid SSE payload: ${message}`);
-    }
-
-    const task = parsed.task;
-    if (task) {
-      await args.onTask(task);
-    }
-  };
-
-  const dispatchEvent = async (): Promise<void> => {
-    if (dataLines.length === 0) {
-      eventName = "message";
-      return;
-    }
-    const data = dataLines.join("\n");
-    const event = eventName || "message";
-    eventName = "message";
-    dataLines.length = 0;
-    await handleEvent({ event, data });
-  };
-
-  const processLine = async (line: string): Promise<void> => {
-    if (line === "") {
-      await dispatchEvent();
-      return;
-    }
-    if (line.startsWith(":")) {
-      return;
-    }
-
-    const separator = line.indexOf(":");
-    const field = separator < 0 ? line : line.slice(0, separator);
-    let value = separator < 0 ? "" : line.slice(separator + 1);
-    if (value.startsWith(" ")) {
-      value = value.slice(1);
-    }
-
-    if (field === "event") {
-      eventName = value || "message";
-      return;
-    }
-    if (field === "data") {
-      dataLines.push(value);
-    }
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      buffer += decoder.decode();
-      break;
-    }
-    buffer += decoder.decode(value, { stream: true });
-
-    while (true) {
-      const newlineIndex = buffer.indexOf("\n");
-      if (newlineIndex < 0) {
-        break;
-      }
-      let line = buffer.slice(0, newlineIndex);
-      buffer = buffer.slice(newlineIndex + 1);
-      if (line.endsWith("\r")) {
-        line = line.slice(0, -1);
-      }
-      await processLine(line);
-    }
-  }
-
-  if (buffer.length > 0) {
-    const trailing = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
-    if (trailing.length > 0) {
-      await processLine(trailing);
-    }
-  }
-
-  await dispatchEvent();
-  throw new Error("SSE stream closed by server");
-}
 function resolveShellPath(): string {
   if (process.platform === "win32") {
     return process.env.ComSpec || "cmd.exe";
@@ -1082,27 +952,7 @@ async function getJson<T>(url: string): Promise<T> {
   return data as T;
 }
 
-async function emitEvent(args: {
-  serverBaseUrl: string;
-  taskId: string;
-  userId: string;
-  agentToken: string;
-  type: AgentEventType;
-  seq: number;
-  payload: Record<string, unknown>;
-}): Promise<void> {
-  await postJson(`${args.serverBaseUrl}/api/agent/tasks/${encodeURIComponent(args.taskId)}/events`, {
-    userId: args.userId,
-    agentToken: args.agentToken,
-    type: args.type,
-    seq: args.seq,
-    payload: args.payload,
-  });
-}
-
 const nextEventSeqByTask = new Map<string, number>();
-let pendingUploaderWake: (() => void) | null = null;
-let pendingUploaderStarted = false;
 
 function reserveNextEventSeq(taskId: string): number {
   const current = nextEventSeqByTask.get(taskId) ?? 1;
@@ -1110,22 +960,33 @@ function reserveNextEventSeq(taskId: string): number {
   return current;
 }
 
-function bumpNextEventSeq(taskId: string, nextSeq: number): void {
-  if (!Number.isInteger(nextSeq) || nextSeq <= 0) {
+function emitAgentMetaLog(level: "info" | "error", message: string): void {
+  const ctx = activeTaskLogContext;
+  if (!ctx) {
     return;
   }
-  const current = nextEventSeqByTask.get(taskId) ?? 1;
-  if (nextSeq > current) {
-    nextEventSeqByTask.set(taskId, nextSeq);
-  }
-}
-
-function signalPendingUploader(): void {
-  pendingUploaderWake?.();
+  const seq = reserveNextEventSeq(ctx.taskId);
+  void recordAgentEvent({
+    jetstream: ctx.jetstream,
+    serverBaseUrl: ctx.serverBaseUrl,
+    taskId: ctx.taskId,
+    userId: ctx.userId,
+    type: "meta",
+    seq,
+    payload: {
+      channel: "agent",
+      level,
+      message,
+      at: formatLocalTimestamp(),
+    },
+  }).catch((error) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[doer-agent] meta log persist failed task=${ctx.taskId}: ${detail}\n`);
+  });
 }
 
 async function recordAgentEvent(args: {
-  queuePath: string;
+  jetstream: AgentJetStreamContext;
   serverBaseUrl: string;
   taskId: string;
   userId: string;
@@ -1133,62 +994,120 @@ async function recordAgentEvent(args: {
   seq: number;
   payload: Record<string, unknown>;
 }): Promise<void> {
-  await enqueuePendingAgentEvent({
-    queuePath: args.queuePath,
-    serverBaseUrl: args.serverBaseUrl,
-    userId: args.userId,
-    taskId: args.taskId,
-    type: args.type,
-    seq: args.seq,
-    payload: args.payload,
-  });
-  signalPendingUploader();
+  await args.jetstream.js.publish(
+    args.jetstream.subject,
+    args.jetstream.codec.encode({
+      serverBaseUrl: args.serverBaseUrl,
+      userId: args.userId,
+      taskId: args.taskId,
+      type: args.type,
+      seq: args.seq,
+      payload: args.payload,
+    }),
+  );
 }
 
-function startPendingEventUploader(args: {
-  queuePath: string;
+function persistEventOrFatal(args: {
+  jetstream: AgentJetStreamContext;
+  serverBaseUrl: string;
+  taskId: string;
+  userId: string;
+  type: AgentEventType;
+  seq: number;
+  payload: Record<string, unknown>;
+  context: string;
+}): void {
+  void (async () => {
+    let attempt = 0;
+    let delayMs = 150;
+    while (attempt < 3) {
+      attempt += 1;
+      try {
+        await recordAgentEvent(args);
+        return;
+      } catch (error) {
+        if (attempt >= 3) {
+          const message = error instanceof Error ? error.message : String(error);
+          writeAgentError(
+            `task=${args.taskId} ${args.context}: ${message} (dropped after ${attempt} attempts)`,
+          );
+          return;
+        }
+        await sleep(delayMs);
+        delayMs *= 2;
+      }
+    }
+  })();
+}
+
+async function heartbeatAgent(args: {
   serverBaseUrl: string;
   userId: string;
   agentToken: string;
-}): void {
-  if (pendingUploaderStarted) {
-    return;
-  }
-  pendingUploaderStarted = true;
-  void (async () => {
-    while (true) {
-      try {
-        const result = await flushPendingAgentEvents({
-          queuePath: args.queuePath,
-          serverBaseUrl: args.serverBaseUrl,
-          userId: args.userId,
-          agentToken: args.agentToken,
-        });
-        if (result.delivered > 0) {
-          writeAgentInfo(`flushed pending events delivered=${result.delivered} remaining=${result.remaining}`);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`pending event flush failed: ${message}`);
-      }
+}): Promise<void> {
+  await postJson<{ ok?: boolean }>(`${args.serverBaseUrl}/api/agent/heartbeat`, {
+    userId: args.userId,
+    agentToken: args.agentToken,
+  });
+}
 
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const finish = () => {
-          if (settled) {
-            return;
-          }
-          settled = true;
-          if (pendingUploaderWake === finish) {
-            pendingUploaderWake = null;
-          }
-          resolve();
-        };
-        pendingUploaderWake = finish;
-        setTimeout(finish, 1000).unref?.();
+async function claimTaskById(args: {
+  serverBaseUrl: string;
+  userId: string;
+  agentToken: string;
+  taskId: string;
+}): Promise<PollResponse["task"]> {
+  const response = await postJson<{ task?: PollResponse["task"] | null }>(
+    `${args.serverBaseUrl}/api/agent/tasks/claim`,
+    {
+      userId: args.userId,
+      agentToken: args.agentToken,
+      taskId: args.taskId,
+    },
+  );
+  return response.task ?? null;
+}
+
+async function runClaimedTask(args: {
+  task: NonNullable<PollResponse["task"]>;
+  serverBaseUrl: string;
+  userId: string;
+  agentToken: string;
+  jetstream: AgentJetStreamContext;
+}): Promise<void> {
+  try {
+    writeAgentInfo(`run task=${args.task.id} command=${args.task.command}`);
+    await runTask({
+      serverBaseUrl: args.serverBaseUrl,
+      taskId: args.task.id,
+      command: args.task.command,
+      cwd: args.task.cwd,
+      userId: args.userId,
+      agentToken: args.agentToken,
+      jetstream: args.jetstream,
+    }).catch(async (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      writeAgentError(`task=${args.task.id} run failed: ${message}`);
+      const failPayload = {
+        status: "failed",
+        error: message,
+        finishedAt: formatLocalTimestamp(),
+      } satisfies Record<string, unknown>;
+      await recordAgentEvent({
+        jetstream: args.jetstream,
+        serverBaseUrl: args.serverBaseUrl,
+        taskId: args.task.id,
+        userId: args.userId,
+        type: "status",
+        seq: reserveNextEventSeq(args.task.id),
+        payload: failPayload,
       });
+    });
+  } finally {
+    if (activeTaskLogContext?.taskId === args.task.id) {
+      activeTaskLogContext = null;
     }
-  })();
+  }
 }
 
 async function checkCancelRequested(args: {
@@ -1267,8 +1186,14 @@ async function runTask(args: {
   cwd: string | null;
   userId: string;
   agentToken: string;
-  pendingEventQueuePath: string;
+  jetstream: AgentJetStreamContext;
 }): Promise<void> {
+  activeTaskLogContext = {
+    jetstream: args.jetstream,
+    serverBaseUrl: args.serverBaseUrl,
+    taskId: args.taskId,
+    userId: args.userId,
+  };
   const shellPath = resolveShellPath();
   const runtimeConfig = await prepareTaskRuntimeConfig({
     serverBaseUrl: args.serverBaseUrl,
@@ -1297,17 +1222,7 @@ async function runTask(args: {
     PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || PLAYWRIGHT_BROWSERS_PATH,
     PLAYWRIGHT_SKIP_BROWSER_GC: PLAYWRIGHT_SKIP_BROWSER_GC,
   };
-  const maxQueuedSeq = await findMaxPendingEventSeq({
-    queuePath: args.pendingEventQueuePath,
-    serverBaseUrl: args.serverBaseUrl,
-    userId: args.userId,
-    taskId: args.taskId,
-  }).catch(() => 0);
-  if (maxQueuedSeq > 0) {
-    bumpNextEventSeq(args.taskId, maxQueuedSeq + 1);
-  }
-  await recordAgentEvent({
-    queuePath: args.pendingEventQueuePath,
+  await recordAgentEvent({    jetstream: args.jetstream,
     serverBaseUrl: args.serverBaseUrl,
     taskId: args.taskId,
     userId: args.userId,
@@ -1354,34 +1269,30 @@ async function runTask(args: {
     child.stdout.on("data", (chunk: string) => {
       writeTaskStream(args.taskId, "stdout", chunk);
       const seq = reserveNextEventSeq(args.taskId);
-      void recordAgentEvent({
-        queuePath: args.pendingEventQueuePath,
+      persistEventOrFatal({
+        jetstream: args.jetstream,
         serverBaseUrl: args.serverBaseUrl,
         taskId: args.taskId,
         userId: args.userId,
         type: "stdout",
         seq,
         payload: { chunk, at: formatLocalTimestamp() },
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`task=${args.taskId} stdout failed to persist pending event: ${message}`);
+        context: "stdout persist failed",
       });
     });
 
     child.stderr.on("data", (chunk: string) => {
       writeTaskStream(args.taskId, "stderr", chunk);
       const seq = reserveNextEventSeq(args.taskId);
-      void recordAgentEvent({
-        queuePath: args.pendingEventQueuePath,
+      persistEventOrFatal({
+        jetstream: args.jetstream,
         serverBaseUrl: args.serverBaseUrl,
         taskId: args.taskId,
         userId: args.userId,
         type: "stderr",
         seq,
         payload: { chunk, at: formatLocalTimestamp() },
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`task=${args.taskId} stderr failed to persist pending event: ${message}`);
+        context: "stderr persist failed",
       });
     });
 
@@ -1454,8 +1365,7 @@ async function runTask(args: {
           ? `Command exited with code ${result.code ?? "null"}`
           : null,
     } satisfies Record<string, unknown>;
-    await recordAgentEvent({
-      queuePath: args.pendingEventQueuePath,
+    await recordAgentEvent({    jetstream: args.jetstream,
       serverBaseUrl: args.serverBaseUrl,
       taskId: args.taskId,
       userId: args.userId,
@@ -1467,7 +1377,53 @@ async function runTask(args: {
       `task=${args.taskId} status=${status} exitCode=${typeof result.code === "number" ? result.code : "null"} signal=${result.signal ?? "null"}`,
     );
   } finally {
+    activeTaskLogContext = null;
     await codexAuth?.cleanup().catch(() => undefined);
+  }
+}
+
+async function connectBootstrapWithRetry(args: {
+  serverBaseUrl: string;
+  userId: string;
+  agentToken: string;
+}): Promise<{
+  natsBootstrap: AgentNatsBootstrapResponse;
+  pendingTaskIds: string[];
+  jetstream: AgentJetStreamContext;
+}> {
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    try {
+      const natsBootstrap = await postJson<AgentNatsBootstrapResponse>(`${args.serverBaseUrl}/api/agent/nats`, {
+        userId: args.userId,
+        agentToken: args.agentToken,
+      });
+      const natsServers = normalizeNatsServers(natsBootstrap.servers);
+      if (natsServers.length === 0) {
+        throw new Error("No NATS servers configured by server");
+      }
+      const taskConfig = parseBootstrapTaskConfig(natsBootstrap.tasks);
+      if (!taskConfig) {
+        throw new Error("Invalid task dispatch config from server");
+      }
+      const natsToken = normalizeNatsToken(natsBootstrap.auth);
+      const pendingTaskIds = normalizeTaskIds(natsBootstrap.pendingTaskIds);
+      const jetstream = await initJetStreamContext({
+        userId: args.userId,
+        servers: natsServers,
+        token: natsToken,
+        taskStream: taskConfig.stream,
+        taskSubject: taskConfig.subject,
+        taskDurable: taskConfig.durable,
+      });
+      return { natsBootstrap, pendingTaskIds, jetstream };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const retryMs = Math.min(30_000, 1000 * Math.max(1, attempt));
+      writeAgentError(`bootstrap failed: ${message} (retry in ${Math.floor(retryMs / 1000)}s, attempt=${attempt})`);
+      await sleep(retryMs);
+    }
   }
 }
 
@@ -1482,13 +1438,25 @@ async function main() {
     throw new Error("user-id and agent-secret are required");
   }
   const agentToken = agentSecret;
-  const pendingEventQueuePath = resolvePendingEventQueuePath();
-  const pollWaitMs = resolvePollWaitMs();
+  let { natsBootstrap, pendingTaskIds, jetstream } = await connectBootstrapWithRetry({
+    serverBaseUrl,
+    userId,
+    agentToken,
+  });
 
   process.stdout.write(`\n[doer-agent]\n`);
   process.stdout.write(`- server: ${serverBaseUrl}\n`);
   process.stdout.write(`- userId: ${userId}\n`);
-  process.stdout.write(`\n- streamWaitMs: ${pollWaitMs}\n\n`);
+  process.stdout.write(`- agentId: ${typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "unknown"}\n`);
+  process.stdout.write(`\n- transport: nats\n`);
+  process.stdout.write(`- natsServers: ${jetstream.servers.join(",")}\n`);
+  process.stdout.write(`- natsStream: ${jetstream.stream}\n`);
+  process.stdout.write(`- natsSubject: ${jetstream.subject}\n`);
+  process.stdout.write(`- natsDurable: ${jetstream.durable}\n\n`);
+  process.stdout.write(`- taskStream: ${jetstream.taskStream}\n`);
+  process.stdout.write(`- taskSubject: ${jetstream.taskSubject}\n`);
+  process.stdout.write(`- taskDurable: ${jetstream.taskDurable}\n`);
+  process.stdout.write(`- pendingTasks: ${pendingTaskIds.length}\n\n`);
   if (requestedServerBaseUrl !== serverBaseUrl) {
     writeAgentInfo(
       `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
@@ -1498,74 +1466,127 @@ async function main() {
     `시작 커맨드 예시: npm run start -- --server ${serverBaseUrl} --user-id ${userId} --agent-secret <SECRET>\n`,
   );
 
-  startPendingEventUploader({
-    queuePath: pendingEventQueuePath,
-    serverBaseUrl,
-    userId,
-    agentToken,
-  });
+  let heartbeatHealthy: boolean | null = null;
+  const heartbeatTimer = setInterval(() => {
+    void heartbeatAgent({ serverBaseUrl, userId, agentToken })
+      .then(() => {
+        if (heartbeatHealthy === false) {
+          writeAgentInfraError(`heartbeat reconnected at=${formatLocalTimestamp()}`);
+        }
+        heartbeatHealthy = true;
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (heartbeatHealthy !== false) {
+          writeAgentInfraError(`heartbeat failed: ${message}`);
+        }
+        heartbeatHealthy = false;
+      });
+  }, 10_000);
 
-  let isStreamConnected = false;
-  let hasConnectedBefore = false;
-  let consecutiveStreamErrors = 0;
-
-  while (true) {
+  for (const pendingTaskId of pendingTaskIds) {
     try {
-      await consumeTaskStream({
+      const task = await claimTaskById({
         serverBaseUrl,
         userId,
         agentToken,
-        waitMs: pollWaitMs,
-        onOpen: () => {
-          consecutiveStreamErrors = 0;
-          if (!isStreamConnected) {
-            const statusText = hasConnectedBefore ? "reconnected" : "connected";
-            writeAgentInfo(
-              `${statusText} to server (SSE ok) at=${formatLocalTimestamp()} userId=${userId} server=${serverBaseUrl}`,
-            );
-            hasConnectedBefore = true;
-          }
-          isStreamConnected = true;
-        },
-        onTask: async (task) => {
-          writeAgentInfo(`run task=${task.id} command=${task.command}`);
-          await runTask({
-            serverBaseUrl,
-            taskId: task.id,
-            command: task.command,
-            cwd: task.cwd,
-            userId,
-            agentToken,
-            pendingEventQueuePath,
-          }).catch(async (error) => {
-            const message = error instanceof Error ? error.message : String(error);
-            writeAgentError(`task=${task.id} run failed: ${message}`);
-            const failPayload = {
-              status: "failed",
-              error: message,
-              finishedAt: formatLocalTimestamp(),
-            } satisfies Record<string, unknown>;
-            await recordAgentEvent({
-              queuePath: pendingEventQueuePath,
-              serverBaseUrl,
-              taskId: task.id,
-              userId,
-              type: "status",
-              seq: reserveNextEventSeq(task.id),
-              payload: failPayload,
-            });
-          });
-        },
+        taskId: pendingTaskId,
       });
+      if (task) {
+        await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      consecutiveStreamErrors += 1;
-      if (isStreamConnected) {
-        writeAgentError(`disconnected from server at=${formatLocalTimestamp()} reason=${message}`);
+      writeAgentError(`pending task bootstrap failed taskId=${pendingTaskId}: ${message}`);
+    }
+  }
+
+  let connected = false;
+  while (true) {
+    try {
+      const consumer = await jetstream.js.consumers.get(jetstream.taskStream, jetstream.taskDurable);
+      if (!connected) {
+        writeAgentInfo(`connected to task stream (NATS ok) at=${formatLocalTimestamp()} userId=${userId}`);
+        connected = true;
       }
-      isStreamConnected = false;
-      writeAgentError(`stream loop error: ${message} (retry in 2s, attempt=${consecutiveStreamErrors})`);
-      await sleep(2000);
+      const messages = await consumer.fetch({ max_messages: 200, expires: 5_000 });
+      for await (const msg of messages) {
+        let dispatch: AgentTaskDispatchEnvelope;
+        try {
+          dispatch = jetstream.taskCodec.decode(msg.data);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          writeAgentError(`task dispatch decode failed: ${message}`);
+          msg.term();
+          continue;
+        }
+
+        try {
+          const task = await claimTaskById({
+            serverBaseUrl,
+            userId,
+            agentToken,
+            taskId: dispatch.taskId,
+          });
+          if (!task) {
+            msg.ack();
+            continue;
+          }
+          await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+          msg.ack();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          writeAgentError(`task dispatch handle failed taskId=${dispatch.taskId}: ${message}`);
+          msg.nak();
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (connected) {
+        writeAgentError(`task stream disconnected at=${formatLocalTimestamp()} reason=${message}`);
+      }
+      connected = false;
+      if (isLikelyNatsAuthError(error)) {
+        writeAgentError(`nats auth error detected. refreshing bootstrap credentials...`);
+      } else if (isLikelyNatsReconnectError(error)) {
+        writeAgentError(`nats connection lost. refreshing bootstrap/session...`);
+      } else {
+        writeAgentError(`task stream error detected. forcing bootstrap/session refresh... reason=${message}`);
+      }
+      try {
+        await jetstream.nc.close();
+      } catch {
+        // noop
+      }
+      const refreshed = await connectBootstrapWithRetry({
+        serverBaseUrl,
+        userId,
+        agentToken,
+      });
+      natsBootstrap = refreshed.natsBootstrap;
+      pendingTaskIds = refreshed.pendingTaskIds;
+      jetstream = refreshed.jetstream;
+
+      for (const pendingTaskId of pendingTaskIds) {
+        try {
+          const task = await claimTaskById({
+            serverBaseUrl,
+            userId,
+            agentToken,
+            taskId: pendingTaskId,
+          });
+          if (task) {
+            await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+          }
+        } catch (pendingError) {
+          const pendingMessage = pendingError instanceof Error ? pendingError.message : String(pendingError);
+          writeAgentError(`pending task refresh failed taskId=${pendingTaskId}: ${pendingMessage}`);
+        }
+      }
+      writeAgentInfo(
+        `nats credentials refreshed at=${formatLocalTimestamp()} agentId=${typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "unknown"}`,
+      );
+      continue;
     }
   }
 }
