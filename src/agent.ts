@@ -1343,6 +1343,7 @@ async function runTask(args: {
         ...baseTaskEnvPatch,
         ...taskGitEnv.envPatch,
         ...codexMcpEnvPatch,
+        DOER_AGENT_TOKEN: args.agentToken,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
