@@ -203,6 +203,27 @@ async function initJetStreamContext(args: {
     durable: args.taskDurable,
   });
 
+  void nc.closed().then((error) => {
+    if (error) {
+      writeAgentInfraError(`nats connection closed with error: ${error.message}`);
+      return;
+    }
+    writeAgentInfraError("nats connection closed cleanly");
+  });
+
+  void (async () => {
+    try {
+      for await (const status of nc.status()) {
+        const statusType = typeof status.type === "string" ? status.type : "unknown";
+        const statusData = formatNatsStatusData((status as { data?: unknown }).data);
+        writeAgentInfraError(`nats status type=${statusType} data=${statusData}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeAgentInfraError(`nats status loop ended: ${message}`);
+    }
+  })();
+
   return {
     nc,
     js: nc.jetstream(),
@@ -757,6 +778,20 @@ function writeAgentInfraError(message: string): void {
     process.stderr.write(`[doer-agent] ${message}\n`);
   } catch {
     // Keep heartbeat/connectivity failures non-fatal.
+  }
+}
+
+function formatNatsStatusData(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "null";
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
   }
 }
 
@@ -1417,6 +1452,9 @@ async function connectBootstrapWithRetry(args: {
         taskSubject: taskConfig.subject,
         taskDurable: taskConfig.durable,
       });
+      writeAgentInfraError(
+        `bootstrap ok servers=${natsServers.length} taskStream=${taskConfig.stream} taskSubject=${taskConfig.subject} taskDurable=${taskConfig.durable}`,
+      );
       return { natsBootstrap, pendingTaskIds, jetstream };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1520,6 +1558,9 @@ async function main() {
           msg.term();
           continue;
         }
+        writeAgentInfo(
+          `task dispatch received taskId=${dispatch.taskId} createdAt=${dispatch.createdAt} subject=${jetstream.taskSubject} durable=${jetstream.taskDurable}`,
+        );
 
         try {
           const task = await claimTaskById({
@@ -1529,14 +1570,17 @@ async function main() {
             taskId: dispatch.taskId,
           });
           if (!task) {
+            writeAgentInfo(`task dispatch acked without run taskId=${dispatch.taskId} reason=already-claimed`);
             msg.ack();
             continue;
           }
           await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
           msg.ack();
+          writeAgentInfo(`task dispatch acked taskId=${dispatch.taskId}`);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           writeAgentError(`task dispatch handle failed taskId=${dispatch.taskId}: ${message}`);
+          writeAgentError(`task dispatch sending nak taskId=${dispatch.taskId}`);
           msg.nak();
         }
       }
