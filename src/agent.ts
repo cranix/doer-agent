@@ -1481,6 +1481,7 @@ async function main() {
     userId,
     agentToken,
   });
+  const maxConcurrency = Math.max(1, parseEnvInteger(process.env.DOER_AGENT_MAX_CONCURRENCY, 3));
 
   process.stdout.write(`\n[doer-agent]\n`);
   process.stdout.write(`- server: ${serverBaseUrl}\n`);
@@ -1494,7 +1495,8 @@ async function main() {
   process.stdout.write(`- taskStream: ${jetstream.taskStream}\n`);
   process.stdout.write(`- taskSubject: ${jetstream.taskSubject}\n`);
   process.stdout.write(`- taskDurable: ${jetstream.taskDurable}\n`);
-  process.stdout.write(`- pendingTasks: ${pendingTaskIds.length}\n\n`);
+  process.stdout.write(`- pendingTasks: ${pendingTaskIds.length}\n`);
+  process.stdout.write(`- maxConcurrency: ${maxConcurrency}\n\n`);
   if (requestedServerBaseUrl !== serverBaseUrl) {
     writeAgentInfo(
       `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
@@ -1522,21 +1524,48 @@ async function main() {
       });
   }, 10_000);
 
-  for (const pendingTaskId of pendingTaskIds) {
-    try {
-      const task = await claimTaskById({
-        serverBaseUrl,
-        userId,
-        agentToken,
-        taskId: pendingTaskId,
-      });
-      if (task) {
-        await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+  const inFlightTasks = new Set<Promise<void>>();
+
+  async function waitForAvailableSlot(): Promise<void> {
+    while (inFlightTasks.size >= maxConcurrency) {
+      try {
+        await Promise.race(inFlightTasks);
+      } catch {
+        // keep draining slots even when a task fails.
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      writeAgentError(`pending task bootstrap failed taskId=${pendingTaskId}: ${message}`);
     }
+  }
+
+  function trackInFlight(taskPromise: Promise<void>): void {
+    inFlightTasks.add(taskPromise);
+    void taskPromise.finally(() => {
+      inFlightTasks.delete(taskPromise);
+    });
+  }
+
+  function scheduleTask(taskPromiseFactory: () => Promise<void>): void {
+    const taskPromise = taskPromiseFactory();
+    trackInFlight(taskPromise);
+  }
+
+  for (const pendingTaskId of pendingTaskIds) {
+    await waitForAvailableSlot();
+    scheduleTask(async () => {
+      try {
+        const task = await claimTaskById({
+          serverBaseUrl,
+          userId,
+          agentToken,
+          taskId: pendingTaskId,
+        });
+        if (task) {
+          await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`pending task bootstrap failed taskId=${pendingTaskId}: ${message}`);
+      }
+    });
   }
 
   let connected = false;
@@ -1549,40 +1578,43 @@ async function main() {
       }
       const messages = await consumer.fetch({ max_messages: 200, expires: 5_000 });
       for await (const msg of messages) {
-        let dispatch: AgentTaskDispatchEnvelope;
-        try {
-          dispatch = jetstream.taskCodec.decode(msg.data);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          writeAgentError(`task dispatch decode failed: ${message}`);
-          msg.term();
-          continue;
-        }
-        writeAgentInfo(
-          `task dispatch received taskId=${dispatch.taskId} createdAt=${dispatch.createdAt} subject=${jetstream.taskSubject} durable=${jetstream.taskDurable}`,
-        );
-
-        try {
-          const task = await claimTaskById({
-            serverBaseUrl,
-            userId,
-            agentToken,
-            taskId: dispatch.taskId,
-          });
-          if (!task) {
-            writeAgentInfo(`task dispatch acked without run taskId=${dispatch.taskId} reason=already-claimed`);
-            msg.ack();
-            continue;
+        await waitForAvailableSlot();
+        scheduleTask(async () => {
+          let dispatch: AgentTaskDispatchEnvelope;
+          try {
+            dispatch = jetstream.taskCodec.decode(msg.data);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            writeAgentError(`task dispatch decode failed: ${message}`);
+            msg.term();
+            return;
           }
-          await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
-          msg.ack();
-          writeAgentInfo(`task dispatch acked taskId=${dispatch.taskId}`);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          writeAgentError(`task dispatch handle failed taskId=${dispatch.taskId}: ${message}`);
-          writeAgentError(`task dispatch sending nak taskId=${dispatch.taskId}`);
-          msg.nak();
-        }
+          writeAgentInfo(
+            `task dispatch received taskId=${dispatch.taskId} createdAt=${dispatch.createdAt} subject=${jetstream.taskSubject} durable=${jetstream.taskDurable}`,
+          );
+
+          try {
+            const task = await claimTaskById({
+              serverBaseUrl,
+              userId,
+              agentToken,
+              taskId: dispatch.taskId,
+            });
+            if (!task) {
+              writeAgentInfo(`task dispatch acked without run taskId=${dispatch.taskId} reason=already-claimed`);
+              msg.ack();
+              return;
+            }
+            await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+            msg.ack();
+            writeAgentInfo(`task dispatch acked taskId=${dispatch.taskId}`);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            writeAgentError(`task dispatch handle failed taskId=${dispatch.taskId}: ${message}`);
+            writeAgentError(`task dispatch sending nak taskId=${dispatch.taskId}`);
+            msg.nak();
+          }
+        });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1596,6 +1628,10 @@ async function main() {
         writeAgentError(`nats connection lost. refreshing bootstrap/session...`);
       } else {
         writeAgentError(`task stream error detected. forcing bootstrap/session refresh... reason=${message}`);
+      }
+      if (inFlightTasks.size > 0) {
+        writeAgentInfo(`waiting for in-flight tasks before reconnect count=${inFlightTasks.size}`);
+        await Promise.allSettled(Array.from(inFlightTasks));
       }
       try {
         await jetstream.nc.close();
@@ -1612,20 +1648,23 @@ async function main() {
       jetstream = refreshed.jetstream;
 
       for (const pendingTaskId of pendingTaskIds) {
-        try {
-          const task = await claimTaskById({
-            serverBaseUrl,
-            userId,
-            agentToken,
-            taskId: pendingTaskId,
-          });
-          if (task) {
-            await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+        await waitForAvailableSlot();
+        scheduleTask(async () => {
+          try {
+            const task = await claimTaskById({
+              serverBaseUrl,
+              userId,
+              agentToken,
+              taskId: pendingTaskId,
+            });
+            if (task) {
+              await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+            }
+          } catch (pendingError) {
+            const pendingMessage = pendingError instanceof Error ? pendingError.message : String(pendingError);
+            writeAgentError(`pending task refresh failed taskId=${pendingTaskId}: ${pendingMessage}`);
           }
-        } catch (pendingError) {
-          const pendingMessage = pendingError instanceof Error ? pendingError.message : String(pendingError);
-          writeAgentError(`pending task refresh failed taskId=${pendingTaskId}: ${pendingMessage}`);
-        }
+        });
       }
       writeAgentInfo(
         `nats credentials refreshed at=${formatLocalTimestamp()} agentId=${typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "unknown"}`,
