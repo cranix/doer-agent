@@ -215,8 +215,11 @@ async function initJetStreamContext(args: {
     try {
       for await (const status of nc.status()) {
         const statusType = typeof status.type === "string" ? status.type : "unknown";
+        if (statusType === "pingTimer") {
+          continue;
+        }
         const statusData = formatNatsStatusData((status as { data?: unknown }).data);
-        writeAgentInfraError(`nats status type=${statusType} data=${statusData}`);
+        writeAgentInfraError("nats status type=" + statusType + " data=" + statusData);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
