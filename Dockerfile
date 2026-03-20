@@ -105,6 +105,24 @@ RUN apt-get update && \
 COPY package.json package-lock.json ./
 RUN npm install --no-audit --no-fund
 RUN /app/node_modules/.bin/codex --version >/dev/null
+RUN cat >/usr/local/bin/apply_patch <<'EOF' && chmod +x /usr/local/bin/apply_patch && ln -sf /usr/local/bin/apply_patch /usr/local/bin/applypatch
+#!/usr/bin/env bash
+set -euo pipefail
+CODEX_BIN="/app/node_modules/.bin/codex"
+if [ $# -eq 0 ]; then
+  if [ -t 0 ]; then
+    echo "Usage: apply_patch 'PATCH' or echo 'PATCH' | apply_patch" >&2
+    exit 2
+  fi
+  PATCH_CONTENT="$(cat)"
+  exec "$CODEX_BIN" --codex-run-as-apply-patch "$PATCH_CONTENT"
+elif [ $# -eq 1 ]; then
+  exec "$CODEX_BIN" --codex-run-as-apply-patch "$1"
+else
+  echo "Error: apply_patch accepts exactly one argument." >&2
+  exit 2
+fi
+EOF
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_GC=1
