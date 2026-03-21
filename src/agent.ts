@@ -247,11 +247,6 @@ function resolveCodexHomePath(): string {
   return path.join(homedir(), ".codex");
 }
 
-function resolveTaskCodexHomePath(taskId: string): string {
-  const safeTaskId = taskId.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "task";
-  return path.join(resolveAgentStateDir(), "codex-homes", safeTaskId);
-}
-
 function parseEnvBoolean(value: string | undefined): boolean {
   return value?.trim().toLowerCase() === "true";
 }
@@ -1174,7 +1169,6 @@ async function prepareTaskCodexAuth(args: {
   taskId: string;
   userId: string;
   agentToken: string;
-  codexHome: string;
 }): Promise<{
   envPatch: Record<string, string>;
   cleanup: () => Promise<void>;
@@ -1196,7 +1190,7 @@ async function prepareTaskCodexAuth(args: {
     return null;
   }
 
-  const codexHome = args.codexHome;
+  const codexHome = resolveCodexHomePath();
   await mkdir(codexHome, { recursive: true });
   const authFile = path.join(codexHome, "auth.json");
   await writeFile(authFile, bundle.authJson, "utf8");
@@ -1239,7 +1233,6 @@ async function runTask(args: {
     userId: args.userId,
   };
   const shellPath = resolveShellPath();
-  const taskScopedCodexHome = resolveTaskCodexHomePath(args.taskId);
   const runtimeConfig = await prepareTaskRuntimeConfig({
     serverBaseUrl: args.serverBaseUrl,
     taskId: args.taskId,
@@ -1251,7 +1244,6 @@ async function runTask(args: {
     taskId: args.taskId,
     userId: args.userId,
     agentToken: args.agentToken,
-    codexHome: taskScopedCodexHome,
   });
   const baseTaskEnvPatch = {
     ...(runtimeConfig?.envPatch ?? {}),
@@ -1286,7 +1278,6 @@ async function runTask(args: {
       ...(taskGitEnv.meta ?? {}),
       codexPlaywrightMcpConfigPath: codexMcpConfig.configPath,
       codexPlaywrightMcpConfigUpdated: codexMcpConfig.changed,
-      codexTaskHome: codexHome,
     },
   });
 
@@ -1425,7 +1416,6 @@ async function runTask(args: {
     );
   } finally {
     activeTaskLogContext = null;
-    nextEventSeqByTask.delete(args.taskId);
     await codexAuth?.cleanup().catch(() => undefined);
   }
 }
