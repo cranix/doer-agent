@@ -708,11 +708,10 @@ function normalizeEnvPatch(value: unknown): Record<string, string> {
       continue;
     }
     const normalizedKey = key.trim();
-    const normalizedValue = raw.trim();
-    if (!normalizedKey || !normalizedValue) {
+    if (!normalizedKey) {
       continue;
     }
-    out[normalizedKey] = normalizedValue;
+    out[normalizedKey] = raw;
   }
   return out;
 }
@@ -1596,7 +1595,26 @@ async function main() {
             `task dispatch received taskId=${dispatch.taskId} createdAt=${dispatch.createdAt} subject=${jetstream.taskSubject} durable=${jetstream.taskDurable}`,
           );
 
+          const ackKeepAliveIntervalMs = 10_000;
+          let ackKeepAliveTimer: NodeJS.Timeout | null = null;
+          const stopAckKeepAlive = () => {
+            if (ackKeepAliveTimer) {
+              clearInterval(ackKeepAliveTimer);
+              ackKeepAliveTimer = null;
+            }
+          };
+
           try {
+            ackKeepAliveTimer = setInterval(() => {
+              try {
+                msg.working();
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                writeAgentError(`task dispatch keepalive failed taskId=${dispatch.taskId}: ${message}`);
+              }
+            }, ackKeepAliveIntervalMs);
+            ackKeepAliveTimer.unref?.();
+
             const task = await claimTaskById({
               serverBaseUrl,
               userId,
@@ -1604,14 +1622,18 @@ async function main() {
               taskId: dispatch.taskId,
             });
             if (!task) {
+              stopAckKeepAlive();
               writeAgentInfo(`task dispatch acked without run taskId=${dispatch.taskId} reason=already-claimed`);
               msg.ack();
               return;
             }
+
             await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
+            stopAckKeepAlive();
             msg.ack();
             writeAgentInfo(`task dispatch acked taskId=${dispatch.taskId}`);
           } catch (error) {
+            stopAckKeepAlive();
             const message = error instanceof Error ? error.message : String(error);
             writeAgentError(`task dispatch handle failed taskId=${dispatch.taskId}: ${message}`);
             writeAgentError(`task dispatch sending nak taskId=${dispatch.taskId}`);
