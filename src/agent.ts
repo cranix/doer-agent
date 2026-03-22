@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, open, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { arch, homedir } from "node:os";
 import path from "node:path";
@@ -482,7 +482,7 @@ async function ensureManagedPlaywrightMcpDaemon(args: {
   return paths.socketPath;
 }
 
-async function resolvePlaywrightMcpCommand(): Promise<{ command: string; args: string[] }> {
+async function ensureCodexPlaywrightMcpLauncher(): Promise<string> {
   const browserEnvArgs = [
     `PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}`,
     `PLAYWRIGHT_SKIP_BROWSER_GC=${PLAYWRIGHT_SKIP_BROWSER_GC}`,
@@ -496,9 +496,7 @@ async function resolvePlaywrightMcpCommand(): Promise<{ command: string; args: s
       ? daemonArgsRest
       : ["-y", "@playwright/mcp"];
 
-  const hasBrowserOption = daemonArgs.some(
-    (arg, index) => arg === "--browser" || arg.startsWith("--browser="),
-  );
+  const hasBrowserOption = daemonArgs.some((arg) => arg === "--browser" || arg.startsWith("--browser="));
   if (arch() === "arm64" && !hasBrowserOption) {
     daemonArgs = [...daemonArgs, "--browser", "chromium"];
   }
@@ -518,58 +516,7 @@ async function resolvePlaywrightMcpCommand(): Promise<{ command: string; args: s
     daemonArgs,
     browserEnvArgs,
   });
-  const proxyLauncherPath = await ensurePlaywrightMcpProxyLauncher(socketPath, proxyPath);
-  return {
-    command: proxyLauncherPath,
-    args: [],
-  };
-}
-function escapeTomlString(value: string): string {
-  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function toTomlArray(values: string[]): string {
-  return `[${values.map((item) => `"${escapeTomlString(item)}"`).join(", ")}]`;
-}
-
-async function ensureCodexPlaywrightMcpConfig(codexHome: string): Promise<{ configPath: string; changed: boolean }> {
-  await mkdir(codexHome, { recursive: true });
-  const configPath = path.join(codexHome, "config.toml");
-  const sectionHeader = "[mcp_servers.playwright]";
-  const existing = await readFile(configPath, "utf8").catch(() => "");
-
-  const { command, args } = await resolvePlaywrightMcpCommand();
-  const sectionLines = [sectionHeader, `command = "${escapeTomlString(command)}"`];
-  if (args.length > 0) {
-    sectionLines.push(`args = ${toTomlArray(args)}`);
-  }
-  const sectionText = `${sectionLines.join("\n")}\n`;
-  let nextContent = sectionText;
-  if (existing.trim().length > 0) {
-    const lines = existing.split(/\r?\n/);
-    const sectionStart = lines.findIndex((line) => line.trim() === sectionHeader);
-    if (sectionStart < 0) {
-      nextContent = `${existing.trimEnd()}\n\n${sectionText}`;
-    } else {
-      let sectionEnd = lines.length;
-      for (let i = sectionStart + 1; i < lines.length; i += 1) {
-        const trimmed = lines[i].trim();
-        if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-          sectionEnd = i;
-          break;
-        }
-      }
-      const merged = [...lines.slice(0, sectionStart), ...sectionText.trimEnd().split("\n"), ...lines.slice(sectionEnd)];
-      nextContent = `${merged.join("\n").trimEnd()}\n`;
-    }
-  }
-  const changed = nextContent !== existing;
-  if (!changed) {
-    return { configPath, changed: false };
-  }
-  await writeFile(configPath, nextContent, "utf8");
-  await chmod(configPath, 0o600).catch(() => undefined);
-  return { configPath, changed };
+  return ensurePlaywrightMcpProxyLauncher(socketPath, proxyPath);
 }
 
 function resolveAgentStateDir(): string {
@@ -1270,10 +1217,8 @@ async function runTask(args: {
     cwd: args.cwd || process.cwd(),
     baseEnvPatch: baseTaskEnvPatch,
   });
-  const codexHome = pickFirstNonEmpty([baseTaskEnvPatch.CODEX_HOME, process.env.CODEX_HOME, resolveCodexHomePath()]);
-  const codexMcpConfig = await ensureCodexPlaywrightMcpConfig(codexHome);
+  await ensureCodexPlaywrightMcpLauncher();
   const codexMcpEnvPatch: Record<string, string> = {
-    CODEX_HOME: codexHome,
     PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || PLAYWRIGHT_BROWSERS_PATH,
     PLAYWRIGHT_SKIP_BROWSER_GC: PLAYWRIGHT_SKIP_BROWSER_GC,
   };
@@ -1293,8 +1238,6 @@ async function runTask(args: {
       ...(runtimeConfig?.meta ?? { runtimeConfigSynced: false }),
       ...(codexAuth?.meta ?? { codexAuthSynced: false }),
       ...(taskGitEnv.meta ?? {}),
-      codexPlaywrightMcpConfigPath: codexMcpConfig.configPath,
-      codexPlaywrightMcpConfigUpdated: codexMcpConfig.changed,
     },
   });
 
