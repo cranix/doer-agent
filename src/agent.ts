@@ -82,6 +82,7 @@ interface AgentJetStreamContext {
 }
 
 interface AgentTaskDispatchEnvelope {
+  type?: "task" | "cancel";
   userId: string;
   agentId: string;
   taskId: string;
@@ -96,6 +97,7 @@ interface ActiveTaskLogContext {
 }
 
 let activeTaskLogContext: ActiveTaskLogContext | null = null;
+const activeTaskCancelRequests = new Map<string, () => void>();
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -854,6 +856,22 @@ function sendSignalToTaskProcess(child: ReturnType<typeof spawn>, signal: NodeJS
   }
 }
 
+function requestTaskCancellation(taskId: string, reason: string): boolean {
+  const requestCancel = activeTaskCancelRequests.get(taskId);
+  if (!requestCancel) {
+    return false;
+  }
+  try {
+    requestCancel();
+    writeAgentInfo(`task cancel requested taskId=${taskId} via=${reason}`);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeAgentError(`task cancel request failed taskId=${taskId} via=${reason}: ${message}`);
+    return false;
+  }
+}
+
 function resolveLogTimeZone(): string {
   const configured = process.env.DOER_AGENT_LOG_TIMEZONE?.trim() || process.env.TZ?.trim();
   return configured && configured.length > 0 ? configured : "Asia/Seoul";
@@ -1285,6 +1303,7 @@ async function runTask(args: {
     let cancelStage1Timer: NodeJS.Timeout | null = null;
     let cancelStage2Timer: NodeJS.Timeout | null = null;
     let stopCancelPolling = false;
+    let cancelSignalSent = false;
 
     const child = spawn(args.command, {
       cwd: args.cwd || process.cwd(),
@@ -1302,6 +1321,24 @@ async function runTask(args: {
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
+
+    const requestCancel = () => {
+      if (cancelSignalSent || terminationReason === "cancel") {
+        return;
+      }
+      cancelSignalSent = true;
+      terminationReason = "cancel";
+      sendSignalToTaskProcess(child, "SIGINT");
+      cancelStage1Timer = setTimeout(() => {
+        sendSignalToTaskProcess(child, "SIGTERM");
+      }, 1200);
+      cancelStage1Timer.unref?.();
+      cancelStage2Timer = setTimeout(() => {
+        sendSignalToTaskProcess(child, "SIGKILL");
+      }, 3500);
+      cancelStage2Timer.unref?.();
+    };
+    activeTaskCancelRequests.set(args.taskId, requestCancel);
 
     child.stdout.on("data", (chunk: string) => {
       writeTaskStream(args.taskId, "stdout", chunk);
@@ -1335,7 +1372,7 @@ async function runTask(args: {
 
     const cancelPoller = (async () => {
       while (!stopCancelPolling) {
-        await sleep(1500);
+        await sleep(5000);
         if (stopCancelPolling || terminationReason === "cancel") {
           continue;
         }
@@ -1348,16 +1385,7 @@ async function runTask(args: {
         if (!cancelRequested) {
           continue;
         }
-        terminationReason = "cancel";
-        sendSignalToTaskProcess(child, "SIGINT");
-        cancelStage1Timer = setTimeout(() => {
-          sendSignalToTaskProcess(child, "SIGTERM");
-        }, 1200);
-        cancelStage1Timer.unref?.();
-        cancelStage2Timer = setTimeout(() => {
-          sendSignalToTaskProcess(child, "SIGKILL");
-        }, 3500);
-        cancelStage2Timer.unref?.();
+        requestCancel();
       }
     })();
 
@@ -1414,6 +1442,7 @@ async function runTask(args: {
       `task=${args.taskId} status=${status} exitCode=${typeof result.code === "number" ? result.code : "null"} signal=${result.signal ?? "null"}`,
     );
   } finally {
+    activeTaskCancelRequests.delete(args.taskId);
     activeTaskLogContext = null;
     await codexAuth?.cleanup().catch(() => undefined);
   }
@@ -1614,6 +1643,16 @@ async function main() {
               }
             }, ackKeepAliveIntervalMs);
             ackKeepAliveTimer.unref?.();
+
+            if (dispatch.type === "cancel") {
+              stopAckKeepAlive();
+              const canceled = requestTaskCancellation(dispatch.taskId, "nats_dispatch");
+              writeAgentInfo(
+                `task cancel dispatch handled taskId=${dispatch.taskId} result=${canceled ? "signaled" : "not-running"}`,
+              );
+              msg.ack();
+              return;
+            }
 
             const task = await claimTaskById({
               serverBaseUrl,
