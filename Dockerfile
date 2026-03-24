@@ -69,9 +69,7 @@ RUN install -m 0755 -d /etc/apt/keyrings && \
   printf 'Types: deb\nURIs: https://download.docker.com/linux/debian\nSuites: bookworm\nComponents: stable\nSigned-By: /etc/apt/keyrings/docker.asc\n' > "${DOCKER_APT_SOURCE}" && \
   apt-get update && \
   apt-get install -y --no-install-recommends \
-  docker-ce \
   docker-ce-cli \
-  containerd.io \
   docker-buildx-plugin \
   docker-compose-plugin \
   && docker --version >/dev/null && \
@@ -156,4 +154,4 @@ ENV CODEX_HOME=/root/.codex
 RUN mkdir -p /workspace
 WORKDIR /workspace
 
-ENTRYPOINT ["/app/.runtime/bin/agent-entrypoint.sh"]
+ENTRYPOINT ["/app/node_modules/.bin/tsx", "/app/src/agent.ts"]

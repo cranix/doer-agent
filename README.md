@@ -109,7 +109,7 @@ docker run --rm -it \
 
 ## Docker Compose로 개발 실행
 
-개발 실행은 `agent/docker-compose.yml` 기준이며, **agent 컨테이너 내부에서 dockerd를 직접 기동하는 단일 컨테이너 방식**입니다.
+개발 실행은 `agent/docker-compose.dev.yml` 기준으로 합니다. 이 파일은 로컬 이미지 `doer-agent:latest`를 빌드하고, `/workspace`와 `/var/run/docker.sock`를 함께 마운트합니다.
 
 ```bash
 export DOER_AGENT_SERVER=http://<doer-host>:2020
@@ -118,29 +118,25 @@ export DOER_AGENT_SECRET=<SECRET>
 # 선택: 다른 작업 디렉토리를 마운트하려면 지정
 # export DOER_AGENT_WORKSPACE=/absolute/path/to/workspace
 
-cd agent
-docker compose up --build agent-dev
+docker compose -f docker-compose.dev.yml up --build agent-dev
 ```
 
 백그라운드 실행:
 
 ```bash
-cd agent
-docker compose up --build -d agent-dev
-docker compose logs -f agent-dev
+docker compose -f docker-compose.dev.yml up --build -d agent-dev
+docker compose -f docker-compose.dev.yml logs -f agent-dev
 ```
 
 정리:
 
 ```bash
-cd agent
-docker compose down
+docker compose -f docker-compose.dev.yml down
 ```
 
+- compose 파일은 `agent/` 디렉토리에서 실행하는 기준입니다.
 - `DOER_AGENT_SERVER`, `DOER_AGENT_USER_ID`, `DOER_AGENT_SECRET`는 필수입니다.
 - `DOER_AGENT_WORKSPACE`를 지정하지 않으면 기본값으로 저장소 루트(`..`)가 `/workspace`에 마운트됩니다.
-- Docker 데이터는 볼륨 `doer_agent_dind_data`에 저장됩니다.
-- 이 모드는 `privileged: true`가 필요합니다.
 
 ## Windows 권장 사항
 
