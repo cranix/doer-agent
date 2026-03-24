@@ -7,9 +7,13 @@ services:
     working_dir: /workspace
     stdin_open: true
     tty: true
+    privileged: true
+    environment:
+      DOER_AGENT_ENABLE_DIND: "1"
+      DOER_AGENT_DOCKER_DRIVER: overlay2
     volumes:
       - ${DOER_AGENT_WORKSPACE:-..}:/workspace
-      - /var/run/docker.sock:/var/run/docker.sock
+      - doer_agent_dind_data:/var/lib/docker
     command:
       - --server
       - ${DOER_AGENT_SERVER:?DOER_AGENT_SERVER is required}
@@ -17,3 +21,6 @@ services:
       - ${DOER_AGENT_USER_ID:?DOER_AGENT_USER_ID is required}
       - --agent-secret
       - ${DOER_AGENT_SECRET:?DOER_AGENT_SECRET is required}
+
+volumes:
+  doer_agent_dind_data:
