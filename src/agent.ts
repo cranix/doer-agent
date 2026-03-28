@@ -287,11 +287,12 @@ function resolvePlaywrightMcpProxyPath(): string {
   return "";
 }
 
+const PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH = path.join(AGENT_PROJECT_DIR, "runtime/bin/playwright-mcp-proxy-launcher.sh");
+
 function resolvePlaywrightMcpDaemonStatePaths() {
   const daemonDir = path.join(resolveAgentStateDir(), "playwright-mcp-daemon");
   return {
     daemonDir,
-    proxyLauncherPath: path.join(AGENT_PROJECT_DIR, "runtime/bin/playwright-mcp-proxy-launcher.sh"),
     socketPath: path.join(daemonDir, "playwright-mcp.sock"),
     pidPath: path.join(daemonDir, "daemon.pid"),
     metaPath: path.join(daemonDir, "daemon-meta.json"),
@@ -317,18 +318,6 @@ function parseEnvAssignmentArgs(values: string[]): Record<string, string> {
 
 function escapeShellArg(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
-}
-
-async function ensurePlaywrightMcpProxyLauncher(socketPath: string, proxyPath: string): Promise<string> {
-  const paths = resolvePlaywrightMcpDaemonStatePaths();
-  await mkdir(paths.daemonDir, { recursive: true });
-  const scriptBody = `#!/bin/sh
-export DOER_MCP_SOCKET=${escapeShellArg(socketPath)}
-exec ${escapeShellArg(proxyPath)} "$@"
-`;
-  await writeFile(paths.proxyLauncherPath, scriptBody, "utf8");
-  await chmod(paths.proxyLauncherPath, 0o700).catch(() => undefined);
-  return paths.proxyLauncherPath;
 }
 
 async function readPidFile(pidPath: string): Promise<number | null> {
@@ -508,17 +497,15 @@ async function ensureCodexPlaywrightMcpLauncher(): Promise<string> {
     daemonArgs = [...daemonArgs, "--no-sandbox"];
   }
 
-  const proxyPath = resolvePlaywrightMcpProxyPath();
-  if (!proxyPath) {
-    throw new Error("playwright mcp daemon mode requires doer-mcp-proxy binary");
-  }
-
   const socketPath = await ensureManagedPlaywrightMcpDaemon({
     command: daemonCommand,
     daemonArgs,
     browserEnvArgs,
   });
-  return ensurePlaywrightMcpProxyLauncher(socketPath, proxyPath);
+  if (!existsSync(PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH)) {
+    throw new Error(`playwright mcp proxy launcher script not found: ${PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH}`);
+  }
+  return PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH;
 }
 
 function resolveAgentStateDir(): string {

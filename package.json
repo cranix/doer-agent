@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --import tsx src/agent.ts"
+    "start": "node --import tsx src/agent.ts",
+    "codex": "codex"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
