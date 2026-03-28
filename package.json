@@ -1,12 +1,29 @@
 {
-  "name": "doer-agent-runtime",
+  "name": "doer-agent",
   "version": "0.1.0",
-  "private": true,
+  "description": "Reverse-polling agent runtime for doer",
   "type": "module",
+  "main": "dist/agent.js",
+  "bin": {
+    "doer-agent": "dist/cli.js",
+    "playwright-mcp-call": "dist/playwright-mcp-call-cli.js",
+    "codex": "dist/codex-cli.js"
+  },
+  "files": [
+    "dist",
+    "runtime",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json && chmod +x dist/cli.js dist/playwright-mcp-call-cli.js dist/codex-cli.js",
     "start": "node --import tsx src/agent.ts",
+    "start:dist": "node dist/agent.js",
     "codex": "codex",
-    "playwright-mcp-call": "node --import tsx src/playwright-mcp-call.ts"
+    "playwright-mcp-call": "node --import tsx src/playwright-mcp-call.ts",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
