@@ -1,19 +1,129 @@
 # doer-agent
 
-`agent/`는 doer의 리버스 폴링 에이전트를 위한 독립 실행 디렉토리입니다.
+`doer-agent`는 doer 서버에 연결되는 리버스 폴링 에이전트 런타임입니다.
+로컬 머신이나 원격 워크스페이스에서 작업을 실행하고, 결과를 doer로 다시 전달합니다.
 
-## 준비
+## 현재 구조
 
-- doer 서버가 실행 중이어야 합니다. (기본: `http://localhost:2020`)
-- 아래 명령은 `agent/` 디렉토리 기준입니다.
+이 저장소 루트 자체가 `doer-agent` 프로젝트입니다.
+예전 문서의 `agent/` 하위 디렉토리 기준 설명은 더 이상 맞지 않습니다.
+
+주요 엔트리 포인트:
+
+- `doer-agent`: 에이전트 본체 CLI
+- `playwright-mcp-call`: Playwright MCP 호출용 CLI
+- `codex`: Codex 래퍼 CLI
+
+## 요구 사항
+
+- Node.js 20+
+- doer 서버 접근 가능
+- 발급된 `user-id`
+- 발급된 `agent-secret`
+
+기본 서버는 `https://doer.cranix.net`입니다.
+다른 서버를 쓸 때만 `--server` 또는 `DOER_AGENT_SERVER`를 지정하면 됩니다.
+
+## 빠른 실행
+
+패키지 설치 없이 바로 실행하려면 `npx`를 사용합니다.
+CLI는 `run start --` 없이 직접 옵션을 받습니다.
+
+macOS / Linux:
+
+```bash
+WORKSPACE="${WORKSPACE:-$PWD}" npx -y doer-agent \
+  --user-id <userId> \
+  --agent-secret <SECRET>
+```
+
+PowerShell:
+
+```powershell
+$env:WORKSPACE = if ($env:WORKSPACE) { $env:WORKSPACE } else { (Get-Location).Path }
+npx -y doer-agent `
+  --user-id <userId> `
+  --agent-secret <SECRET>
+```
+
+다른 서버를 붙일 때:
+
+```bash
+WORKSPACE="${WORKSPACE:-$PWD}" npx -y doer-agent \
+  --server http://localhost:2020 \
+  --user-id <userId> \
+  --agent-secret <SECRET>
+```
+
+## 로컬 개발
+
+이 저장소를 직접 수정하거나 빌드하려면 루트에서 실행합니다.
+
+설치:
 
 ```bash
 npm install
 ```
 
-## 에이전트 실행 (고정 시크릿 + 리버스 폴링)
+개발 모드 실행:
 
-1. 로그인 세션에서 고정 시크릿 발급:
+```bash
+npm run start -- --user-id <userId> --agent-secret <SECRET>
+```
+
+배포 산출물 빌드:
+
+```bash
+npm run build
+```
+
+빌드 산출물 실행:
+
+```bash
+npm run start:dist -- --user-id <userId> --agent-secret <SECRET>
+```
+
+기본 서버가 아닌 경우에는 위 명령들에 `--server <url>`을 추가하면 됩니다.
+
+## 환경변수
+
+CLI 인자가 우선이고, 없으면 아래 환경변수를 사용합니다.
+
+- `DOER_AGENT_SERVER`: 선택. 기본값은 `https://doer.cranix.net`
+- `DOER_AGENT_USER_ID`: 필수
+- `DOER_AGENT_SECRET`: 필수
+- `WORKSPACE`: 선택. 작업 디렉터리
+- `DOER_AGENT_MAX_CONCURRENCY`: 선택. 동시 작업 수
+
+예시:
+
+```bash
+DOER_AGENT_USER_ID=<userId> \
+DOER_AGENT_SECRET=<SECRET> \
+WORKSPACE=/absolute/path/to/workspace \
+npm run start
+```
+
+로컬 서버 예시:
+
+```bash
+DOER_AGENT_SERVER=http://localhost:2020 \
+DOER_AGENT_USER_ID=<userId> \
+DOER_AGENT_SECRET=<SECRET> \
+WORKSPACE=/absolute/path/to/workspace \
+npm run start
+```
+
+## 자주 쓰는 옵션
+
+- `--server`: doer 서버 베이스 URL
+- `--user-id`: doer 사용자 ID
+- `--agent-secret`: doer가 발급한 에이전트 시크릿
+- `--workspace-dir`: 실행 전에 이동할 작업 디렉터리
+
+## 시크릿 발급 예시
+
+서버가 로컬에서 돌고 있을 때 예시입니다.
 
 ```bash
 curl -X POST 'http://localhost:2020/api/users/<userId>/agent/secret' \
@@ -31,123 +141,8 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/secret' \
 }
 ```
 
-2. 에이전트 실행:
+## 참고
 
-```bash
-npm run start -- --server http://localhost:2020 --user-id <userId> --agent-secret <SECRET>
-```
-
-환경변수 fallback도 지원합니다. CLI 인자가 있으면 그 값이 우선합니다.
-
-```bash
-DOER_AGENT_SERVER=http://localhost:2020 DOER_AGENT_USER_ID=<userId> DOER_AGENT_SECRET=<SECRET> WORKSPACE=/absolute/path/to/workspace npm run start
-```
-
-
-3. 원격 Codex 실행 전송:
-
-```bash
-curl -X POST 'http://localhost:2020/api/users/<userId>/agent/codex-tasks' \
-  -H 'Content-Type: application/json' \
-  --cookie 'doer_session=<session-cookie>' \
-  -d '{"agentId":"agent_...","prompt":"현재 작업 디렉토리와 파일 목록을 요약해줘"}'
-```
-
-## Docker로 기본 실행
-
-기본 실행은 퍼블릭 이미지 `cranix/doer-agent:latest`를 직접 사용합니다.
-
-```bash
-docker run --rm -it \
-  -v "${PWD}:/workspace" \
-  cranix/doer-agent:latest \
-  --server http://<doer-host>:2020 \
-  --user-id <userId> \
-  --agent-secret <SECRET>
-```
-
-PowerShell:
-
-```powershell
-docker run --rm -it `
-  -v "${PWD}:/workspace" `
-  cranix/doer-agent:latest `
-  --server http://<doer-host>:2020 `
-  --user-id <userId> `
-  --agent-secret <SECRET>
-```
-
-- 다른 이미지를 쓰려면 `cranix/doer-agent:latest` 부분만 원하는 태그로 바꾸면 됩니다.
-- 기본 실행은 Docker socket을 마운트하지 않습니다.
-- 따라서 컨테이너 내부의 중첩 `docker` 사용은 기본 실행 범위에 포함되지 않습니다.
-
-## Agent 이미지 빌드/퍼블리시
-
-배포용 agent 이미지는 `agent/` 디렉토리에서 `build`와 `publish` 스크립트로 분리해 사용합니다. 두 스크립트 모두 `.` 컨텍스트와 `./Dockerfile`을 기본값으로 사용하며, 기본 이미지 리포지토리는 `cranix/doer-agent`입니다.
-
-로컬 빌드(load):
-
-```bash
-./scripts/build.sh
-./scripts/build.sh --tag v1.2.3 --also-latest
-./scripts/build.sh --image docker.io/example/doer-agent --platform linux/amd64
-```
-
-레지스트리 퍼블리시(push):
-
-```bash
-./scripts/publish.sh
-./scripts/publish.sh --tag v1.2.3
-./scripts/publish.sh --image docker.io/example/doer-agent --tag v1.2.3
-```
-
-`publish.sh`는 태그 기반 퍼블리시 시 `:<tag>`와 `:latest`를 함께 push합니다.
-
-퍼블리시한 이미지는 직접 `docker run`으로 지정해 사용합니다.
-
-```bash
-docker run --rm -it \
-  -v "${PWD}:/workspace" \
-  ghcr.io/example/doer-agent:v1.2.3 \
-  --server http://<doer-host>:2020 \
-  --user-id <userId> \
-  --agent-secret <SECRET>
-```
-
-## Docker Compose로 개발 실행
-
-개발 실행은 `agent/docker-compose.dev.yml` 기준으로 합니다. 이 파일은 로컬 이미지 `doer-agent:latest`를 빌드하고, `/workspace`와 `/var/run/docker.sock`를 함께 마운트합니다.
-
-```bash
-export DOER_AGENT_SERVER=http://<doer-host>:2020
-export DOER_AGENT_USER_ID=<userId>
-export DOER_AGENT_SECRET=<SECRET>
-# 선택: 다른 작업 디렉토리를 마운트하려면 지정
-# export DOER_AGENT_WORKSPACE=/absolute/path/to/workspace
-
-docker compose -f docker-compose.dev.yml up --build agent-dev
-```
-
-백그라운드 실행:
-
-```bash
-docker compose -f docker-compose.dev.yml up --build -d agent-dev
-docker compose -f docker-compose.dev.yml logs -f agent-dev
-```
-
-정리:
-
-```bash
-docker compose -f docker-compose.dev.yml down
-```
-
-- compose 파일은 `agent/` 디렉토리에서 실행하는 기준입니다.
-- `DOER_AGENT_SERVER`, `DOER_AGENT_USER_ID`, `DOER_AGENT_SECRET`는 필수입니다.
-- `DOER_AGENT_WORKSPACE`를 지정하지 않으면 기본값으로 저장소 루트(`..`)가 `/workspace`에 마운트됩니다.
-
-## Windows 권장 사항
-
-- Windows에서는 Docker Desktop의 `Linux containers` 모드가 필요합니다.
-- 로컬 개발 환경은 Docker Desktop의 WSL2 백엔드를 권장합니다.
-- Windows 네이티브 PowerShell보다 WSL2 셸에서 직접 `docker compose`를 실행하는 쪽이 더 직접적일 수 있습니다.
-- PowerShell에서 `/var/run/docker.sock` 마운트 가능 여부는 Docker Desktop 설정과 실행 환경에 따라 다릅니다.
+- `runtime/`에는 실행 보조 스크립트가 들어 있습니다.
+- Playwright MCP 프록시는 에이전트 상태 디렉터리(`~/.doer-agent`) 아래 소켓을 사용합니다.
+- 이 저장소에는 예전 README에 있던 `scripts/build.sh`, `scripts/publish.sh`, `docker-compose.dev.yml`이 없습니다. 현재 문서는 실제 파일 구조 기준으로 정리되어 있습니다.

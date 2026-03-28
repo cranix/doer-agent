@@ -53,6 +53,7 @@ interface AgentNatsBootstrapResponse {
 const PLAYWRIGHT_SKIP_BROWSER_GC = "1";
 const PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS_DEFAULT = 10800;
 const PLAYWRIGHT_MCP_DAEMON_SIGNATURE_VERSION = "2026-03-15";
+const DEFAULT_SERVER_BASE_URL = "https://doer.cranix.net";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 
@@ -1445,9 +1446,10 @@ async function main() {
     process.chdir(path.resolve(workspaceDir));
   }
 
-  const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], "http://localhost:2020");
+  const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], DEFAULT_SERVER_BASE_URL);
   const requestedServerBaseUrl = serverBaseUrlRaw.replace(/\/$/, "");
   const serverBaseUrl = resolveContainerReachableServerBaseUrl(requestedServerBaseUrl);
+  const usesDefaultServer = requestedServerBaseUrl === DEFAULT_SERVER_BASE_URL;
   const userId = resolveArgOrEnv(args, ["user-id", "userId"], ["DOER_AGENT_USER_ID"]);
   const agentSecret = resolveArgOrEnv(args, ["agent-secret", "agentSecret"], ["DOER_AGENT_SECRET"]);
   if (!userId || !agentSecret) {
@@ -1462,7 +1464,9 @@ async function main() {
   const maxConcurrency = Math.max(1, parseEnvInteger(process.env.DOER_AGENT_MAX_CONCURRENCY, 3));
 
   process.stdout.write(`\n[doer-agent]\n`);
-  process.stdout.write(`- server: ${serverBaseUrl}\n`);
+  if (!usesDefaultServer) {
+    process.stdout.write(`- server: ${serverBaseUrl}\n`);
+  }
   process.stdout.write(`- userId: ${userId}\n`);
   process.stdout.write(`- agentId: ${typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "unknown"}\n`);
   process.stdout.write(`\n- transport: nats\n`);
