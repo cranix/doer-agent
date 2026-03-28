@@ -37,6 +37,13 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/secret' \
 npm run start -- --server http://localhost:2020 --user-id <userId> --agent-secret <SECRET>
 ```
 
+환경변수 fallback도 지원합니다. CLI 인자가 있으면 그 값이 우선합니다.
+
+```bash
+DOER_AGENT_SERVER=http://localhost:2020 DOER_AGENT_USER_ID=<userId> DOER_AGENT_SECRET=<SECRET> WORKSPACE=/absolute/path/to/workspace npm run start
+```
+
+
 3. 원격 Codex 실행 전송:
 
 ```bash
