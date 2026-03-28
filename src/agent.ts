@@ -874,6 +874,22 @@ function parseArgs(argv: string[]): Record<string, string> {
   return out;
 }
 
+function resolveArgOrEnv(args: Record<string, string>, argKeys: string[], envKeys: string[], fallback = ""): string {
+  for (const key of argKeys) {
+    const value = args[key]?.trim();
+    if (value) {
+      return value;
+    }
+  }
+  for (const key of envKeys) {
+    const value = process.env[key]?.trim();
+    if (value) {
+      return value;
+    }
+  }
+  return fallback;
+}
+
 function resolveShellPath(): string {
   if (process.platform === "win32") {
     return process.env.ComSpec || "cmd.exe";
@@ -1186,12 +1202,11 @@ async function runTask(args: {
     userId: args.userId,
     agentToken: args.agentToken,
   });
-  const taskWorkspace = args.cwd || process.cwd();
+  const taskWorkspace = args.cwd || process.env.WORKSPACE?.trim() || process.cwd();
   const baseTaskEnvPatch = {
     ...(runtimeConfig?.envPatch ?? {}),
     ...(codexAuth?.envPatch ?? {}),
     WORKSPACE: taskWorkspace,
-    DOER_AGENT_WORKSPACE: taskWorkspace,
   };
 
   const taskGitEnv = await prepareTaskGitEnv({
@@ -1425,11 +1440,16 @@ async function connectBootstrapWithRetry(args: {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const serverBaseUrlRaw = args.server || args.url || "http://localhost:2020";
+  const workspaceDir = resolveArgOrEnv(args, ["workspace-dir", "workspaceDir"], ["WORKSPACE"]);
+  if (workspaceDir) {
+    process.chdir(path.resolve(workspaceDir));
+  }
+
+  const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], "http://localhost:2020");
   const requestedServerBaseUrl = serverBaseUrlRaw.replace(/\/$/, "");
   const serverBaseUrl = resolveContainerReachableServerBaseUrl(requestedServerBaseUrl);
-  const userId = (args["user-id"] || args.userId || "").trim();
-  const agentSecret = (args["agent-secret"] || args.agentSecret || "").trim();
+  const userId = resolveArgOrEnv(args, ["user-id", "userId"], ["DOER_AGENT_USER_ID"]);
+  const agentSecret = resolveArgOrEnv(args, ["agent-secret", "agentSecret"], ["DOER_AGENT_SECRET"]);
   if (!userId || !agentSecret) {
     throw new Error("user-id and agent-secret are required");
   }
@@ -1455,6 +1475,7 @@ async function main() {
   process.stdout.write(`- taskDurable: ${jetstream.taskDurable}\n`);
   process.stdout.write(`- pendingTasks: ${pendingTaskIds.length}\n`);
   process.stdout.write(`- maxConcurrency: ${maxConcurrency}\n\n`);
+  process.stdout.write(`- workspace: ${process.cwd()}\n\n`);
   if (requestedServerBaseUrl !== serverBaseUrl) {
     writeAgentInfo(
       `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
