@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -7,7 +5,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-function parseArgs(argv) {
+function parseArgs(argv: string[]): { tool: string; argsBase64: string } {
   const parsed = { tool: "", argsBase64: "" };
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -24,7 +22,7 @@ function parseArgs(argv) {
   return parsed;
 }
 
-function resolveProxyPath() {
+function resolveProxyPath(): string {
   const candidates = [
     path.join(process.cwd(), "agent/runtime/bin/doer-mcp-proxy"),
     path.join(process.cwd(), "runtime/bin/doer-mcp-proxy"),
@@ -37,7 +35,7 @@ function resolveProxyPath() {
   return "";
 }
 
-function resolveSocketPath() {
+function resolveSocketPath(): string {
   const explicit = (process.env.DOER_MCP_SOCKET || "").trim();
   if (explicit) {
     return explicit;
@@ -46,19 +44,19 @@ function resolveSocketPath() {
   return path.join(stateDir, "playwright-mcp-daemon", "playwright-mcp.sock");
 }
 
-function decodeToolArgs(argsBase64) {
+function decodeToolArgs(argsBase64: string): Record<string, unknown> {
   if (!argsBase64) {
     return {};
   }
   const raw = Buffer.from(argsBase64, "base64").toString("utf8");
-  const parsed = JSON.parse(raw);
+  const parsed = JSON.parse(raw) as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("decoded tool arguments must be a JSON object");
   }
-  return parsed;
+  return parsed as Record<string, unknown>;
 }
 
-async function main() {
+async function main(): Promise<void> {
   const { tool, argsBase64 } = parseArgs(process.argv.slice(2));
   if (!tool) {
     throw new Error("--tool is required");
@@ -113,7 +111,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${JSON.stringify({ ok: false, error: message })}\n`);
   process.exit(1);

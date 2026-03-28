@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node --import tsx src/agent.ts",
-    "codex": "codex"
+    "codex": "codex",
+    "playwright-mcp-call": "node --import tsx src/playwright-mcp-call.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
