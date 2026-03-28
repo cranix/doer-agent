@@ -1481,9 +1481,6 @@ async function main() {
       `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
     );
   }
-  process.stdout.write(
-    `시작 커맨드 예시: npm run start -- --server ${serverBaseUrl} --user-id ${userId} --agent-secret <SECRET>\n`,
-  );
 
   let heartbeatHealthy: boolean | null = null;
   const heartbeatTimer = setInterval(() => {
