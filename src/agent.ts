@@ -56,6 +56,7 @@ const PLAYWRIGHT_MCP_DAEMON_SIGNATURE_VERSION = "2026-03-15";
 const DEFAULT_SERVER_BASE_URL = "https://doer.cranix.net";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
+const AGENT_PACKAGE_JSON_PATH = path.join(AGENT_PROJECT_DIR, "package.json");
 
 interface AgentEventEnvelope {
   serverBaseUrl: string;
@@ -515,6 +516,19 @@ function resolveAgentStateDir(): string {
 
 function resolveContainerReachableServerBaseUrl(serverBaseUrl: string): string {
   return serverBaseUrl;
+}
+
+async function resolveAgentVersion(): Promise<string> {
+  const raw = await readFile(AGENT_PACKAGE_JSON_PATH, "utf8").catch(() => "");
+  if (!raw) {
+    return "unknown";
+  }
+  try {
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    return typeof parsed.version === "string" && parsed.version.trim() ? parsed.version.trim() : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function pickFirstNonEmpty(values: Array<string | undefined | null>): string {
@@ -1461,9 +1475,10 @@ async function main() {
     userId,
     agentToken,
   });
-  const maxConcurrency = Math.max(1, parseEnvInteger(process.env.DOER_AGENT_MAX_CONCURRENCY, 3));
+  const maxConcurrency = Math.max(1, parseEnvInteger(process.env.DOER_AGENT_MAX_CONCURRENCY, 5));
+  const agentVersion = await resolveAgentVersion();
 
-  process.stdout.write(`\n[doer-agent]\n`);
+  process.stdout.write(`\n[doer-agent v${agentVersion}]\n`);
   if (!usesDefaultServer) {
     process.stdout.write(`- server: ${serverBaseUrl}\n`);
   }
