@@ -50,7 +50,6 @@ interface AgentNatsBootstrapResponse {
   pendingTaskIds?: unknown;
 }
 
-const PLAYWRIGHT_BROWSERS_PATH = "/ms-playwright";
 const PLAYWRIGHT_SKIP_BROWSER_GC = "1";
 const PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS_DEFAULT = 10800;
 const PLAYWRIGHT_MCP_DAEMON_SIGNATURE_VERSION = "2026-03-15";
@@ -275,7 +274,11 @@ function parseEnvInteger(value: string | undefined, fallback: number): number {
 }
 
 function resolvePlaywrightMcpProxyPath(): string {
-  const candidates = ["/app/.runtime/bin/doer-mcp-proxy"];
+  const candidates = [
+    path.join(AGENT_PROJECT_DIR, "runtime/bin/doer-mcp-proxy"),
+    path.join(process.cwd(), "agent/runtime/bin/doer-mcp-proxy"),
+    path.join(process.cwd(), "runtime/bin/doer-mcp-proxy"),
+  ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
       return candidate;
@@ -288,7 +291,7 @@ function resolvePlaywrightMcpDaemonStatePaths() {
   const daemonDir = path.join(resolveAgentStateDir(), "playwright-mcp-daemon");
   return {
     daemonDir,
-    proxyLauncherPath: path.join(daemonDir, "playwright-mcp-proxy-launcher.sh"),
+    proxyLauncherPath: path.join(AGENT_PROJECT_DIR, "runtime/bin/playwright-mcp-proxy-launcher.sh"),
     socketPath: path.join(daemonDir, "playwright-mcp.sock"),
     pidPath: path.join(daemonDir, "daemon.pid"),
     metaPath: path.join(daemonDir, "daemon-meta.json"),
@@ -484,7 +487,6 @@ async function ensureManagedPlaywrightMcpDaemon(args: {
 
 async function ensureCodexPlaywrightMcpLauncher(): Promise<string> {
   const browserEnvArgs = [
-    `PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}`,
     `PLAYWRIGHT_SKIP_BROWSER_GC=${PLAYWRIGHT_SKIP_BROWSER_GC}`,
   ];
   const daemonArgsFromEnv = parseEnvStringArray(process.env.DOER_PLAYWRIGHT_MCP_DAEMON_ARGS_JSON);
@@ -524,18 +526,6 @@ function resolveAgentStateDir(): string {
 }
 
 function resolveContainerReachableServerBaseUrl(serverBaseUrl: string): string {
-  if (!existsSync("/.dockerenv")) {
-    return serverBaseUrl;
-  }
-  try {
-    const parsed = new URL(serverBaseUrl);
-    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1") {
-      parsed.hostname = "host.docker.internal";
-      return parsed.toString().replace(/\/$/, "");
-    }
-  } catch {
-    return serverBaseUrl;
-  }
   return serverBaseUrl;
 }
 
@@ -553,7 +543,7 @@ function pickFirstNonEmpty(values: Array<string | undefined | null>): string {
 }
 
 async function ensureGitAskpassScript(): Promise<string> {
-  const binDir = path.join(resolveAgentStateDir(), "bin");
+  const binDir = path.join(AGENT_PROJECT_DIR, "runtime/bin");
   const scriptPath = path.join(binDir, "git-askpass.sh");
   const scriptBody = `#!/bin/sh
 case "$1" in
@@ -1209,17 +1199,20 @@ async function runTask(args: {
     userId: args.userId,
     agentToken: args.agentToken,
   });
+  const taskWorkspace = args.cwd || process.cwd();
   const baseTaskEnvPatch = {
     ...(runtimeConfig?.envPatch ?? {}),
     ...(codexAuth?.envPatch ?? {}),
+    WORKSPACE: taskWorkspace,
+    DOER_AGENT_WORKSPACE: taskWorkspace,
   };
+
   const taskGitEnv = await prepareTaskGitEnv({
-    cwd: args.cwd || process.cwd(),
+    cwd: taskWorkspace,
     baseEnvPatch: baseTaskEnvPatch,
   });
   await ensureCodexPlaywrightMcpLauncher();
   const codexMcpEnvPatch: Record<string, string> = {
-    PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH || PLAYWRIGHT_BROWSERS_PATH,
     PLAYWRIGHT_SKIP_BROWSER_GC: PLAYWRIGHT_SKIP_BROWSER_GC,
   };
   await recordAgentEvent({    jetstream: args.jetstream,
@@ -1248,6 +1241,9 @@ async function runTask(args: {
     let stopCancelPolling = false;
     let cancelSignalSent = false;
 
+    const runtimeBinPath = path.join(AGENT_PROJECT_DIR, "runtime/bin");
+    const taskPath = [runtimeBinPath, process.env.PATH || ""].filter(Boolean).join(path.delimiter);
+
     const child = spawn(args.command, {
       cwd: args.cwd || process.cwd(),
       shell: shellPath,
@@ -1257,6 +1253,7 @@ async function runTask(args: {
         ...baseTaskEnvPatch,
         ...taskGitEnv.envPatch,
         ...codexMcpEnvPatch,
+        PATH: taskPath,
         DOER_AGENT_TOKEN: args.agentToken,
       },
       stdio: ["ignore", "pipe", "pipe"],

@@ -25,7 +25,10 @@ function parseArgs(argv) {
 }
 
 function resolveProxyPath() {
-  const candidates = ["/app/.runtime/bin/doer-mcp-proxy"];
+  const candidates = [
+    path.join(process.cwd(), "agent/runtime/bin/doer-mcp-proxy"),
+    path.join(process.cwd(), "runtime/bin/doer-mcp-proxy"),
+  ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
       return candidate;
