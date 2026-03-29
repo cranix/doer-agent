@@ -1,8 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import net from "node:net";
-import { arch, homedir } from "node:os";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, type JetStreamClient, type JetStreamManager, type NatsConnection } from "nats";
@@ -50,9 +49,6 @@ interface AgentNatsBootstrapResponse {
   pendingTaskIds?: unknown;
 }
 
-const PLAYWRIGHT_SKIP_BROWSER_GC = "1";
-const PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS_DEFAULT = 10800;
-const PLAYWRIGHT_MCP_DAEMON_SIGNATURE_VERSION = "2026-03-15";
 const DEFAULT_SERVER_BASE_URL = "https://doer.cranix.net";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
@@ -254,18 +250,6 @@ function parseEnvBoolean(value: string | undefined): boolean {
   return value?.trim().toLowerCase() === "true";
 }
 
-function parseEnvStringArray(value: string | undefined): string[] {
-  if (!value?.trim()) {
-    return [];
-  }
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) && parsed.every((item) => typeof item === "string") ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
 function parseEnvInteger(value: string | undefined, fallback: number): number {
   const normalized = value?.trim();
   if (!normalized) {
@@ -273,245 +257,6 @@ function parseEnvInteger(value: string | undefined, fallback: number): number {
   }
   const parsed = Number.parseInt(normalized, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function resolvePlaywrightMcpProxyPath(): string {
-  const candidates = [
-    path.join(AGENT_PROJECT_DIR, "runtime/bin/doer-mcp-proxy"),
-    path.join(process.cwd(), "agent/runtime/bin/doer-mcp-proxy"),
-    path.join(process.cwd(), "runtime/bin/doer-mcp-proxy"),
-  ];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return "";
-}
-
-const PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH = path.join(AGENT_PROJECT_DIR, "runtime/bin/playwright-mcp-proxy-launcher.sh");
-
-function resolvePlaywrightMcpDaemonStatePaths() {
-  const daemonDir = path.join(resolveAgentStateDir(), "playwright-mcp-daemon");
-  return {
-    daemonDir,
-    socketPath: path.join(daemonDir, "playwright-mcp.sock"),
-    pidPath: path.join(daemonDir, "daemon.pid"),
-    metaPath: path.join(daemonDir, "daemon-meta.json"),
-  };
-}
-
-function parseEnvAssignmentArgs(values: string[]): Record<string, string> {
-  const envPatch: Record<string, string> = {};
-  for (const value of values) {
-    const separatorIndex = value.indexOf("=");
-    if (separatorIndex <= 0) {
-      continue;
-    }
-    const key = value.slice(0, separatorIndex).trim();
-    const envValue = value.slice(separatorIndex + 1);
-    if (!key) {
-      continue;
-    }
-    envPatch[key] = envValue;
-  }
-  return envPatch;
-}
-
-function escapeShellArg(value: string): string {
-  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
-}
-
-async function readPidFile(pidPath: string): Promise<number | null> {
-  const raw = await readFile(pidPath, "utf8").catch(() => "");
-  const parsed = Number.parseInt(raw.trim(), 10);
-  return Number.isInteger(parsed) && parsed > 1 ? parsed : null;
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForPlaywrightMcpSocketReady(socketPath: string, timeoutMs: number): Promise<boolean> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt <= timeoutMs) {
-    const isReady = await new Promise<boolean>((resolve) => {
-      const socket = net.createConnection({ path: socketPath });
-      let settled = false;
-      const finish = (value: boolean) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        resolve(value);
-      };
-      socket.once("connect", () => {
-        socket.end();
-        finish(true);
-      });
-      socket.once("error", () => {
-        finish(false);
-      });
-      setTimeout(() => {
-        socket.destroy();
-        finish(false);
-      }, 250).unref?.();
-    });
-    if (isReady) {
-      return true;
-    }
-    await sleep(120);
-  }
-  return false;
-}
-
-async function stopPlaywrightMcpDaemon(paths: { socketPath: string; pidPath: string; metaPath: string }): Promise<void> {
-  const pid = await readPidFile(paths.pidPath);
-  if (pid && isProcessAlive(pid)) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // ignore
-    }
-    const waitStartedAt = Date.now();
-    while (Date.now() - waitStartedAt < 1800 && isProcessAlive(pid)) {
-      await sleep(120);
-    }
-    if (isProcessAlive(pid)) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // ignore
-      }
-    }
-  }
-  await Promise.all([
-    rename(paths.socketPath, `${paths.socketPath}.stale.${Date.now()}`).catch(() => undefined),
-    rename(paths.pidPath, `${paths.pidPath}.stale.${Date.now()}`).catch(() => undefined),
-    rename(paths.metaPath, `${paths.metaPath}.stale.${Date.now()}`).catch(() => undefined),
-  ]);
-}
-
-async function ensureManagedPlaywrightMcpDaemon(args: {
-  command: string;
-  daemonArgs: string[];
-  browserEnvArgs: string[];
-}): Promise<string> {
-  const paths = resolvePlaywrightMcpDaemonStatePaths();
-  await mkdir(paths.daemonDir, { recursive: true });
-  const daemonCommand = args.command;
-  const targetEnvPatch = parseEnvAssignmentArgs(args.browserEnvArgs);
-  const daemonCommandArgs = args.daemonArgs;
-  const signature = JSON.stringify({
-    version: PLAYWRIGHT_MCP_DAEMON_SIGNATURE_VERSION,
-    daemonCommand,
-    daemonCommandArgs,
-    targetEnvPatch,
-    idleTtlSeconds: parseEnvInteger(
-      process.env.DOER_PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS,
-      PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS_DEFAULT,
-    ),
-  });
-
-  const existingMetaRaw = await readFile(paths.metaPath, "utf8").catch(() => "");
-  let existingMeta: { signature?: string } | null = null;
-  if (existingMetaRaw) {
-    try {
-      existingMeta = JSON.parse(existingMetaRaw) as { signature?: string };
-    } catch {
-      existingMeta = null;
-    }
-  }
-  const existingPid = await readPidFile(paths.pidPath);
-  if (
-    existingMeta?.signature === signature
-    && existingPid
-    && isProcessAlive(existingPid)
-    && await waitForPlaywrightMcpSocketReady(paths.socketPath, 350)
-  ) {
-    return paths.socketPath;
-  }
-
-  await stopPlaywrightMcpDaemon(paths);
-
-  const daemonScriptPath = path.join(AGENT_MODULE_DIR, "playwright-mcp-daemon.ts");
-  const idleTtlSeconds = String(
-    parseEnvInteger(process.env.DOER_PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS, PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS_DEFAULT),
-  );
-  const child = spawn(process.execPath, ["--import", "tsx", daemonScriptPath], {
-    cwd: AGENT_PROJECT_DIR,
-    detached: true,
-    stdio: "ignore",
-    env: {
-      ...process.env,
-      DOER_PLAYWRIGHT_MCP_DAEMON_SOCKET: paths.socketPath,
-      DOER_PLAYWRIGHT_MCP_DAEMON_IDLE_TTL_SECONDS: idleTtlSeconds,
-      DOER_PLAYWRIGHT_MCP_TARGET_COMMAND: daemonCommand,
-      DOER_PLAYWRIGHT_MCP_TARGET_ARGS_JSON: JSON.stringify(daemonCommandArgs),
-      DOER_PLAYWRIGHT_MCP_TARGET_ENV_JSON: JSON.stringify(targetEnvPatch),
-    },
-  });
-  child.unref();
-
-  if (!child.pid) {
-    throw new Error("failed to start playwright mcp daemon: missing pid");
-  }
-
-  await writeFile(paths.pidPath, `${child.pid}\n`, "utf8");
-  await writeFile(
-    paths.metaPath,
-    `${JSON.stringify({ signature, pid: child.pid, socketPath: paths.socketPath, updatedAt: new Date().toISOString() }, null, 2)}\n`,
-    "utf8",
-  );
-
-  const ready = await waitForPlaywrightMcpSocketReady(paths.socketPath, 6000);
-  if (!ready) {
-    throw new Error(`playwright mcp daemon socket not ready: ${paths.socketPath}`);
-  }
-  return paths.socketPath;
-}
-
-async function ensureCodexPlaywrightMcpLauncher(): Promise<string> {
-  const browserEnvArgs = [
-    `PLAYWRIGHT_SKIP_BROWSER_GC=${PLAYWRIGHT_SKIP_BROWSER_GC}`,
-  ];
-  const daemonArgsFromEnv = parseEnvStringArray(process.env.DOER_PLAYWRIGHT_MCP_DAEMON_ARGS_JSON);
-  const [daemonCommandFromArgs, ...daemonArgsRest] = daemonArgsFromEnv;
-
-  const daemonCommand = daemonCommandFromArgs || "npx";
-  let daemonArgs =
-    daemonCommandFromArgs && daemonArgsFromEnv.length > 0
-      ? daemonArgsRest
-      : ["-y", "@playwright/mcp"];
-
-  const hasBrowserOption = daemonArgs.some((arg) => arg === "--browser" || arg.startsWith("--browser="));
-  if (arch() === "arm64" && !hasBrowserOption) {
-    daemonArgs = [...daemonArgs, "--browser", "chromium"];
-  }
-
-  const hasNoSandboxOption = daemonArgs.some((arg) => arg === "--no-sandbox");
-  if (typeof process.getuid === "function" && process.getuid() === 0 && !hasNoSandboxOption) {
-    daemonArgs = [...daemonArgs, "--no-sandbox"];
-  }
-
-  const socketPath = await ensureManagedPlaywrightMcpDaemon({
-    command: daemonCommand,
-    daemonArgs,
-    browserEnvArgs,
-  });
-  if (!existsSync(PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH)) {
-    throw new Error(`playwright mcp proxy launcher script not found: ${PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH}`);
-  }
-  return PLAYWRIGHT_MCP_PROXY_LAUNCHER_PATH;
-}
-
-function resolveAgentStateDir(): string {
-  return process.env.DOER_AGENT_STATE_DIR?.trim() || path.join(homedir(), ".doer-agent");
 }
 
 function resolveContainerReachableServerBaseUrl(serverBaseUrl: string): string {
@@ -1228,10 +973,6 @@ async function runTask(args: {
     cwd: taskWorkspace,
     baseEnvPatch: baseTaskEnvPatch,
   });
-  await ensureCodexPlaywrightMcpLauncher();
-  const codexMcpEnvPatch: Record<string, string> = {
-    PLAYWRIGHT_SKIP_BROWSER_GC: PLAYWRIGHT_SKIP_BROWSER_GC,
-  };
   await recordAgentEvent({    jetstream: args.jetstream,
     serverBaseUrl: args.serverBaseUrl,
     taskId: args.taskId,
@@ -1269,7 +1010,6 @@ async function runTask(args: {
         ...process.env,
         ...baseTaskEnvPatch,
         ...taskGitEnv.envPatch,
-        ...codexMcpEnvPatch,
         PATH: taskPath,
         DOER_AGENT_TOKEN: args.agentToken,
       },

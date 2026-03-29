@@ -11,7 +11,6 @@
 주요 엔트리 포인트:
 
 - `doer-agent`: 에이전트 본체 CLI
-- `playwright-mcp-call`: Playwright MCP 호출용 CLI
 - `codex`: Codex 래퍼 CLI
 
 ## 요구 사항
