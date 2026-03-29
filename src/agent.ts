@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -665,6 +665,40 @@ function resolveShellPath(): string {
   throw new Error("No shell executable found. Set SHELL env or install /bin/sh (or bash).");
 }
 
+function resolveTaskWorkspace(rawCwd: string | null): string {
+  const workspaceRoot = process.env.WORKSPACE?.trim() || process.cwd();
+  const requestedCwd = rawCwd?.trim() || "";
+  const resolvedCwd = requestedCwd
+    ? path.isAbsolute(requestedCwd)
+      ? path.resolve(requestedCwd)
+      : path.resolve(workspaceRoot, requestedCwd)
+    : workspaceRoot;
+
+  if (!existsSync(resolvedCwd)) {
+    throw new Error(
+      `Invalid cwd: ${requestedCwd || "(empty)"} resolved to ${resolvedCwd} (path does not exist)`,
+    );
+  }
+
+  let stats;
+  try {
+    stats = statSync(resolvedCwd);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `Invalid cwd: ${requestedCwd || "(empty)"} resolved to ${resolvedCwd} (${message})`,
+    );
+  }
+
+  if (!stats.isDirectory()) {
+    throw new Error(
+      `Invalid cwd: ${requestedCwd || "(empty)"} resolved to ${resolvedCwd} (not a directory)`,
+    );
+  }
+
+  return resolvedCwd;
+}
+
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
@@ -950,6 +984,7 @@ async function runTask(args: {
     userId: args.userId,
   };
   const shellPath = resolveShellPath();
+  const taskWorkspace = resolveTaskWorkspace(args.cwd);
   const runtimeConfig = await prepareTaskRuntimeConfig({
     serverBaseUrl: args.serverBaseUrl,
     taskId: args.taskId,
@@ -962,7 +997,6 @@ async function runTask(args: {
     userId: args.userId,
     agentToken: args.agentToken,
   });
-  const taskWorkspace = args.cwd || process.env.WORKSPACE?.trim() || process.cwd();
   const baseTaskEnvPatch = {
     ...(runtimeConfig?.envPatch ?? {}),
     ...(codexAuth?.envPatch ?? {}),
@@ -984,7 +1018,8 @@ async function runTask(args: {
       pid: process.pid,
       startedAt: formatLocalTimestamp(),
       command: args.command,
-      cwd: args.cwd,
+      cwd: taskWorkspace,
+      requestedCwd: args.cwd,
       shell: shellPath,
       ...(runtimeConfig?.meta ?? { runtimeConfigSynced: false }),
       ...(codexAuth?.meta ?? { codexAuthSynced: false }),
@@ -1003,7 +1038,7 @@ async function runTask(args: {
     const taskPath = [runtimeBinPath, process.env.PATH || ""].filter(Boolean).join(path.delimiter);
 
     const child = spawn(args.command, {
-      cwd: args.cwd || process.cwd(),
+      cwd: taskWorkspace,
       shell: shellPath,
       detached: process.platform !== "win32",
       env: {
