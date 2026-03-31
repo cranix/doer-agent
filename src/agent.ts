@@ -1,7 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, type JetStreamClient, type JetStreamManager, type NatsConnection } from "nats";
@@ -95,6 +94,7 @@ interface ActiveTaskLogContext {
 
 let activeTaskLogContext: ActiveTaskLogContext | null = null;
 const activeTaskCancelRequests = new Map<string, () => void>();
+let workspaceRootOverride: string | null = null;
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -243,7 +243,8 @@ async function initJetStreamContext(args: {
 }
 
 function resolveCodexHomePath(): string {
-  return path.join(homedir(), ".codex");
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  return path.join(workspaceRoot, ".codex");
 }
 
 function parseEnvBoolean(value: string | undefined): boolean {
@@ -666,7 +667,7 @@ function resolveShellPath(): string {
 }
 
 function resolveTaskWorkspace(rawCwd: string | null): string {
-  const workspaceRoot = process.env.WORKSPACE?.trim() || process.cwd();
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
   const requestedCwd = rawCwd?.trim() || "";
   const resolvedCwd = requestedCwd
     ? path.isAbsolute(requestedCwd)
@@ -1231,9 +1232,9 @@ async function connectBootstrapWithRetry(args: {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const workspaceDir = resolveArgOrEnv(args, ["workspace-dir", "workspaceDir"], ["WORKSPACE"]);
-  if (workspaceDir) {
-    process.chdir(path.resolve(workspaceDir));
-  }
+  const startupWorkspaceRoot = path.resolve(workspaceDir || process.cwd());
+  workspaceRootOverride = startupWorkspaceRoot;
+  process.chdir(startupWorkspaceRoot);
 
   const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], DEFAULT_SERVER_BASE_URL);
   const requestedServerBaseUrl = serverBaseUrlRaw.replace(/\/$/, "");
