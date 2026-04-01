@@ -1,9 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, type JetStreamClient, type JetStreamManager, type NatsConnection } from "nats";
+import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
 
 interface PollResponse {
   task: {
@@ -85,6 +85,21 @@ interface AgentTaskDispatchEnvelope {
   createdAt: string;
 }
 
+type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text";
+
+interface AgentFsRpcRequest {
+  requestId?: unknown;
+  action?: unknown;
+  path?: unknown;
+  offset?: unknown;
+  length?: unknown;
+  limit?: unknown;
+  encoding?: unknown;
+  uploadUrl?: unknown;
+  chatId?: unknown;
+  agentId?: unknown;
+}
+
 interface ActiveTaskLogContext {
   jetstream: AgentJetStreamContext;
   serverBaseUrl: string;
@@ -95,6 +110,7 @@ interface ActiveTaskLogContext {
 let activeTaskLogContext: ActiveTaskLogContext | null = null;
 const activeTaskCancelRequests = new Map<string, () => void>();
 let workspaceRootOverride: string | null = null;
+const fsRpcCodec = StringCodec();
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -700,6 +716,232 @@ function resolveTaskWorkspace(rawCwd: string | null): string {
   return resolvedCwd;
 }
 
+function buildAgentFsRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.fs.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function normalizeFsRpcPath(rawPath: unknown): { abs: string; formatPath: (target: string) => string } {
+  const root = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  const raw = typeof rawPath === "string" && rawPath.trim() ? rawPath.trim() : ".";
+  const normalizedRaw = raw.replace(/\\/g, "/");
+  const useAbsolute = path.isAbsolute(normalizedRaw);
+  const rel = normalizedRaw.replace(/^\/+/, "") || ".";
+  const abs = useAbsolute ? path.resolve(normalizedRaw) : path.resolve(root, rel);
+  if (!useAbsolute && abs !== root && !abs.startsWith(root + path.sep)) {
+    throw new Error("path escapes workspace root");
+  }
+  const formatPath = (target: string): string => {
+    if (useAbsolute) {
+      return target.split(path.sep).join("/") || "/";
+    }
+    return path.relative(root, target).split(path.sep).join("/") || ".";
+  };
+  return { abs, formatPath };
+}
+
+function parseFsRpcAction(value: unknown): AgentFsRpcAction {
+  if (value === "list" || value === "stat" || value === "fetch_file" || value === "read_text") {
+    return value;
+  }
+  throw new Error("unsupported action");
+}
+
+function normalizeFsRpcNumber(value: unknown, fallback: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  return Math.floor(n);
+}
+
+async function executeFsRpc(args: {
+  request: AgentFsRpcRequest;
+  agentToken: string;
+}): Promise<Record<string, unknown>> {
+  const action = parseFsRpcAction(args.request.action);
+  const { abs, formatPath } = normalizeFsRpcPath(args.request.path);
+
+  if (action === "stat") {
+    const entry = await stat(abs);
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      kind: entry.isDirectory() ? "dir" : "file",
+      size: entry.size,
+      mtimeMs: entry.mtimeMs,
+    };
+  }
+
+  if (action === "list") {
+    const entry = await stat(abs);
+    if (!entry.isDirectory()) {
+      throw new Error("path is not a directory");
+    }
+    const limit = Math.max(1, Math.min(normalizeFsRpcNumber(args.request.limit, 200), 1000));
+    const rows = await readdir(abs, { withFileTypes: true });
+    const items = await Promise.all(
+      rows.map(async (row) => {
+        const child = path.join(abs, row.name);
+        const childStat = await stat(child);
+        return {
+          name: row.name,
+          path: formatPath(child),
+          kind: row.isDirectory() ? "dir" : "file",
+          size: childStat.size,
+          mtimeMs: childStat.mtimeMs,
+        };
+      }),
+    );
+    items.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "dir" ? -1 : 1));
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      items: items.slice(0, limit),
+      truncated: items.length > limit,
+      total: items.length,
+    };
+  }
+
+  if (action === "fetch_file") {
+    const entry = await stat(abs);
+    if (!entry.isFile()) {
+      throw new Error("path is not a file");
+    }
+    const uploadUrl = typeof args.request.uploadUrl === "string" ? args.request.uploadUrl : "";
+    const chatId = typeof args.request.chatId === "string" ? args.request.chatId : "";
+    const agentId = typeof args.request.agentId === "string" ? args.request.agentId : "";
+    if (!uploadUrl || !chatId || !agentId) {
+      throw new Error("missing upload parameters");
+    }
+    const data = await readFile(abs);
+    const fileName = path.basename(abs) || "file";
+    const form = new FormData();
+    form.append("file", new File([data], fileName));
+    form.append("chatId", chatId);
+    form.append("agentId", agentId);
+    const response = await fetch(uploadUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${args.agentToken}` },
+      body: form,
+    });
+    const text = await response.text();
+    let upload: Record<string, unknown> = {};
+    try {
+      upload = JSON.parse(text || "{}") as Record<string, unknown>;
+    } catch {
+      upload = {};
+    }
+    if (!response.ok) {
+      const message = typeof upload.error === "string" ? upload.error : `upload failed: ${response.status}`;
+      throw new Error(message);
+    }
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      size: entry.size,
+      upload,
+    };
+  }
+
+  const entry = await stat(abs);
+  if (!entry.isFile()) {
+    throw new Error("path is not a file");
+  }
+  const offset = Math.max(0, normalizeFsRpcNumber(args.request.offset, 0));
+  const length = Math.max(1, Math.min(normalizeFsRpcNumber(args.request.length, 65536), 262144));
+  const encoding = typeof args.request.encoding === "string" && args.request.encoding ? args.request.encoding : "utf8";
+  const fd = await open(abs, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const readResult = await fd.read(buffer, 0, length, offset);
+    const slice = buffer.subarray(0, readResult.bytesRead);
+    try {
+      const text = slice.toString(encoding as BufferEncoding);
+      return {
+        ok: true,
+        action,
+        path: formatPath(abs),
+        offset,
+        length: readResult.bytesRead,
+        totalSize: entry.size,
+        eof: offset + readResult.bytesRead >= entry.size,
+        encoding,
+        text,
+        bytesRead: readResult.bytesRead,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "failed to decode text";
+      return {
+        ok: false,
+        action,
+        path: formatPath(abs),
+        error: message,
+      };
+    }
+  } finally {
+    await fd.close();
+  }
+}
+
+async function handleFsRpcMessage(args: {
+  msg: Msg;
+  serverBaseUrl: string;
+  userId: string;
+  agentId: string;
+  agentToken: string;
+}): Promise<void> {
+  let payload: AgentFsRpcRequest = {};
+  try {
+    payload = JSON.parse(fsRpcCodec.decode(args.msg.data)) as AgentFsRpcRequest;
+    if (typeof payload.agentId === "string" && payload.agentId.trim() && payload.agentId !== args.agentId) {
+      throw new Error("agent id mismatch");
+    }
+    const result = await executeFsRpc({ request: payload, agentToken: args.agentToken });
+    args.msg.respond(fsRpcCodec.encode(JSON.stringify(result)));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    const action = typeof payload.action === "string" ? payload.action : "";
+    const response = {
+      ok: false,
+      action,
+      path: typeof payload.path === "string" ? payload.path : ".",
+      error: message,
+    };
+    args.msg.respond(fsRpcCodec.encode(JSON.stringify(response)));
+    writeAgentError(`fs rpc failed action=${action || "unknown"} error=${message}`);
+  }
+}
+
+function subscribeToFsRpc(args: {
+  jetstream: AgentJetStreamContext;
+  serverBaseUrl: string;
+  userId: string;
+  agentId: string;
+  agentToken: string;
+}): void {
+  const subject = buildAgentFsRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`fs rpc subscription error: ${message}`);
+        return;
+      }
+      void handleFsRpcMessage({
+        msg,
+        serverBaseUrl: args.serverBaseUrl,
+        userId: args.userId,
+        agentId: args.agentId,
+        agentToken: args.agentToken,
+      });
+    },
+  });
+  writeAgentInfo(`fs rpc subscribed subject=${subject}`);
+}
+
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
@@ -1253,13 +1495,17 @@ async function main() {
   });
   const maxConcurrency = Math.max(1, parseEnvInteger(process.env.DOER_AGENT_MAX_CONCURRENCY, 5));
   const agentVersion = await resolveAgentVersion();
+  const initialAgentId = typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "";
+  if (!initialAgentId) {
+    throw new Error("agent id missing from bootstrap");
+  }
 
   process.stdout.write(`\n[doer-agent v${agentVersion}]\n`);
   if (!usesDefaultServer) {
     process.stdout.write(`- server: ${serverBaseUrl}\n`);
   }
   process.stdout.write(`- userId: ${userId}\n`);
-  process.stdout.write(`- agentId: ${typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "unknown"}\n`);
+  process.stdout.write(`- agentId: ${initialAgentId}\n`);
   process.stdout.write(`\n- transport: nats\n`);
   process.stdout.write(`- natsServers: ${jetstream.servers.join(",")}\n`);
   process.stdout.write(`- natsStream: ${jetstream.stream}\n`);
@@ -1318,6 +1564,14 @@ async function main() {
     const taskPromise = taskPromiseFactory();
     trackInFlight(taskPromise);
   }
+
+  subscribeToFsRpc({
+    jetstream,
+    serverBaseUrl,
+    userId,
+    agentId: initialAgentId,
+    agentToken,
+  });
 
   for (const pendingTaskId of pendingTaskIds) {
     await waitForAvailableSlot();
@@ -1450,6 +1704,17 @@ async function main() {
       natsBootstrap = refreshed.natsBootstrap;
       pendingTaskIds = refreshed.pendingTaskIds;
       jetstream = refreshed.jetstream;
+      const refreshedAgentId = typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "";
+      if (!refreshedAgentId) {
+        throw new Error("agent id missing from refreshed bootstrap");
+      }
+      subscribeToFsRpc({
+        jetstream,
+        serverBaseUrl,
+        userId,
+        agentId: refreshedAgentId,
+        agentToken,
+      });
 
       for (const pendingTaskId of pendingTaskIds) {
         await waitForAvailableSlot();
