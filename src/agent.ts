@@ -1,9 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { createWriteStream, existsSync, statSync } from "node:fs";
 import { chmod, mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
+import type { WriteStream } from "node:fs";
 
 interface PollResponse {
   task: {
@@ -40,12 +41,6 @@ interface AgentNatsBootstrapResponse {
     token?: unknown;
   } | null;
   agentId?: unknown;
-  tasks?: {
-    stream?: unknown;
-    subject?: unknown;
-    durable?: unknown;
-  } | null;
-  pendingTaskIds?: unknown;
 }
 
 const DEFAULT_SERVER_BASE_URL = "https://doer.cranix.net";
@@ -67,22 +62,10 @@ interface AgentJetStreamContext {
   js: JetStreamClient;
   jsm: JetStreamManager;
   codec: ReturnType<typeof JSONCodec<AgentEventEnvelope>>;
-  taskCodec: ReturnType<typeof JSONCodec<AgentTaskDispatchEnvelope>>;
   subject: string;
   stream: string;
   durable: string;
   servers: string[];
-  taskStream: string;
-  taskSubject: string;
-  taskDurable: string;
-}
-
-interface AgentTaskDispatchEnvelope {
-  type?: "task" | "cancel";
-  userId: string;
-  agentId: string;
-  taskId: string;
-  createdAt: string;
 }
 
 type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text";
@@ -111,6 +94,78 @@ interface AgentShellRpcRequest {
   agentId?: unknown;
   runtimeEnvPatch?: unknown;
   codexAuth?: unknown;
+}
+
+interface AgentRunRpcRequest {
+  requestId?: unknown;
+  action?: unknown;
+  runId?: unknown;
+  command?: unknown;
+  cwd?: unknown;
+  chatId?: unknown;
+  responseSubject?: unknown;
+  agentId?: unknown;
+  sinceSeq?: unknown;
+  limit?: unknown;
+  runtimeEnvPatch?: unknown;
+  codexAuth?: unknown;
+}
+
+interface AgentRunRpcResponse {
+  requestId: string;
+  ok: boolean;
+  task?: PublicRunTask | null;
+  tasks?: PublicRunTask[];
+  error?: string;
+}
+
+type AgentRunRpcAction = "start" | "get" | "cancel" | "list";
+
+interface AgentRunRpcNormalizedRequest {
+  requestId: string;
+  action: AgentRunRpcAction;
+  runId: string | null;
+  command: string | null;
+  cwd: string | null;
+  chatId: string | null;
+  responseSubject: string;
+  sinceSeq: number | null;
+  limit: number;
+  runtimeEnvPatch: Record<string, string>;
+  codexAuthBundle: CodexAuthBundleResponse | null;
+}
+
+interface PublicRunTask {
+  id: string;
+  userId: string;
+  agentId: string;
+  command: string;
+  cwd: string | null;
+  chatId: string | null;
+  status: "queued" | "running" | "completed" | "failed" | "canceled";
+  cancelRequested: boolean;
+  resultExitCode: number | null;
+  resultSignal: string | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  agentEventAckSeq: number;
+  events: Array<{
+    seq: number;
+    type: AgentEventType;
+    timestamp: string;
+    payload: Record<string, unknown>;
+  }>;
+}
+
+interface ActiveRunRecord {
+  task: PublicRunTask;
+  child: ReturnType<typeof spawn>;
+  logPath: string;
+  logStream: WriteStream;
+  requestCancel: () => void;
 }
 
 interface AgentShellRpcResponse {
@@ -147,10 +202,17 @@ const activeTaskCancelRequests = new Map<string, () => void>();
 let workspaceRootOverride: string | null = null;
 const fsRpcCodec = StringCodec();
 const shellRpcCodec = StringCodec();
+const runRpcCodec = StringCodec();
+const activeRuns = new Map<string, ActiveRunRecord>();
+const retainedRuns = new Map<string, PublicRunTask>();
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
   return normalized.length > 0 ? normalized : "anonymous";
+}
+
+function buildAgentRunRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.run.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function normalizeNatsServers(value: unknown): string[] {
@@ -235,9 +297,6 @@ async function initJetStreamContext(args: {
   userId: string;
   servers: string[];
   token: string | null;
-  taskStream: string;
-  taskSubject: string;
-  taskDurable: string;
 }): Promise<AgentJetStreamContext> {
   const sanitized = sanitizeUserId(args.userId);
   const stream = `DOER_AGENT_EVENTS_${sanitized}`;
@@ -247,12 +306,6 @@ async function initJetStreamContext(args: {
   const nc = await connect(args.token ? { servers: args.servers, token: args.token } : { servers: args.servers });
   const jsm = await nc.jetstreamManager();
   await ensureJetStreamInfra({ jsm, stream, subject, durable });
-  await ensureJetStreamInfra({
-    jsm,
-    stream: args.taskStream,
-    subject: args.taskSubject,
-    durable: args.taskDurable,
-  });
 
   void nc.closed().then((error) => {
     if (error) {
@@ -283,14 +336,10 @@ async function initJetStreamContext(args: {
     js: nc.jetstream(),
     jsm,
     codec: JSONCodec<AgentEventEnvelope>(),
-    taskCodec: JSONCodec<AgentTaskDispatchEnvelope>(),
     subject,
     stream,
     durable,
     servers: args.servers,
-    taskStream: args.taskStream,
-    taskSubject: args.taskSubject,
-    taskDurable: args.taskDurable,
   };
 }
 
@@ -566,6 +615,308 @@ function writeRpcStream(requestId: string, stream: "stdout" | "stderr", chunk: s
 
 function writeRpcStatus(requestId: string, message: string): void {
   process.stdout.write(`[doer-agent][rpc=${requestId}][status] ${message}\n`);
+}
+
+function writeRunStatus(runId: string, message: string): void {
+  process.stdout.write(`[doer-agent][run=${runId}][status] ${message}\n`);
+}
+
+function writeRunStream(runId: string, stream: "stdout" | "stderr", chunk: string): void {
+  const target = stream === "stdout" ? process.stdout : process.stderr;
+  const lines = chunk.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!line && index === lines.length - 1) {
+      continue;
+    }
+    target.write(`[doer-agent][run=${runId}][${stream}] ${line}\n`);
+  }
+}
+
+function normalizeRunRpcRequest(args: { request: AgentRunRpcRequest; agentId: string }): AgentRunRpcNormalizedRequest {
+  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
+  if (!requestId) {
+    throw new Error("missing requestId");
+  }
+  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
+  if (!requestAgentId || requestAgentId !== args.agentId) {
+    throw new Error("agent id mismatch");
+  }
+  const actionRaw = typeof args.request.action === "string" ? args.request.action.trim() : "";
+  const action: AgentRunRpcAction = actionRaw === "cancel" || actionRaw === "get" || actionRaw === "list" ? actionRaw : "start";
+  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
+  if (!responseSubject) {
+    throw new Error("missing responseSubject");
+  }
+  const runId = typeof args.request.runId === "string" && args.request.runId.trim() ? args.request.runId.trim() : null;
+  const command = typeof args.request.command === "string" && args.request.command.trim() ? args.request.command.trim() : null;
+  if (action === "start" && !command) {
+    throw new Error("missing command");
+  }
+  if ((action === "get" || action === "cancel") && !runId) {
+    throw new Error("missing runId");
+  }
+  const cwd = typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null;
+  const chatId = typeof args.request.chatId === "string" && args.request.chatId.trim() ? args.request.chatId.trim() : null;
+  const sinceSeqRaw = Number(args.request.sinceSeq);
+  const sinceSeq = Number.isInteger(sinceSeqRaw) && sinceSeqRaw >= 0 ? sinceSeqRaw : null;
+  const limitRaw = Number(args.request.limit);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(Math.floor(limitRaw), 200)) : 50;
+  return {
+    requestId,
+    action,
+    runId,
+    command,
+    cwd,
+    chatId,
+    responseSubject,
+    sinceSeq,
+    limit,
+    runtimeEnvPatch: normalizeEnvPatch(args.request.runtimeEnvPatch),
+    codexAuthBundle: normalizeShellRpcCodexAuthBundle(args.request.codexAuth),
+  };
+}
+
+function publishRunRpcResponse(args: { nc: NatsConnection; responseSubject: string; payload: AgentRunRpcResponse }): void {
+  args.nc.publish(args.responseSubject, runRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+async function resolveRunLogsDir(): Promise<string> {
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  const dir = path.join(workspaceRoot, ".doer-agent", "runs");
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
+
+function cloneRunTask(task: PublicRunTask, sinceSeq?: number | null): PublicRunTask {
+  return {
+    ...task,
+    events: task.events
+      .filter((event) => typeof sinceSeq === "number" ? event.seq > sinceSeq : true)
+      .map((event) => ({ ...event, payload: { ...event.payload } })),
+  };
+}
+
+function appendRunEvent(task: PublicRunTask, type: AgentEventType, payload: Record<string, unknown>): void {
+  const timestamp = formatLocalTimestamp();
+  const seq = task.agentEventAckSeq + 1;
+  task.agentEventAckSeq = seq;
+  task.updatedAt = timestamp;
+  task.events.push({ seq, type, timestamp, payload });
+}
+
+function persistRetainedRun(task: PublicRunTask): void {
+  retainedRuns.set(task.id, cloneRunTask(task));
+}
+
+function getStoredRun(runId: string): PublicRunTask | null {
+  const active = activeRuns.get(runId);
+  if (active) {
+    return active.task;
+  }
+  return retainedRuns.get(runId) ?? null;
+}
+
+async function startManagedRun(args: {
+  requestId: string;
+  runId: string;
+  userId: string;
+  agentId: string;
+  command: string;
+  cwd: string | null;
+  chatId: string | null;
+  runtimeEnvPatch: Record<string, string>;
+  codexAuthBundle: CodexAuthBundleResponse | null;
+  agentToken: string;
+}): Promise<PublicRunTask> {
+  const prepared = await prepareCommandExecution({
+    cwd: args.cwd,
+    runtimeEnvPatch: args.runtimeEnvPatch,
+    codexAuthBundle: args.codexAuthBundle,
+  });
+  const child = spawnPreparedCommand({
+    kind: "shell",
+    command: args.command,
+    patch: null,
+    shellPath: prepared.shellPath,
+    taskWorkspace: prepared.taskWorkspace,
+    env: prepared.env,
+    agentToken: args.agentToken,
+  });
+
+  const logsDir = await resolveRunLogsDir();
+  const logPath = path.join(logsDir, `${args.runId}.log`);
+  const logStream = createWriteStream(logPath, { flags: "a", encoding: "utf8" });
+  const now = formatLocalTimestamp();
+  const task: PublicRunTask = {
+    id: args.runId,
+    userId: args.userId,
+    agentId: args.agentId,
+    command: args.command,
+    cwd: args.cwd,
+    chatId: args.chatId,
+    status: "running",
+    cancelRequested: false,
+    resultExitCode: null,
+    resultSignal: null,
+    error: null,
+    createdAt: now,
+    updatedAt: now,
+    startedAt: now,
+    finishedAt: null,
+    agentEventAckSeq: 0,
+    events: [],
+  };
+
+  appendRunEvent(task, "meta", {
+    host: process.platform,
+    pid: child.pid ?? null,
+    startedAt: now,
+    command: args.command,
+    cwd: prepared.taskWorkspace,
+    requestedCwd: args.cwd,
+    shell: prepared.shellPath,
+    logPath,
+    ...prepared.taskGitMeta,
+    ...prepared.codexAuthMeta,
+  });
+  appendRunEvent(task, "status", { status: "running" });
+
+  const cancellation = createManagedCancellation(child);
+  const requestCancel = () => {
+    if (task.status === "completed" || task.status === "failed" || task.status === "canceled") {
+      return;
+    }
+    task.cancelRequested = true;
+    task.updatedAt = formatLocalTimestamp();
+    writeRunStatus(task.id, "cancel requested");
+    cancellation.requestCancel();
+  };
+
+  const recordChunk = (stream: "stdout" | "stderr", chunk: string) => {
+    appendRunEvent(task, stream, { chunk, at: formatLocalTimestamp() });
+    logStream.write(JSON.stringify({ at: formatLocalTimestamp(), stream, chunk }) + "\n");
+    writeRunStream(task.id, stream, chunk);
+  };
+
+  child.stdout!.on("data", (chunk: string) => recordChunk("stdout", chunk));
+  child.stderr!.on("data", (chunk: string) => recordChunk("stderr", chunk));
+  child.once("error", (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    task.status = "failed";
+    task.error = message;
+    task.finishedAt = formatLocalTimestamp();
+    appendRunEvent(task, "status", { status: "failed", error: message, finishedAt: task.finishedAt });
+    persistRetainedRun(task);
+    activeRuns.delete(task.id);
+    logStream.end();
+    void prepared.codexAuthCleanup().catch(() => undefined);
+    writeRunStatus(task.id, `failed error=${message}`);
+  });
+  child.once("close", (code, signal) => {
+    cancellation.clear();
+    task.resultExitCode = typeof code === "number" ? code : null;
+    task.resultSignal = signal;
+    task.finishedAt = formatLocalTimestamp();
+    task.status = task.cancelRequested ? "canceled" : (task.resultExitCode ?? 1) === 0 ? "completed" : "failed";
+    task.error = task.status === "failed" ? `Command exited with code ${task.resultExitCode ?? "null"}` : null;
+    appendRunEvent(task, "status", {
+      status: task.status,
+      exitCode: task.resultExitCode,
+      signal: task.resultSignal,
+      error: task.error,
+      finishedAt: task.finishedAt,
+    });
+    persistRetainedRun(task);
+    activeRuns.delete(task.id);
+    logStream.end();
+    void prepared.codexAuthCleanup().catch(() => undefined);
+    writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
+  });
+
+  activeRuns.set(task.id, { task, child, logPath, logStream, requestCancel });
+  persistRetainedRun(task);
+  writeRunStatus(task.id, `started requestId=${args.requestId} cwd=${prepared.taskWorkspace}`);
+  return cloneRunTask(task);
+}
+
+async function handleRunRpcMessage(args: { msg: Msg; jetstream: AgentJetStreamContext; userId: string; agentId: string; agentToken: string }): Promise<void> {
+  let requestId = "unknown";
+  let responseSubject = "";
+  try {
+    const payload = JSON.parse(runRpcCodec.decode(args.msg.data)) as AgentRunRpcRequest;
+    const request = normalizeRunRpcRequest({ request: payload, agentId: args.agentId });
+    requestId = request.requestId;
+    responseSubject = request.responseSubject;
+
+    if (request.action === "start") {
+      const task = await startManagedRun({
+        requestId,
+        runId: request.runId ?? requestId,
+        userId: args.userId,
+        agentId: args.agentId,
+        command: request.command ?? "",
+        cwd: request.cwd,
+        chatId: request.chatId,
+        runtimeEnvPatch: request.runtimeEnvPatch,
+        codexAuthBundle: request.codexAuthBundle,
+        agentToken: args.agentToken,
+      });
+      publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
+      return;
+    }
+
+    if (request.action === "list") {
+      const tasks = [...activeRuns.values()].map((entry) => cloneRunTask(entry.task));
+      const retained = [...retainedRuns.values()].filter((task) => !activeRuns.has(task.id)).map((task) => cloneRunTask(task));
+      const merged = [...tasks, ...retained]
+        .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+        .slice(0, request.limit);
+      publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, tasks: merged } });
+      return;
+    }
+
+    const stored = request.runId ? getStoredRun(request.runId) : null;
+    if (!stored || stored.agentId !== args.agentId || stored.userId !== args.userId) {
+      throw new Error("Run not found");
+    }
+
+    if (request.action === "cancel") {
+      const active = activeRuns.get(stored.id);
+      active?.requestCancel();
+      const task = cloneRunTask(active?.task ?? stored);
+      publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
+      return;
+    }
+
+    const task = cloneRunTask(stored, request.sinceSeq);
+    publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (responseSubject) {
+      publishRunRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: false, error: message },
+      });
+    }
+    writeAgentError(`run rpc failed requestId=${requestId} error=${message}`);
+  }
+}
+
+function subscribeToRunRpc(args: { jetstream: AgentJetStreamContext; userId: string; agentId: string; agentToken: string }): void {
+  const subject = buildAgentRunRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`run rpc subscription error: ${message}`);
+        return;
+      }
+      void handleRunRpcMessage({ msg, jetstream: args.jetstream, userId: args.userId, agentId: args.agentId, agentToken: args.agentToken });
+    },
+  });
+  writeAgentInfo(`run rpc subscribed subject=${subject}`);
 }
 
 function isLikelyNatsAuthError(error: unknown): boolean {
@@ -1085,65 +1436,30 @@ async function handleShellRpcMessage(args: {
     requestId = request.requestId;
     responseSubject = request.responseSubject;
     const startedAtMs = Date.now();
-
-    const shellPath = resolveShellPath();
-    const taskWorkspace = resolveTaskWorkspace(request.cwd);
-    const codexAuth = await prepareCodexAuthBundle(request.codexAuthBundle);
-    const baseTaskEnvPatch = {
-      ...request.runtimeEnvPatch,
-      ...(codexAuth?.envPatch ?? {}),
-      WORKSPACE: taskWorkspace,
-    };
-    const taskGitEnv = await prepareTaskGitEnv({
-      cwd: taskWorkspace,
-      baseEnvPatch: baseTaskEnvPatch,
+    const prepared = await prepareCommandExecution({
+      cwd: request.cwd,
+      runtimeEnvPatch: request.runtimeEnvPatch,
+      codexAuthBundle: request.codexAuthBundle,
     });
-    const runtimeBinPath = path.join(AGENT_PROJECT_DIR, "runtime/bin");
-    const taskPath = [runtimeBinPath, process.env.PATH || ""].filter(Boolean).join(path.delimiter);
-    const child =
-      request.kind === "apply_patch"
-        ? spawn("apply_patch", {
-            cwd: taskWorkspace,
-            detached: process.platform !== "win32",
-            env: {
-              ...process.env,
-              ...baseTaskEnvPatch,
-              ...taskGitEnv.envPatch,
-              PATH: taskPath,
-              DOER_AGENT_TOKEN: args.agentToken,
-            },
-            stdio: ["pipe", "pipe", "pipe"],
-          })
-        : spawn(request.command ?? "", {
-            cwd: taskWorkspace,
-            shell: shellPath,
-            detached: process.platform !== "win32",
-            env: {
-              ...process.env,
-              ...baseTaskEnvPatch,
-              ...taskGitEnv.envPatch,
-              PATH: taskPath,
-              DOER_AGENT_TOKEN: args.agentToken,
-            },
-            stdio: ["ignore", "pipe", "pipe"],
-          });
-    if (request.kind === "apply_patch") {
-      child.stdin?.write(request.patch ?? "");
-      child.stdin?.end();
-    }
+    const child = spawnPreparedCommand({
+      kind: request.kind,
+      command: request.command,
+      patch: request.patch,
+      shellPath: prepared.shellPath,
+      taskWorkspace: prepared.taskWorkspace,
+      env: prepared.env,
+      agentToken: args.agentToken,
+    });
 
     writeRpcStatus(
       requestId,
-      `started kind=${request.kind} cwd=${taskWorkspace} shell=${request.kind === "shell" ? shellPath : "apply_patch"}`,
+      `started kind=${request.kind} cwd=${prepared.taskWorkspace} shell=${request.kind === "shell" ? prepared.shellPath : "apply_patch"}`,
     );
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
+    child.stdout!.on("data", (chunk: string) => {
       stdout += chunk;
       writeRpcStream(requestId, "stdout", chunk);
     });
-    child.stderr.on("data", (chunk: string) => {
+    child.stderr!.on("data", (chunk: string) => {
       stderr += chunk;
       writeRpcStream(requestId, "stderr", chunk);
     });
@@ -1166,6 +1482,7 @@ async function handleShellRpcMessage(args: {
     }).finally(() => {
       clearTimeout(timeout);
     });
+    await prepared.codexAuthCleanup().catch(() => undefined);
 
     publishShellRpcResponse({
       nc: args.jetstream.nc,
@@ -1509,6 +1826,119 @@ async function prepareCodexAuthBundle(bundle: CodexAuthBundleResponse | null): P
   };
 }
 
+async function prepareCommandExecution(args: {
+  cwd: string | null;
+  runtimeEnvPatch: Record<string, string>;
+  codexAuthBundle: CodexAuthBundleResponse | null;
+}): Promise<{
+  shellPath: string;
+  taskWorkspace: string;
+  taskPath: string;
+  env: NodeJS.ProcessEnv;
+  taskGitMeta: Record<string, unknown>;
+  codexAuthMeta: Record<string, unknown>;
+  codexAuthCleanup: () => Promise<void>;
+}> {
+  const shellPath = resolveShellPath();
+  const taskWorkspace = resolveTaskWorkspace(args.cwd);
+  const codexAuth = await prepareCodexAuthBundle(args.codexAuthBundle);
+  const baseTaskEnvPatch = {
+    ...args.runtimeEnvPatch,
+    ...(codexAuth?.envPatch ?? {}),
+    WORKSPACE: taskWorkspace,
+  };
+  const taskGitEnv = await prepareTaskGitEnv({
+    cwd: taskWorkspace,
+    baseEnvPatch: baseTaskEnvPatch,
+  });
+  const runtimeBinPath = path.join(AGENT_PROJECT_DIR, "runtime/bin");
+  const taskPath = [runtimeBinPath, process.env.PATH || ""].filter(Boolean).join(path.delimiter);
+  return {
+    shellPath,
+    taskWorkspace,
+    taskPath,
+    env: {
+      ...process.env,
+      ...baseTaskEnvPatch,
+      ...taskGitEnv.envPatch,
+      PATH: taskPath,
+    },
+    taskGitMeta: taskGitEnv.meta ?? {},
+    codexAuthMeta: codexAuth?.meta ?? { codexAuthSynced: false },
+    codexAuthCleanup: codexAuth?.cleanup ?? (async () => {}),
+  };
+}
+
+function spawnPreparedCommand(args: {
+  kind: "shell" | "apply_patch";
+  command: string | null;
+  patch: string | null;
+  shellPath: string;
+  taskWorkspace: string;
+  env: NodeJS.ProcessEnv;
+  agentToken: string;
+}): ReturnType<typeof spawn> {
+  const env = {
+    ...args.env,
+    DOER_AGENT_TOKEN: args.agentToken,
+  };
+  const child = args.kind === "apply_patch"
+    ? spawn("apply_patch", {
+        cwd: args.taskWorkspace,
+        detached: process.platform !== "win32",
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+    : spawn(args.command ?? "", {
+        cwd: args.taskWorkspace,
+        shell: args.shellPath,
+        detached: process.platform !== "win32",
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+  if (args.kind === "apply_patch") {
+    child.stdin?.write(args.patch ?? "");
+    child.stdin?.end();
+  }
+  child.stdout!.setEncoding("utf8");
+  child.stderr!.setEncoding("utf8");
+  return child;
+}
+
+function createManagedCancellation(child: ReturnType<typeof spawn>): {
+  requestCancel: () => void;
+  clear: () => void;
+} {
+  let cancelStage1Timer: NodeJS.Timeout | null = null;
+  let cancelStage2Timer: NodeJS.Timeout | null = null;
+  let cancelSignalSent = false;
+  return {
+    requestCancel: () => {
+      if (cancelSignalSent) {
+        return;
+      }
+      cancelSignalSent = true;
+      sendSignalToTaskProcess(child, "SIGINT");
+      cancelStage1Timer = setTimeout(() => {
+        sendSignalToTaskProcess(child, "SIGTERM");
+      }, 1200);
+      cancelStage1Timer.unref?.();
+      cancelStage2Timer = setTimeout(() => {
+        sendSignalToTaskProcess(child, "SIGKILL");
+      }, 3500);
+      cancelStage2Timer.unref?.();
+    },
+    clear: () => {
+      if (cancelStage1Timer) {
+        clearTimeout(cancelStage1Timer);
+      }
+      if (cancelStage2Timer) {
+        clearTimeout(cancelStage2Timer);
+      }
+    },
+  };
+}
+
 async function runTask(args: {
   serverBaseUrl: string;
   taskId: string;
@@ -1592,8 +2022,8 @@ async function runTask(args: {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
 
     const requestCancel = () => {
       if (cancelSignalSent || terminationReason === "cancel") {
@@ -1727,7 +2157,6 @@ async function connectBootstrapWithRetry(args: {
   agentToken: string;
 }): Promise<{
   natsBootstrap: AgentNatsBootstrapResponse;
-  pendingTaskIds: string[];
   jetstream: AgentJetStreamContext;
 }> {
   let attempt = 0;
@@ -1742,24 +2171,14 @@ async function connectBootstrapWithRetry(args: {
       if (natsServers.length === 0) {
         throw new Error("No NATS servers configured by server");
       }
-      const taskConfig = parseBootstrapTaskConfig(natsBootstrap.tasks);
-      if (!taskConfig) {
-        throw new Error("Invalid task dispatch config from server");
-      }
       const natsToken = normalizeNatsToken(natsBootstrap.auth);
-      const pendingTaskIds = normalizeTaskIds(natsBootstrap.pendingTaskIds);
       const jetstream = await initJetStreamContext({
         userId: args.userId,
         servers: natsServers,
         token: natsToken,
-        taskStream: taskConfig.stream,
-        taskSubject: taskConfig.subject,
-        taskDurable: taskConfig.durable,
       });
-      writeAgentInfraError(
-        `bootstrap ok servers=${natsServers.length} taskStream=${taskConfig.stream} taskSubject=${taskConfig.subject} taskDurable=${taskConfig.durable}`,
-      );
-      return { natsBootstrap, pendingTaskIds, jetstream };
+      writeAgentInfraError(`bootstrap ok servers=${natsServers.length} eventStream=${jetstream.stream} eventSubject=${jetstream.subject}`);
+      return { natsBootstrap, jetstream };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const retryMs = Math.min(30_000, 1000 * Math.max(1, attempt));
@@ -1786,12 +2205,11 @@ async function main() {
     throw new Error("user-id and agent-secret are required");
   }
   const agentToken = agentSecret;
-  let { natsBootstrap, pendingTaskIds, jetstream } = await connectBootstrapWithRetry({
+  const { natsBootstrap, jetstream } = await connectBootstrapWithRetry({
     serverBaseUrl,
     userId,
     agentToken,
   });
-  const maxConcurrency = Math.max(1, parseEnvInteger(process.env.DOER_AGENT_MAX_CONCURRENCY, 5));
   const agentVersion = await resolveAgentVersion();
   const initialAgentId = typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "";
   if (!initialAgentId) {
@@ -1809,11 +2227,6 @@ async function main() {
   process.stdout.write(`- natsStream: ${jetstream.stream}\n`);
   process.stdout.write(`- natsSubject: ${jetstream.subject}\n`);
   process.stdout.write(`- natsDurable: ${jetstream.durable}\n\n`);
-  process.stdout.write(`- taskStream: ${jetstream.taskStream}\n`);
-  process.stdout.write(`- taskSubject: ${jetstream.taskSubject}\n`);
-  process.stdout.write(`- taskDurable: ${jetstream.taskDurable}\n`);
-  process.stdout.write(`- pendingTasks: ${pendingTaskIds.length}\n`);
-  process.stdout.write(`- maxConcurrency: ${maxConcurrency}\n\n`);
   process.stdout.write(`- workspace: ${process.cwd()}\n\n`);
   if (requestedServerBaseUrl !== serverBaseUrl) {
     writeAgentInfo(
@@ -1839,30 +2252,6 @@ async function main() {
       });
   }, 10_000);
 
-  const inFlightTasks = new Set<Promise<void>>();
-
-  async function waitForAvailableSlot(): Promise<void> {
-    while (inFlightTasks.size >= maxConcurrency) {
-      try {
-        await Promise.race(inFlightTasks);
-      } catch {
-        // keep draining slots even when a task fails.
-      }
-    }
-  }
-
-  function trackInFlight(taskPromise: Promise<void>): void {
-    inFlightTasks.add(taskPromise);
-    void taskPromise.finally(() => {
-      inFlightTasks.delete(taskPromise);
-    });
-  }
-
-  function scheduleTask(taskPromiseFactory: () => Promise<void>): void {
-    const taskPromise = taskPromiseFactory();
-    trackInFlight(taskPromise);
-  }
-
   subscribeToFsRpc({
     jetstream,
     serverBaseUrl,
@@ -1876,181 +2265,15 @@ async function main() {
     agentId: initialAgentId,
     agentToken,
   });
-
-  for (const pendingTaskId of pendingTaskIds) {
-    await waitForAvailableSlot();
-    scheduleTask(async () => {
-      try {
-        const task = await claimTaskById({
-          serverBaseUrl,
-          userId,
-          agentToken,
-          taskId: pendingTaskId,
-        });
-        if (task) {
-          await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`pending task bootstrap failed taskId=${pendingTaskId}: ${message}`);
-      }
-    });
-  }
-
-  let connected = false;
-  while (true) {
-    try {
-      const consumer = await jetstream.js.consumers.get(jetstream.taskStream, jetstream.taskDurable);
-      if (!connected) {
-        writeAgentInfo(`connected to task stream (NATS ok) at=${formatLocalTimestamp()} userId=${userId}`);
-        connected = true;
-      }
-      const messages = await consumer.fetch({ max_messages: 200, expires: 5_000 });
-      for await (const msg of messages) {
-        await waitForAvailableSlot();
-        scheduleTask(async () => {
-          let dispatch: AgentTaskDispatchEnvelope;
-          try {
-            dispatch = jetstream.taskCodec.decode(msg.data);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            writeAgentError(`task dispatch decode failed: ${message}`);
-            msg.term();
-            return;
-          }
-          writeAgentInfo(
-            `task dispatch received taskId=${dispatch.taskId} createdAt=${dispatch.createdAt} subject=${jetstream.taskSubject} durable=${jetstream.taskDurable}`,
-          );
-
-          const ackKeepAliveIntervalMs = 10_000;
-          let ackKeepAliveTimer: NodeJS.Timeout | null = null;
-          const stopAckKeepAlive = () => {
-            if (ackKeepAliveTimer) {
-              clearInterval(ackKeepAliveTimer);
-              ackKeepAliveTimer = null;
-            }
-          };
-
-          try {
-            ackKeepAliveTimer = setInterval(() => {
-              try {
-                msg.working();
-              } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                writeAgentError(`task dispatch keepalive failed taskId=${dispatch.taskId}: ${message}`);
-              }
-            }, ackKeepAliveIntervalMs);
-            ackKeepAliveTimer.unref?.();
-
-            if (dispatch.type === "cancel") {
-              stopAckKeepAlive();
-              const canceled = requestTaskCancellation(dispatch.taskId, "nats_dispatch");
-              writeAgentInfo(
-                `task cancel dispatch handled taskId=${dispatch.taskId} result=${canceled ? "signaled" : "not-running"}`,
-              );
-              msg.ack();
-              return;
-            }
-
-            const task = await claimTaskById({
-              serverBaseUrl,
-              userId,
-              agentToken,
-              taskId: dispatch.taskId,
-            });
-            if (!task) {
-              stopAckKeepAlive();
-              writeAgentInfo(`task dispatch acked without run taskId=${dispatch.taskId} reason=already-claimed`);
-              msg.ack();
-              return;
-            }
-
-            await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
-            stopAckKeepAlive();
-            msg.ack();
-            writeAgentInfo(`task dispatch acked taskId=${dispatch.taskId}`);
-          } catch (error) {
-            stopAckKeepAlive();
-            const message = error instanceof Error ? error.message : String(error);
-            writeAgentError(`task dispatch handle failed taskId=${dispatch.taskId}: ${message}`);
-            writeAgentError(`task dispatch sending nak taskId=${dispatch.taskId}`);
-            msg.nak();
-          }
-        });
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (connected) {
-        writeAgentError(`task stream disconnected at=${formatLocalTimestamp()} reason=${message}`);
-      }
-      connected = false;
-      if (isLikelyNatsAuthError(error)) {
-        writeAgentError(`nats auth error detected. refreshing bootstrap credentials...`);
-      } else if (isLikelyNatsReconnectError(error)) {
-        writeAgentError(`nats connection lost. refreshing bootstrap/session...`);
-      } else {
-        writeAgentError(`task stream error detected. forcing bootstrap/session refresh... reason=${message}`);
-      }
-      if (inFlightTasks.size > 0) {
-        writeAgentInfo(`waiting for in-flight tasks before reconnect count=${inFlightTasks.size}`);
-        await Promise.allSettled(Array.from(inFlightTasks));
-      }
-      try {
-        await jetstream.nc.close();
-      } catch {
-        // noop
-      }
-      const refreshed = await connectBootstrapWithRetry({
-        serverBaseUrl,
-        userId,
-        agentToken,
-      });
-      natsBootstrap = refreshed.natsBootstrap;
-      pendingTaskIds = refreshed.pendingTaskIds;
-      jetstream = refreshed.jetstream;
-      const refreshedAgentId = typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "";
-      if (!refreshedAgentId) {
-        throw new Error("agent id missing from refreshed bootstrap");
-      }
-      subscribeToFsRpc({
-        jetstream,
-        serverBaseUrl,
-        userId,
-        agentId: refreshedAgentId,
-        agentToken,
-      });
-      subscribeToShellRpc({
-        jetstream,
-        userId,
-        agentId: refreshedAgentId,
-        agentToken,
-      });
-
-      for (const pendingTaskId of pendingTaskIds) {
-        await waitForAvailableSlot();
-        scheduleTask(async () => {
-          try {
-            const task = await claimTaskById({
-              serverBaseUrl,
-              userId,
-              agentToken,
-              taskId: pendingTaskId,
-            });
-            if (task) {
-              await runClaimedTask({ task, serverBaseUrl, userId, agentToken, jetstream });
-            }
-          } catch (pendingError) {
-            const pendingMessage = pendingError instanceof Error ? pendingError.message : String(pendingError);
-            writeAgentError(`pending task refresh failed taskId=${pendingTaskId}: ${pendingMessage}`);
-          }
-        });
-      }
-      writeAgentInfo(
-        `nats credentials refreshed at=${formatLocalTimestamp()} agentId=${typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "unknown"}`,
-      );
-      continue;
-    }
-  }
+  subscribeToRunRpc({
+    jetstream,
+    userId,
+    agentId: initialAgentId,
+    agentToken,
+  });
+  await new Promise<never>(() => {
+    // Keep the long-lived agent process alive for RPC subscriptions and heartbeat.
+  });
 }
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
