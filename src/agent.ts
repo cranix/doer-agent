@@ -100,6 +100,25 @@ interface AgentFsRpcRequest {
   agentId?: unknown;
 }
 
+interface AgentShellRpcRequest {
+  requestId?: unknown;
+  command?: unknown;
+  cwd?: unknown;
+  timeoutMs?: unknown;
+  responseSubject?: unknown;
+  agentId?: unknown;
+}
+
+interface AgentShellRpcResponse {
+  requestId: string;
+  ok: boolean;
+  exitCode: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+  error?: string;
+}
+
 interface ActiveTaskLogContext {
   jetstream: AgentJetStreamContext;
   serverBaseUrl: string;
@@ -111,6 +130,7 @@ let activeTaskLogContext: ActiveTaskLogContext | null = null;
 const activeTaskCancelRequests = new Map<string, () => void>();
 let workspaceRootOverride: string | null = null;
 const fsRpcCodec = StringCodec();
+const shellRpcCodec = StringCodec();
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -720,6 +740,10 @@ function buildAgentFsRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.fs.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
+function buildAgentShellRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.shell.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
 function normalizeFsRpcPath(rawPath: unknown): { abs: string; formatPath: (target: string) => string } {
   const root = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
   const raw = typeof rawPath === "string" && rawPath.trim() ? rawPath.trim() : ".";
@@ -940,6 +964,160 @@ function subscribeToFsRpc(args: {
     },
   });
   writeAgentInfo(`fs rpc subscribed subject=${subject}`);
+}
+
+function normalizeShellRpcRequest(args: {
+  request: AgentShellRpcRequest;
+  agentId: string;
+}): { requestId: string; command: string; cwd: string | null; timeoutMs: number; responseSubject: string } {
+  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
+  if (!requestId) {
+    throw new Error("missing requestId");
+  }
+  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
+  if (!requestAgentId) {
+    throw new Error("missing agentId");
+  }
+  if (requestAgentId !== args.agentId) {
+    throw new Error("agent id mismatch");
+  }
+  const command = typeof args.request.command === "string" ? args.request.command.trim() : "";
+  if (!command) {
+    throw new Error("missing command");
+  }
+  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
+  if (!responseSubject) {
+    throw new Error("missing responseSubject");
+  }
+  const cwd = typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null;
+  const timeoutRaw = Number(args.request.timeoutMs);
+  const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(1000, Math.min(Math.floor(timeoutRaw), 300000)) : 30000;
+  return { requestId, command, cwd, timeoutMs, responseSubject };
+}
+
+function publishShellRpcResponse(args: {
+  nc: NatsConnection;
+  responseSubject: string;
+  payload: AgentShellRpcResponse;
+}): void {
+  args.nc.publish(args.responseSubject, shellRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+async function handleShellRpcMessage(args: {
+  msg: Msg;
+  jetstream: AgentJetStreamContext;
+  agentId: string;
+}): Promise<void> {
+  let requestId = "unknown";
+  let responseSubject = "";
+  let stdout = "";
+  let stderr = "";
+  try {
+    const payload = JSON.parse(shellRpcCodec.decode(args.msg.data)) as AgentShellRpcRequest;
+    const request = normalizeShellRpcRequest({ request: payload, agentId: args.agentId });
+    requestId = request.requestId;
+    responseSubject = request.responseSubject;
+
+    const shellPath = resolveShellPath();
+    const taskWorkspace = resolveTaskWorkspace(request.cwd);
+    const runtimeBinPath = path.join(AGENT_PROJECT_DIR, "runtime/bin");
+    const taskPath = [runtimeBinPath, process.env.PATH || ""].filter(Boolean).join(path.delimiter);
+
+    const child = spawn(request.command, {
+      cwd: taskWorkspace,
+      shell: shellPath,
+      detached: process.platform !== "win32",
+      env: {
+        ...process.env,
+        WORKSPACE: taskWorkspace,
+        PATH: taskPath,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      sendSignalToTaskProcess(child, "SIGTERM");
+      setTimeout(() => {
+        sendSignalToTaskProcess(child, "SIGKILL");
+      }, 1000).unref?.();
+    }, request.timeoutMs);
+    timeout.unref?.();
+
+    const result = await new Promise<{ exitCode: number | null; signal: string | null }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => {
+        resolve({ exitCode: typeof code === "number" ? code : null, signal });
+      });
+    }).finally(() => {
+      clearTimeout(timeout);
+    });
+
+    publishShellRpcResponse({
+      nc: args.jetstream.nc,
+      responseSubject,
+      payload: {
+        requestId,
+        ok: !timedOut,
+        exitCode: result.exitCode,
+        signal: result.signal,
+        stdout,
+        stderr,
+        ...(timedOut ? { error: `Command timed out after ${request.timeoutMs}ms` } : {}),
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (responseSubject) {
+      publishShellRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: {
+          requestId,
+          ok: false,
+          exitCode: null,
+          signal: null,
+          stdout,
+          stderr,
+          error: message,
+        },
+      });
+    }
+    writeAgentError(`shell rpc failed requestId=${requestId} error=${message}`);
+  }
+}
+
+function subscribeToShellRpc(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): void {
+  const subject = buildAgentShellRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`shell rpc subscription error: ${message}`);
+        return;
+      }
+      void handleShellRpcMessage({
+        msg,
+        jetstream: args.jetstream,
+        agentId: args.agentId,
+      });
+    },
+  });
+  writeAgentInfo(`shell rpc subscribed subject=${subject}`);
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
@@ -1572,6 +1750,11 @@ async function main() {
     agentId: initialAgentId,
     agentToken,
   });
+  subscribeToShellRpc({
+    jetstream,
+    userId,
+    agentId: initialAgentId,
+  });
 
   for (const pendingTaskId of pendingTaskIds) {
     await waitForAvailableSlot();
@@ -1714,6 +1897,11 @@ async function main() {
         userId,
         agentId: refreshedAgentId,
         agentToken,
+      });
+      subscribeToShellRpc({
+        jetstream,
+        userId,
+        agentId: refreshedAgentId,
       });
 
       for (const pendingTaskId of pendingTaskIds) {
