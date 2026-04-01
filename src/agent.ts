@@ -101,8 +101,10 @@ interface AgentFsRpcRequest {
 }
 
 interface AgentShellRpcRequest {
+  kind?: unknown;
   requestId?: unknown;
   command?: unknown;
+  patch?: unknown;
   cwd?: unknown;
   timeoutMs?: unknown;
   responseSubject?: unknown;
@@ -122,8 +124,10 @@ interface AgentShellRpcResponse {
 }
 
 interface AgentShellRpcNormalizedRequest {
+  kind: "shell" | "apply_patch";
   requestId: string;
-  command: string;
+  command: string | null;
+  patch: string | null;
   cwd: string | null;
   timeoutMs: number;
   responseSubject: string;
@@ -993,9 +997,14 @@ function normalizeShellRpcRequest(args: {
   if (requestAgentId !== args.agentId) {
     throw new Error("agent id mismatch");
   }
+  const kind = args.request.kind === "apply_patch" ? "apply_patch" : "shell";
   const command = typeof args.request.command === "string" ? args.request.command.trim() : "";
-  if (!command) {
+  const patch = typeof args.request.patch === "string" ? args.request.patch : "";
+  if (kind === "shell" && !command) {
     throw new Error("missing command");
+  }
+  if (kind === "apply_patch" && !patch.trim()) {
+    throw new Error("missing patch");
   }
   const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
   if (!responseSubject) {
@@ -1005,8 +1014,10 @@ function normalizeShellRpcRequest(args: {
   const timeoutRaw = Number(args.request.timeoutMs);
   const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(1000, Math.min(Math.floor(timeoutRaw), 300000)) : 30000;
   return {
+    kind,
     requestId,
-    command,
+    command: kind === "shell" ? command : null,
+    patch: kind === "apply_patch" ? patch : null,
     cwd,
     timeoutMs,
     responseSubject,
@@ -1072,20 +1083,37 @@ async function handleShellRpcMessage(args: {
     });
     const runtimeBinPath = path.join(AGENT_PROJECT_DIR, "runtime/bin");
     const taskPath = [runtimeBinPath, process.env.PATH || ""].filter(Boolean).join(path.delimiter);
-
-    const child = spawn(request.command, {
-      cwd: taskWorkspace,
-      shell: shellPath,
-      detached: process.platform !== "win32",
-      env: {
-        ...process.env,
-        ...baseTaskEnvPatch,
-        ...taskGitEnv.envPatch,
-        PATH: taskPath,
-        DOER_AGENT_TOKEN: args.agentToken,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child =
+      request.kind === "apply_patch"
+        ? spawn("apply_patch", {
+            cwd: taskWorkspace,
+            detached: process.platform !== "win32",
+            env: {
+              ...process.env,
+              ...baseTaskEnvPatch,
+              ...taskGitEnv.envPatch,
+              PATH: taskPath,
+              DOER_AGENT_TOKEN: args.agentToken,
+            },
+            stdio: ["pipe", "pipe", "pipe"],
+          })
+        : spawn(request.command ?? "", {
+            cwd: taskWorkspace,
+            shell: shellPath,
+            detached: process.platform !== "win32",
+            env: {
+              ...process.env,
+              ...baseTaskEnvPatch,
+              ...taskGitEnv.envPatch,
+              PATH: taskPath,
+              DOER_AGENT_TOKEN: args.agentToken,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+    if (request.kind === "apply_patch") {
+      child.stdin?.write(request.patch ?? "");
+      child.stdin?.end();
+    }
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
