@@ -552,6 +552,22 @@ function writeTaskUpload(taskId: string, message: string): void {
   process.stdout.write(`[doer-agent][task=${taskId}][upload] ${message}\n`);
 }
 
+function writeRpcStream(requestId: string, stream: "stdout" | "stderr", chunk: string): void {
+  const target = stream === "stdout" ? process.stdout : process.stderr;
+  const lines = chunk.replace(/\r/g, "\n").split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.length === 0 && i === lines.length - 1) {
+      continue;
+    }
+    target.write(`[doer-agent][rpc=${requestId}][${stream}] ${line}\n`);
+  }
+}
+
+function writeRpcStatus(requestId: string, message: string): void {
+  process.stdout.write(`[doer-agent][rpc=${requestId}][status] ${message}\n`);
+}
+
 function isLikelyNatsAuthError(error: unknown): boolean {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
   return (
@@ -1068,6 +1084,7 @@ async function handleShellRpcMessage(args: {
     const request = normalizeShellRpcRequest({ request: payload, agentId: args.agentId });
     requestId = request.requestId;
     responseSubject = request.responseSubject;
+    const startedAtMs = Date.now();
 
     const shellPath = resolveShellPath();
     const taskWorkspace = resolveTaskWorkspace(request.cwd);
@@ -1115,13 +1132,20 @@ async function handleShellRpcMessage(args: {
       child.stdin?.end();
     }
 
+    writeRpcStatus(
+      requestId,
+      `started kind=${request.kind} cwd=${taskWorkspace} shell=${request.kind === "shell" ? shellPath : "apply_patch"}`,
+    );
+
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
+      writeRpcStream(requestId, "stdout", chunk);
     });
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
+      writeRpcStream(requestId, "stderr", chunk);
     });
 
     let timedOut = false;
@@ -1156,6 +1180,10 @@ async function handleShellRpcMessage(args: {
         ...(timedOut ? { error: `Command timed out after ${request.timeoutMs}ms` } : {}),
       },
     });
+    writeRpcStatus(
+      requestId,
+      `${timedOut ? "timed_out" : "completed"} exitCode=${result.exitCode ?? "null"} signal=${result.signal ?? "null"} durationMs=${Date.now() - startedAtMs}`,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (responseSubject) {
@@ -1173,6 +1201,7 @@ async function handleShellRpcMessage(args: {
         },
       });
     }
+    writeRpcStatus(requestId, `failed error=${message}`);
     writeAgentError(`shell rpc failed requestId=${requestId} error=${message}`);
   }
 }
