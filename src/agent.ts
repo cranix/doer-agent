@@ -720,6 +720,7 @@ function getStoredRun(runId: string): PublicRunTask | null {
 async function startManagedRun(args: {
   requestId: string;
   runId: string;
+  serverBaseUrl: string;
   userId: string;
   agentId: string;
   command: string;
@@ -831,6 +832,17 @@ async function startManagedRun(args: {
     activeRuns.delete(task.id);
     logStream.end();
     void prepared.codexAuthCleanup().catch(() => undefined);
+    if ((task.status === "completed" || task.status === "failed") && task.chatId) {
+      void notifyServerRunFinished({
+        serverBaseUrl: args.serverBaseUrl,
+        userId: args.userId,
+        agentToken: args.agentToken,
+        task,
+      }).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentInfraError(`run completion notify failed runId=${task.id}: ${message}`);
+      });
+    }
     writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
   });
 
@@ -840,7 +852,37 @@ async function startManagedRun(args: {
   return cloneRunTask(task);
 }
 
-async function handleRunRpcMessage(args: { msg: Msg; jetstream: AgentJetStreamContext; userId: string; agentId: string; agentToken: string }): Promise<void> {
+async function notifyServerRunFinished(args: {
+  serverBaseUrl: string;
+  userId: string;
+  agentToken: string;
+  task: PublicRunTask;
+}): Promise<void> {
+  if (!args.task.chatId || (args.task.status !== "completed" && args.task.status !== "failed")) {
+    return;
+  }
+  await postJson<{ ok?: boolean }>(`${args.serverBaseUrl}/api/agent/run-finished`, {
+    userId: args.userId,
+    agentToken: args.agentToken,
+    chatId: args.task.chatId,
+    runId: args.task.id,
+    command: args.task.command,
+    status: args.task.status,
+    exitCode: args.task.resultExitCode,
+    signal: args.task.resultSignal,
+    finishedAt: args.task.finishedAt,
+    error: args.task.error,
+  });
+}
+
+async function handleRunRpcMessage(args: {
+  msg: Msg;
+  jetstream: AgentJetStreamContext;
+  serverBaseUrl: string;
+  userId: string;
+  agentId: string;
+  agentToken: string;
+}): Promise<void> {
   let requestId = "unknown";
   let responseSubject = "";
   try {
@@ -853,6 +895,7 @@ async function handleRunRpcMessage(args: { msg: Msg; jetstream: AgentJetStreamCo
       const task = await startManagedRun({
         requestId,
         runId: request.runId ?? requestId,
+        serverBaseUrl: args.serverBaseUrl,
         userId: args.userId,
         agentId: args.agentId,
         command: request.command ?? "",
@@ -904,7 +947,13 @@ async function handleRunRpcMessage(args: { msg: Msg; jetstream: AgentJetStreamCo
   }
 }
 
-function subscribeToRunRpc(args: { jetstream: AgentJetStreamContext; userId: string; agentId: string; agentToken: string }): void {
+function subscribeToRunRpc(args: {
+  jetstream: AgentJetStreamContext;
+  serverBaseUrl: string;
+  userId: string;
+  agentId: string;
+  agentToken: string;
+}): void {
   const subject = buildAgentRunRpcSubject(args.userId, args.agentId);
   args.jetstream.nc.subscribe(subject, {
     callback: (error, msg) => {
@@ -913,7 +962,14 @@ function subscribeToRunRpc(args: { jetstream: AgentJetStreamContext; userId: str
         writeAgentError(`run rpc subscription error: ${message}`);
         return;
       }
-      void handleRunRpcMessage({ msg, jetstream: args.jetstream, userId: args.userId, agentId: args.agentId, agentToken: args.agentToken });
+      void handleRunRpcMessage({
+        msg,
+        jetstream: args.jetstream,
+        serverBaseUrl: args.serverBaseUrl,
+        userId: args.userId,
+        agentId: args.agentId,
+        agentToken: args.agentToken,
+      });
     },
   });
   writeAgentInfo(`run rpc subscribed subject=${subject}`);
@@ -2267,6 +2323,7 @@ async function main() {
   });
   subscribeToRunRpc({
     jetstream,
+    serverBaseUrl,
     userId,
     agentId: initialAgentId,
     agentToken,
