@@ -107,6 +107,8 @@ interface AgentShellRpcRequest {
   timeoutMs?: unknown;
   responseSubject?: unknown;
   agentId?: unknown;
+  runtimeEnvPatch?: unknown;
+  codexAuth?: unknown;
 }
 
 interface AgentShellRpcResponse {
@@ -117,6 +119,16 @@ interface AgentShellRpcResponse {
   stdout: string;
   stderr: string;
   error?: string;
+}
+
+interface AgentShellRpcNormalizedRequest {
+  requestId: string;
+  command: string;
+  cwd: string | null;
+  timeoutMs: number;
+  responseSubject: string;
+  runtimeEnvPatch: Record<string, string>;
+  codexAuthBundle: CodexAuthBundleResponse | null;
 }
 
 interface ActiveTaskLogContext {
@@ -969,7 +981,7 @@ function subscribeToFsRpc(args: {
 function normalizeShellRpcRequest(args: {
   request: AgentShellRpcRequest;
   agentId: string;
-}): { requestId: string; command: string; cwd: string | null; timeoutMs: number; responseSubject: string } {
+}): AgentShellRpcNormalizedRequest {
   const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
   if (!requestId) {
     throw new Error("missing requestId");
@@ -992,7 +1004,34 @@ function normalizeShellRpcRequest(args: {
   const cwd = typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null;
   const timeoutRaw = Number(args.request.timeoutMs);
   const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(1000, Math.min(Math.floor(timeoutRaw), 300000)) : 30000;
-  return { requestId, command, cwd, timeoutMs, responseSubject };
+  return {
+    requestId,
+    command,
+    cwd,
+    timeoutMs,
+    responseSubject,
+    runtimeEnvPatch: normalizeEnvPatch(args.request.runtimeEnvPatch),
+    codexAuthBundle: normalizeShellRpcCodexAuthBundle(args.request.codexAuth),
+  };
+}
+
+function normalizeShellRpcCodexAuthBundle(value: unknown): CodexAuthBundleResponse | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const row = value as Record<string, unknown>;
+  const authJson = typeof row.authJson === "string" ? row.authJson : null;
+  if (!authJson) {
+    return null;
+  }
+  return {
+    taskId: typeof row.taskId === "string" ? row.taskId : undefined,
+    authMode: row.authMode === "oauth" ? "oauth" : row.authMode === "api_key" ? "api_key" : undefined,
+    issuedAt: typeof row.issuedAt === "string" ? row.issuedAt : undefined,
+    expiresAt: typeof row.expiresAt === "string" ? row.expiresAt : undefined,
+    authJson,
+    apiKey: typeof row.apiKey === "string" || row.apiKey === null ? row.apiKey : undefined,
+  };
 }
 
 function publishShellRpcResponse(args: {
@@ -1007,6 +1046,7 @@ async function handleShellRpcMessage(args: {
   msg: Msg;
   jetstream: AgentJetStreamContext;
   agentId: string;
+  agentToken: string;
 }): Promise<void> {
   let requestId = "unknown";
   let responseSubject = "";
@@ -1020,6 +1060,16 @@ async function handleShellRpcMessage(args: {
 
     const shellPath = resolveShellPath();
     const taskWorkspace = resolveTaskWorkspace(request.cwd);
+    const codexAuth = await prepareCodexAuthBundle(request.codexAuthBundle);
+    const baseTaskEnvPatch = {
+      ...request.runtimeEnvPatch,
+      ...(codexAuth?.envPatch ?? {}),
+      WORKSPACE: taskWorkspace,
+    };
+    const taskGitEnv = await prepareTaskGitEnv({
+      cwd: taskWorkspace,
+      baseEnvPatch: baseTaskEnvPatch,
+    });
     const runtimeBinPath = path.join(AGENT_PROJECT_DIR, "runtime/bin");
     const taskPath = [runtimeBinPath, process.env.PATH || ""].filter(Boolean).join(path.delimiter);
 
@@ -1029,8 +1079,10 @@ async function handleShellRpcMessage(args: {
       detached: process.platform !== "win32",
       env: {
         ...process.env,
-        WORKSPACE: taskWorkspace,
+        ...baseTaskEnvPatch,
+        ...taskGitEnv.envPatch,
         PATH: taskPath,
+        DOER_AGENT_TOKEN: args.agentToken,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1101,6 +1153,7 @@ function subscribeToShellRpc(args: {
   jetstream: AgentJetStreamContext;
   userId: string;
   agentId: string;
+  agentToken: string;
 }): void {
   const subject = buildAgentShellRpcSubject(args.userId, args.agentId);
   args.jetstream.nc.subscribe(subject, {
@@ -1114,6 +1167,7 @@ function subscribeToShellRpc(args: {
         msg,
         jetstream: args.jetstream,
         agentId: args.agentId,
+        agentToken: args.agentToken,
       });
     },
   });
@@ -1357,6 +1411,15 @@ async function prepareTaskCodexAuth(args: {
     writeAgentError(`task=${args.taskId} codex auth sync skipped: ${message}`);
     return null;
   });
+
+  return await prepareCodexAuthBundle(bundle);
+}
+
+async function prepareCodexAuthBundle(bundle: CodexAuthBundleResponse | null): Promise<{
+  envPatch: Record<string, string>;
+  cleanup: () => Promise<void>;
+  meta: Record<string, unknown>;
+} | null> {
 
   if (!bundle || typeof bundle.authJson !== "string") {
     return null;
@@ -1754,6 +1817,7 @@ async function main() {
     jetstream,
     userId,
     agentId: initialAgentId,
+    agentToken,
   });
 
   for (const pendingTaskId of pendingTaskIds) {
@@ -1902,6 +1966,7 @@ async function main() {
         jetstream,
         userId,
         agentId: refreshedAgentId,
+        agentToken,
       });
 
       for (const pendingTaskId of pendingTaskIds) {
