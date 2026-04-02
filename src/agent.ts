@@ -1897,8 +1897,11 @@ async function prepareCommandExecution(args: {
 }> {
   const shellPath = resolveShellPath();
   const taskWorkspace = resolveTaskWorkspace(args.cwd);
+  const codexHome = resolveCodexHomePath();
+  await mkdir(codexHome, { recursive: true });
   const codexAuth = await prepareCodexAuthBundle(args.codexAuthBundle);
   const baseTaskEnvPatch = {
+    CODEX_HOME: codexHome,
     ...args.runtimeEnvPatch,
     ...(codexAuth?.envPatch ?? {}),
     WORKSPACE: taskWorkspace,
@@ -2012,6 +2015,8 @@ async function runTask(args: {
   };
   const shellPath = resolveShellPath();
   const taskWorkspace = resolveTaskWorkspace(args.cwd);
+  const codexHome = resolveCodexHomePath();
+  await mkdir(codexHome, { recursive: true });
   const runtimeConfig = await prepareTaskRuntimeConfig({
     serverBaseUrl: args.serverBaseUrl,
     taskId: args.taskId,
@@ -2025,6 +2030,7 @@ async function runTask(args: {
     agentToken: args.agentToken,
   });
   const baseTaskEnvPatch = {
+    CODEX_HOME: codexHome,
     ...(runtimeConfig?.envPatch ?? {}),
     ...(codexAuth?.envPatch ?? {}),
     WORKSPACE: taskWorkspace,
@@ -2250,6 +2256,9 @@ async function main() {
   const startupWorkspaceRoot = path.resolve(workspaceDir || process.cwd());
   workspaceRootOverride = startupWorkspaceRoot;
   process.chdir(startupWorkspaceRoot);
+  process.env.WORKSPACE = startupWorkspaceRoot;
+  process.env.CODEX_HOME = path.join(startupWorkspaceRoot, ".codex");
+  await mkdir(process.env.CODEX_HOME, { recursive: true }).catch(() => undefined);
 
   const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], DEFAULT_SERVER_BASE_URL);
   const requestedServerBaseUrl = serverBaseUrlRaw.replace(/\/$/, "");
