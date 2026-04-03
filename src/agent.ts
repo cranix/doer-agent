@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream, existsSync, statSync } from "node:fs";
-import { chmod, mkdir, open, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { createWriteStream, existsSync, statSync, watch } from "node:fs";
+import { chmod, mkdir, open, readFile, readdir, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
@@ -68,7 +68,7 @@ interface AgentJetStreamContext {
   servers: string[];
 }
 
-type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text";
+type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file";
 
 interface AgentFsRpcRequest {
   requestId?: unknown;
@@ -77,10 +77,49 @@ interface AgentFsRpcRequest {
   offset?: unknown;
   length?: unknown;
   limit?: unknown;
+  maxBytes?: unknown;
   encoding?: unknown;
   uploadUrl?: unknown;
   chatId?: unknown;
   agentId?: unknown;
+}
+
+type AgentSessionRpcAction = "list" | "messages" | "delete" | "watch" | "stop_watch";
+
+interface AgentSessionRpcRequest {
+  requestId?: unknown;
+  action?: unknown;
+  agentId?: unknown;
+  filePath?: unknown;
+  beforeRowId?: unknown;
+  pageSize?: unknown;
+  responseSubject?: unknown;
+  watchId?: unknown;
+}
+
+interface AgentSessionRpcResponse {
+  requestId: string;
+  ok: boolean;
+  action?: AgentSessionRpcAction;
+  sessions?: unknown[];
+  messages?: unknown[];
+  nextCursor?: number;
+  hasMoreBefore?: boolean;
+  oldestRowId?: number | null;
+  watchId?: string | null;
+  event?: Record<string, unknown> | null;
+  error?: string;
+}
+
+interface AgentSessionRpcNormalizedRequest {
+  requestId: string;
+  action: AgentSessionRpcAction;
+  agentId: string;
+  filePath: string | null;
+  beforeRowId: number | null;
+  pageSize: number;
+  responseSubject: string;
+  watchId: string | null;
 }
 
 interface AgentShellRpcRequest {
@@ -109,6 +148,51 @@ interface AgentRunRpcRequest {
   limit?: unknown;
   runtimeEnvPatch?: unknown;
   codexAuth?: unknown;
+}
+
+interface AgentCodexRpcRequest {
+  requestId?: unknown;
+  responseSubject?: unknown;
+  agentId?: unknown;
+  runId?: unknown;
+  prompt?: unknown;
+  sessionId?: unknown;
+  cwd?: unknown;
+  chatId?: unknown;
+  model?: unknown;
+  runtimeEnvPatch?: unknown;
+  codexAuth?: unknown;
+}
+
+interface AgentCodexRpcResponse {
+  requestId: string;
+  ok: boolean;
+  task?: PublicRunTask | null;
+  error?: string;
+}
+
+interface AgentGitRpcRequest {
+  requestId?: unknown;
+  responseSubject?: unknown;
+  agentId?: unknown;
+  targetPath?: unknown;
+  base?: unknown;
+  target?: unknown;
+  mergeBase?: unknown;
+  staged?: unknown;
+  format?: unknown;
+  contextLines?: unknown;
+  ignoreWhitespace?: unknown;
+  diffAlgorithm?: unknown;
+  findRenames?: unknown;
+  pathspecs?: unknown;
+}
+
+interface AgentGitRpcResponse {
+  requestId: string;
+  ok: boolean;
+  payload?: Record<string, unknown> | null;
+  error?: string;
 }
 
 interface AgentRunRpcResponse {
@@ -203,8 +287,12 @@ let workspaceRootOverride: string | null = null;
 const fsRpcCodec = StringCodec();
 const shellRpcCodec = StringCodec();
 const runRpcCodec = StringCodec();
+const sessionRpcCodec = StringCodec();
+const codexRpcCodec = StringCodec();
+const gitRpcCodec = StringCodec();
 const activeRuns = new Map<string, ActiveRunRecord>();
 const retainedRuns = new Map<string, PublicRunTask>();
+const activeSessionWatchers = new Map<string, () => void>();
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -213,6 +301,18 @@ function sanitizeUserId(userId: string): string {
 
 function buildAgentRunRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.run.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function buildAgentSessionRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.session.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function buildAgentCodexRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.codex.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function buildAgentGitRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.git.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function normalizeNatsServers(value: unknown): string[] {
@@ -852,6 +952,522 @@ async function startManagedRun(args: {
   return cloneRunTask(task);
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function normalizeCodexModel(value: unknown): string {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  return normalized || "gpt-5.4";
+}
+
+function normalizeCodexRpcRequest(args: {
+  request: AgentCodexRpcRequest;
+  agentId: string;
+}): {
+  requestId: string;
+  responseSubject: string;
+  runId: string;
+  prompt: string;
+  sessionId: string | null;
+  cwd: string | null;
+  chatId: string | null;
+  model: string;
+  runtimeEnvPatch: Record<string, string>;
+  codexAuthBundle: CodexAuthBundleResponse | null;
+} {
+  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
+  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
+  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
+  const runId = typeof args.request.runId === "string" ? args.request.runId.trim() : "";
+  const prompt = typeof args.request.prompt === "string" ? args.request.prompt.trim() : "";
+  if (!requestId || !responseSubject || !requestAgentId || requestAgentId !== args.agentId || !runId || !prompt) {
+    throw new Error("invalid codex rpc request");
+  }
+  return {
+    requestId,
+    responseSubject,
+    runId,
+    prompt,
+    sessionId: typeof args.request.sessionId === "string" && args.request.sessionId.trim() ? args.request.sessionId.trim() : null,
+    cwd: typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null,
+    chatId: typeof args.request.chatId === "string" && args.request.chatId.trim() ? args.request.chatId.trim() : null,
+    model: normalizeCodexModel(args.request.model),
+    runtimeEnvPatch: normalizeEnvPatch(args.request.runtimeEnvPatch),
+    codexAuthBundle: normalizeShellRpcCodexAuthBundle(args.request.codexAuth),
+  };
+}
+
+function buildManagedCodexCommand(args: {
+  prompt: string;
+  sessionId: string | null;
+  model: string;
+}): string {
+  const fixedArgs = ["--dangerously-bypass-approvals-and-sandbox"];
+  const codexArgs = args.sessionId
+    ? ["exec", "resume", "--json", args.sessionId, args.prompt]
+    : ["exec", "--json", args.prompt];
+  const commandArgs = [...fixedArgs, "--model", args.model, ...codexArgs].map(shellSingleQuote).join(" ");
+  const direct = `exec codex ${commandArgs}`;
+  const fallback = `exec npm exec --yes --package doer-agent -- codex ${commandArgs}`;
+  const script = [
+    "if command -v codex >/dev/null 2>&1; then",
+    `  ${direct}`,
+    "fi",
+    fallback,
+  ].join("\n");
+  return `bash -lc ${shellSingleQuote(script)}`;
+}
+
+function publishCodexRpcResponse(args: {
+  nc: NatsConnection;
+  responseSubject: string;
+  payload: AgentCodexRpcResponse;
+}): void {
+  args.nc.publish(args.responseSubject, codexRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+async function handleCodexRpcMessage(args: {
+  msg: Msg;
+  jetstream: AgentJetStreamContext;
+  serverBaseUrl: string;
+  userId: string;
+  agentId: string;
+  agentToken: string;
+}): Promise<void> {
+  let requestId = "unknown";
+  let responseSubject = "";
+  try {
+    const payload = JSON.parse(codexRpcCodec.decode(args.msg.data)) as AgentCodexRpcRequest;
+    const request = normalizeCodexRpcRequest({ request: payload, agentId: args.agentId });
+    requestId = request.requestId;
+    responseSubject = request.responseSubject;
+    const task = await startManagedRun({
+      requestId,
+      runId: request.runId,
+      serverBaseUrl: args.serverBaseUrl,
+      userId: args.userId,
+      agentId: args.agentId,
+      command: buildManagedCodexCommand({
+        prompt: request.prompt,
+        sessionId: request.sessionId,
+        model: request.model,
+      }),
+      cwd: request.cwd,
+      chatId: request.chatId,
+      runtimeEnvPatch: request.runtimeEnvPatch,
+      codexAuthBundle: request.codexAuthBundle,
+      agentToken: args.agentToken,
+    });
+    publishCodexRpcResponse({
+      nc: args.jetstream.nc,
+      responseSubject,
+      payload: { requestId, ok: true, task },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (responseSubject) {
+      publishCodexRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: false, error: message },
+      });
+    }
+    writeAgentError(`codex rpc failed requestId=${requestId} error=${message}`);
+  }
+}
+
+function subscribeToCodexRpc(args: {
+  jetstream: AgentJetStreamContext;
+  serverBaseUrl: string;
+  userId: string;
+  agentId: string;
+  agentToken: string;
+}): void {
+  const subject = buildAgentCodexRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`codex rpc subscription error: ${message}`);
+        return;
+      }
+      void handleCodexRpcMessage({
+        msg,
+        jetstream: args.jetstream,
+        serverBaseUrl: args.serverBaseUrl,
+        userId: args.userId,
+        agentId: args.agentId,
+        agentToken: args.agentToken,
+      });
+    },
+  });
+  writeAgentInfo(`codex rpc subscribed subject=${subject}`);
+}
+
+type AgentGitDiffFormat = "patch" | "name-only" | "name-status" | "stat" | "numstat" | "raw";
+type AgentGitDiffIgnoreWhitespace = "none" | "at-eol" | "change" | "all";
+type AgentGitDiffAlgorithm = "default" | "minimal" | "patience" | "histogram";
+
+function runLocalCommand(command: string, args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr!.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code) => {
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
+  });
+}
+
+function sanitizeGitRef(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (trimmed.startsWith("-") || /\s/.test(trimmed) || trimmed.includes("..") || trimmed.includes(":")) {
+    throw new Error(`Invalid git ref: ${trimmed}`);
+  }
+  return trimmed;
+}
+
+function sanitizeGitPathspec(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new Error("Invalid pathspec");
+  }
+  const trimmed = value.trim().replace(/\\/g, "/");
+  if (!trimmed || trimmed.startsWith("-") || trimmed.includes("\0")) {
+    throw new Error(`Invalid pathspec: ${trimmed}`);
+  }
+  return trimmed;
+}
+
+function normalizeGitRpcRequest(args: {
+  request: AgentGitRpcRequest;
+  agentId: string;
+}): {
+  requestId: string;
+  responseSubject: string;
+  targetPath: string;
+  base: string | null;
+  target: string | null;
+  mergeBase: boolean;
+  staged: boolean;
+  format: AgentGitDiffFormat;
+  contextLines: number | null;
+  ignoreWhitespace: AgentGitDiffIgnoreWhitespace;
+  diffAlgorithm: AgentGitDiffAlgorithm;
+  findRenames: boolean;
+  pathspecs: string[];
+} {
+  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
+  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
+  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
+  const targetPath = typeof args.request.targetPath === "string" ? args.request.targetPath.trim() : "";
+  if (!requestId || !responseSubject || !requestAgentId || requestAgentId !== args.agentId || !targetPath) {
+    throw new Error("invalid git rpc request");
+  }
+  const format =
+    args.request.format === "name-only" ||
+    args.request.format === "name-status" ||
+    args.request.format === "stat" ||
+    args.request.format === "numstat" ||
+    args.request.format === "raw"
+      ? args.request.format
+      : "patch";
+  const ignoreWhitespace =
+    args.request.ignoreWhitespace === "at-eol" ||
+    args.request.ignoreWhitespace === "change" ||
+    args.request.ignoreWhitespace === "all"
+      ? args.request.ignoreWhitespace
+      : "none";
+  const diffAlgorithm =
+    args.request.diffAlgorithm === "minimal" ||
+    args.request.diffAlgorithm === "patience" ||
+    args.request.diffAlgorithm === "histogram"
+      ? args.request.diffAlgorithm
+      : "default";
+  const contextRaw = Number(args.request.contextLines);
+  const contextLines = Number.isFinite(contextRaw) ? Math.max(0, Math.min(200, Math.trunc(contextRaw))) : null;
+  const pathspecs = Array.isArray(args.request.pathspecs) ? args.request.pathspecs.map((item) => sanitizeGitPathspec(item)) : [];
+  return {
+    requestId,
+    responseSubject,
+    targetPath,
+    base: sanitizeGitRef(args.request.base),
+    target: sanitizeGitRef(args.request.target),
+    mergeBase: args.request.mergeBase === true,
+    staged: args.request.staged === true,
+    format,
+    contextLines,
+    ignoreWhitespace,
+    diffAlgorithm,
+    findRenames: args.request.findRenames === true,
+    pathspecs,
+  };
+}
+
+function buildAgentGitDiffArgs(repoRootAbs: string, request: ReturnType<typeof normalizeGitRpcRequest>): { args: string[]; display: string } {
+  const args = ["-C", repoRootAbs, "diff", "--no-color"];
+  const displayParts = ["git", "diff", "--no-color"];
+  if (request.staged) {
+    args.push("--cached");
+    displayParts.push("--cached");
+  }
+  if (typeof request.contextLines === "number") {
+    args.push(`-U${request.contextLines}`);
+    displayParts.push(`-U${request.contextLines}`);
+  }
+  if (request.ignoreWhitespace === "at-eol") {
+    args.push("--ignore-space-at-eol");
+    displayParts.push("--ignore-space-at-eol");
+  } else if (request.ignoreWhitespace === "change") {
+    args.push("--ignore-space-change");
+    displayParts.push("--ignore-space-change");
+  } else if (request.ignoreWhitespace === "all") {
+    args.push("--ignore-all-space");
+    displayParts.push("--ignore-all-space");
+  }
+  if (request.diffAlgorithm !== "default") {
+    args.push(`--diff-algorithm=${request.diffAlgorithm}`);
+    displayParts.push(`--diff-algorithm=${request.diffAlgorithm}`);
+  }
+  if (request.findRenames) {
+    args.push("--find-renames");
+    displayParts.push("--find-renames");
+  }
+  if (request.format === "name-only") {
+    args.push("--name-only");
+    displayParts.push("--name-only");
+  } else if (request.format === "name-status") {
+    args.push("--name-status");
+    displayParts.push("--name-status");
+  } else if (request.format === "stat") {
+    args.push("--stat");
+    displayParts.push("--stat");
+  } else if (request.format === "numstat") {
+    args.push("--numstat");
+    displayParts.push("--numstat");
+  } else if (request.format === "raw") {
+    args.push("--raw");
+    displayParts.push("--raw");
+  }
+  if (request.mergeBase) {
+    if (!request.base || !request.target) {
+      throw new Error("mergeBase mode requires both base and target");
+    }
+    const merged = `${request.base}...${request.target}`;
+    args.push(merged);
+    displayParts.push(merged);
+  } else {
+    if (request.base) {
+      args.push(request.base);
+      displayParts.push(request.base);
+    }
+    if (request.target) {
+      args.push(request.target);
+      displayParts.push(request.target);
+    }
+  }
+  if (request.pathspecs.length > 0) {
+    args.push("--", ...request.pathspecs);
+    displayParts.push("--", ...request.pathspecs);
+  }
+  return { args, display: displayParts.join(" ") };
+}
+
+function buildUntrackedText(format: AgentGitDiffFormat, untrackedPaths: string[]): string {
+  if (untrackedPaths.length === 0) {
+    return "";
+  }
+  if (format === "name-status" || format === "raw") {
+    return `${untrackedPaths.map((item) => `??\t${item}`).join("\n")}\n`;
+  }
+  if (format === "name-only") {
+    return `${untrackedPaths.join("\n")}\n`;
+  }
+  return `\n# Untracked files\n${untrackedPaths.join("\n")}\n`;
+}
+
+async function appendAgentLocalUntrackedDiff(
+  repoRootAbs: string,
+  request: ReturnType<typeof normalizeGitRpcRequest>,
+  baseOutput: string,
+): Promise<{ output: string; hasUntracked: boolean }> {
+  const listArgs = ["-C", repoRootAbs, "ls-files", "--others", "--exclude-standard"];
+  if (request.pathspecs.length > 0) {
+    listArgs.push("--", ...request.pathspecs);
+  }
+  const listResult = await runLocalCommand("git", listArgs, repoRootAbs);
+  if (listResult.code !== 0) {
+    return { output: baseOutput, hasUntracked: false };
+  }
+  const untrackedPaths = listResult.stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+  if (untrackedPaths.length === 0) {
+    return { output: baseOutput, hasUntracked: false };
+  }
+  if (request.format !== "patch") {
+    return { output: `${baseOutput}${buildUntrackedText(request.format, untrackedPaths)}`, hasUntracked: true };
+  }
+  let output = baseOutput;
+  for (const relPath of untrackedPaths) {
+    const diffResult = await runLocalCommand("git", ["-C", repoRootAbs, "diff", "--no-color", "--no-index", "--", "/dev/null", relPath], repoRootAbs);
+    if (diffResult.code !== 0 && diffResult.code !== 1) {
+      throw new Error(diffResult.stderr.trim() || `Failed to render agent untracked diff: ${relPath}`);
+    }
+    if (diffResult.stdout) {
+      output += diffResult.stdout;
+      if (!output.endsWith("\n")) {
+        output += "\n";
+      }
+    }
+  }
+  return { output, hasUntracked: true };
+}
+
+function publishGitRpcResponse(args: {
+  nc: NatsConnection;
+  responseSubject: string;
+  payload: AgentGitRpcResponse;
+}): void {
+  args.nc.publish(args.responseSubject, gitRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+async function handleGitRpcMessage(args: {
+  msg: Msg;
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): Promise<void> {
+  let requestId = "unknown";
+  let responseSubject = "";
+  try {
+    const payload = JSON.parse(gitRpcCodec.decode(args.msg.data)) as AgentGitRpcRequest;
+    const request = normalizeGitRpcRequest({ request: payload, agentId: args.agentId });
+    requestId = request.requestId;
+    responseSubject = request.responseSubject;
+    if (!request.targetPath.startsWith("/")) {
+      throw new Error("agent source requires an absolute directory path");
+    }
+
+    const topLevelResult = await runLocalCommand("git", ["-C", request.targetPath, "rev-parse", "--show-toplevel"], request.targetPath);
+    if (topLevelResult.code !== 0) {
+      publishGitRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: {
+          requestId,
+          ok: true,
+          payload: {
+            isGitRepo: false,
+            mode: "git_diff",
+            source: "agent",
+            agent: { id: args.agentId, name: null },
+            currentPath: request.targetPath,
+            repoRoot: null,
+            repoRelativePath: null,
+            branch: null,
+            gitDiff: {
+              command: "git diff --no-color",
+              format: "patch",
+              output: "",
+              outputTruncated: false,
+            },
+            message: "현재 경로가 Git 저장소가 아닙니다.",
+          },
+        },
+      });
+      return;
+    }
+
+    const repoRootAbs = topLevelResult.stdout.trim();
+    const prefixResult = await runLocalCommand("git", ["-C", request.targetPath, "rev-parse", "--show-prefix"], request.targetPath);
+    const repoRelativePath = prefixResult.code === 0 ? (prefixResult.stdout.trim().replace(/\/$/, "") || ".") : ".";
+    const branchResult = await runLocalCommand("git", ["-C", repoRootAbs, "symbolic-ref", "--quiet", "--short", "HEAD"], repoRootAbs);
+    const detachedResult =
+      branchResult.code === 0 ? null : await runLocalCommand("git", ["-C", repoRootAbs, "rev-parse", "--short", "HEAD"], repoRootAbs);
+    const branch =
+      branchResult.code === 0 ? branchResult.stdout.trim() || null : detachedResult && detachedResult.code === 0 ? detachedResult.stdout.trim() || null : null;
+
+    const gitDiffArgs = buildAgentGitDiffArgs(repoRootAbs, request);
+    const gitDiffResult = await runLocalCommand("git", gitDiffArgs.args, repoRootAbs);
+    if (gitDiffResult.code !== 0) {
+      throw new Error(gitDiffResult.stderr.trim() || "Failed to run agent git diff");
+    }
+    const withUntracked = await appendAgentLocalUntrackedDiff(repoRootAbs, request, gitDiffResult.stdout);
+    publishGitRpcResponse({
+      nc: args.jetstream.nc,
+      responseSubject,
+      payload: {
+        requestId,
+        ok: true,
+        payload: {
+          isGitRepo: true,
+          mode: "git_diff",
+          source: "agent",
+          agent: { id: args.agentId, name: null },
+          currentPath: request.targetPath,
+          repoRoot: repoRootAbs,
+          repoRelativePath,
+          branch,
+          gitDiff: {
+            command: withUntracked.hasUntracked ? `${gitDiffArgs.display} (+ untracked)` : gitDiffArgs.display,
+            format: request.format,
+            output: withUntracked.output,
+            outputTruncated: false,
+          },
+        },
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (responseSubject) {
+      publishGitRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: false, error: message },
+      });
+    }
+    writeAgentError(`git rpc failed requestId=${requestId} error=${message}`);
+  }
+}
+
+function subscribeToGitRpc(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): void {
+  const subject = buildAgentGitRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`git rpc subscription error: ${message}`);
+        return;
+      }
+      void handleGitRpcMessage({
+        msg,
+        jetstream: args.jetstream,
+        userId: args.userId,
+        agentId: args.agentId,
+      });
+    },
+  });
+  writeAgentInfo(`git rpc subscribed subject=${subject}`);
+}
+
 async function notifyServerRunFinished(args: {
   serverBaseUrl: string;
   userId: string;
@@ -1203,7 +1819,7 @@ function normalizeFsRpcPath(rawPath: unknown): { abs: string; formatPath: (targe
 }
 
 function parseFsRpcAction(value: unknown): AgentFsRpcAction {
-  if (value === "list" || value === "stat" || value === "fetch_file" || value === "read_text") {
+  if (value === "list" || value === "stat" || value === "fetch_file" || value === "read_text" || value === "read_file") {
     return value;
   }
   throw new Error("unsupported action");
@@ -1215,6 +1831,53 @@ function normalizeFsRpcNumber(value: unknown, fallback: number): number {
     return fallback;
   }
   return Math.floor(n);
+}
+
+function inferMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".txt" || ext === ".md" || ext === ".log") {
+    return "text/plain";
+  }
+  if (ext === ".json") {
+    return "application/json";
+  }
+  if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
+    return "text/javascript";
+  }
+  if (ext === ".ts" || ext === ".tsx") {
+    return "text/typescript";
+  }
+  if (ext === ".jsx") {
+    return "text/jsx";
+  }
+  if (ext === ".css") {
+    return "text/css";
+  }
+  if (ext === ".html" || ext === ".htm") {
+    return "text/html";
+  }
+  if (ext === ".xml") {
+    return "application/xml";
+  }
+  if (ext === ".svg") {
+    return "image/svg+xml";
+  }
+  if (ext === ".png") {
+    return "image/png";
+  }
+  if (ext === ".jpg" || ext === ".jpeg") {
+    return "image/jpeg";
+  }
+  if (ext === ".gif") {
+    return "image/gif";
+  }
+  if (ext === ".webp") {
+    return "image/webp";
+  }
+  if (ext === ".pdf") {
+    return "application/pdf";
+  }
+  return "application/octet-stream";
 }
 
 async function executeFsRpc(args: {
@@ -1313,6 +1976,21 @@ async function executeFsRpc(args: {
   if (!entry.isFile()) {
     throw new Error("path is not a file");
   }
+  if (action === "read_file") {
+    const maxBytes = Math.max(1, Math.min(normalizeFsRpcNumber(args.request.maxBytes, 2_000_000), 5_000_000));
+    const data = await readFile(abs);
+    const truncated = data.byteLength > maxBytes;
+    const bytes = truncated ? data.subarray(0, maxBytes) : data;
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      mimeType: inferMimeType(abs),
+      size: entry.size,
+      truncated,
+      contentBase64: bytes.toString("base64"),
+    };
+  }
   const offset = Math.max(0, normalizeFsRpcNumber(args.request.offset, 0));
   const length = Math.max(1, Math.min(normalizeFsRpcNumber(args.request.length, 65536), 262144));
   const encoding = typeof args.request.encoding === "string" && args.request.encoding ? args.request.encoding : "utf8";
@@ -1347,6 +2025,593 @@ async function executeFsRpc(args: {
   } finally {
     await fd.close();
   }
+}
+
+interface AgentSessionSummaryRecord {
+  id: string;
+  label: string;
+  updatedAt: string;
+  cwd: string | null;
+  source: string;
+  originator: string;
+  filePath: string;
+}
+
+interface AgentSessionMessageRecord {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  timestamp: string | null;
+  type: "user_message" | "system_message";
+  sourceFirstRowId: number;
+  sourceLastRowId: number;
+}
+
+function normalizeSessionRpcRequest(args: {
+  request: AgentSessionRpcRequest;
+  agentId: string;
+}): AgentSessionRpcNormalizedRequest {
+  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
+  if (!requestId) {
+    throw new Error("missing requestId");
+  }
+  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
+  if (!requestAgentId || requestAgentId !== args.agentId) {
+    throw new Error("agent id mismatch");
+  }
+  const actionRaw = typeof args.request.action === "string" ? args.request.action.trim() : "";
+  const action: AgentSessionRpcAction =
+    actionRaw === "messages" || actionRaw === "delete" || actionRaw === "watch" || actionRaw === "stop_watch"
+      ? actionRaw
+      : "list";
+  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
+  if (!responseSubject) {
+    throw new Error("missing responseSubject");
+  }
+  const filePath = typeof args.request.filePath === "string" && args.request.filePath.trim() ? args.request.filePath.trim() : null;
+  if ((action === "messages" || action === "delete" || action === "watch") && !filePath) {
+    throw new Error("missing filePath");
+  }
+  const beforeRowIdRaw = Number(args.request.beforeRowId);
+  const beforeRowId = Number.isInteger(beforeRowIdRaw) && beforeRowIdRaw > 0 ? beforeRowIdRaw : null;
+  const pageSizeRaw = Number(args.request.pageSize);
+  const pageSize = Number.isFinite(pageSizeRaw) ? Math.max(1, Math.min(Math.floor(pageSizeRaw), 100)) : 100;
+  const watchId = typeof args.request.watchId === "string" && args.request.watchId.trim() ? args.request.watchId.trim() : null;
+  if (action === "stop_watch" && !watchId) {
+    throw new Error("missing watchId");
+  }
+  return {
+    requestId,
+    action,
+    agentId: requestAgentId,
+    filePath,
+    beforeRowId,
+    pageSize,
+    responseSubject,
+    watchId,
+  };
+}
+
+function getSessionsRootPath(): string {
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  return path.join(workspaceRoot, ".codex", "sessions");
+}
+
+function resolveSessionFilePath(filePath: string): string {
+  const root = path.resolve(getSessionsRootPath());
+  const resolved = path.resolve(filePath);
+  if (!(resolved === root || resolved.startsWith(root + path.sep))) {
+    throw new Error("filePath is outside sessions root");
+  }
+  return resolved;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function toTrimmedStringOrNull(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function pickSessionString(...values: unknown[]): string | null {
+  for (const value of values) {
+    const picked = toTrimmedStringOrNull(value);
+    if (picked) {
+      return picked;
+    }
+  }
+  return null;
+}
+
+async function collectSessionJsonlFiles(rootDir: string): Promise<Array<{ filePath: string; mtimeMs: number }>> {
+  const out: Array<{ filePath: string; mtimeMs: number }> = [];
+  const stack = [rootDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) {
+      continue;
+    }
+    let entries = [];
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".jsonl")) {
+        continue;
+      }
+      try {
+        const entryStat = await stat(fullPath);
+        out.push({ filePath: fullPath, mtimeMs: entryStat.mtimeMs });
+      } catch {
+        // ignore removed files
+      }
+    }
+  }
+  return out;
+}
+
+async function readFirstLine(fileHandle: Awaited<ReturnType<typeof open>>, fileSize: number): Promise<string> {
+  const chunkBytes = 16_384;
+  const maxScanBytes = 262_144;
+  let position = 0;
+  let scanned = 0;
+  let raw = "";
+
+  while (position < fileSize && scanned < maxScanBytes) {
+    const readSize = Math.min(chunkBytes, fileSize - position, maxScanBytes - scanned);
+    const buffer = Buffer.alloc(readSize);
+    const { bytesRead } = await fileHandle.read(buffer, 0, readSize, position);
+    if (bytesRead <= 0) {
+      break;
+    }
+    raw += buffer.toString("utf8", 0, bytesRead);
+    scanned += bytesRead;
+    position += bytesRead;
+    const newlineIndex = raw.search(/\r?\n/);
+    if (newlineIndex >= 0) {
+      return raw.slice(0, newlineIndex).trim();
+    }
+  }
+
+  return raw.trim();
+}
+
+function extractLastAgentMessage(candidateLines: string[]): { message: string; updatedAt: string | null } | null {
+  let fallback: { message: string; updatedAt: string | null } | null = null;
+  for (const line of candidateLines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as { type?: unknown; timestamp?: unknown; payload?: unknown };
+      if (parsed.type !== "event_msg" || !isObjectRecord(parsed.payload)) {
+        continue;
+      }
+      if (parsed.payload.type === "agent_message" && typeof parsed.payload.message === "string" && parsed.payload.message.trim()) {
+        return {
+          message: parsed.payload.message.trim(),
+          updatedAt: toTrimmedStringOrNull(parsed.timestamp),
+        };
+      }
+      if (
+        !fallback &&
+        parsed.payload.type === "task_complete" &&
+        typeof parsed.payload.last_agent_message === "string" &&
+        parsed.payload.last_agent_message.trim()
+      ) {
+        fallback = {
+          message: parsed.payload.last_agent_message.trim(),
+          updatedAt: toTrimmedStringOrNull(parsed.timestamp),
+        };
+      }
+    } catch {
+      // ignore malformed lines
+    }
+  }
+  return fallback;
+}
+
+async function readLastAgentMessage(
+  fileHandle: Awaited<ReturnType<typeof open>>,
+  fileSize: number,
+): Promise<{ message: string; updatedAt: string | null } | null> {
+  const chunkBytes = 16_384;
+  const maxScanBytes = 131_072;
+  if (fileSize <= 0) {
+    return null;
+  }
+  let position = fileSize;
+  let scanned = 0;
+  let carry = "";
+  while (position > 0 && scanned < maxScanBytes) {
+    const readSize = Math.min(chunkBytes, position, maxScanBytes - scanned);
+    position -= readSize;
+    scanned += readSize;
+    const buffer = Buffer.alloc(readSize);
+    const { bytesRead } = await fileHandle.read(buffer, 0, readSize, position);
+    if (bytesRead <= 0) {
+      break;
+    }
+    const merged = buffer.toString("utf8", 0, bytesRead) + carry;
+    const lines = merged.split(/\r?\n/);
+    carry = lines.shift() || "";
+    const found = extractLastAgentMessage(lines.reverse());
+    if (found) {
+      return found;
+    }
+  }
+  return extractLastAgentMessage([carry]);
+}
+
+function normalizeSessionMeta(rawMeta: unknown, filePath: string, mtimeMs: number): AgentSessionSummaryRecord {
+  const baseName = path.basename(filePath, path.extname(filePath));
+  const meta = isObjectRecord(rawMeta) ? rawMeta : {};
+  const updatedAtCandidate = pickSessionString(meta.updatedAt, meta.updated_at, meta.timestamp);
+  return {
+    id: pickSessionString(meta.sessionId, meta.session_id, meta.id) || baseName,
+    label: pickSessionString(meta.label, meta.title, meta.name, meta.sessionLabel, meta.session_label) || baseName,
+    updatedAt: updatedAtCandidate || new Date(mtimeMs).toISOString(),
+    cwd: pickSessionString(meta.cwd, meta.workingDirectory, meta.working_directory),
+    source: pickSessionString(meta.source, meta.sessionSource, meta.session_source) || "codex",
+    originator: pickSessionString(meta.originator, meta.author, meta.user, meta.username) || "unknown",
+    filePath,
+  };
+}
+
+async function readSessionSummary(filePath: string, mtimeMs: number): Promise<AgentSessionSummaryRecord> {
+  let fileHandle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    fileHandle = await open(filePath, "r");
+    const entryStat = await fileHandle.stat();
+    const firstLine = await readFirstLine(fileHandle, entryStat.size);
+    const tailSummary = await readLastAgentMessage(fileHandle, entryStat.size);
+    let normalized = normalizeSessionMeta({}, filePath, mtimeMs);
+
+    if (firstLine) {
+      try {
+        const parsed = JSON.parse(firstLine) as Record<string, unknown>;
+        const candidateMeta =
+          parsed && parsed.type === "session_meta" && isObjectRecord(parsed.payload)
+            ? parsed.payload
+            : isObjectRecord(parsed.session_meta)
+              ? parsed.session_meta
+              : isObjectRecord(parsed.sessionMeta)
+                ? parsed.sessionMeta
+                : isObjectRecord(parsed.meta)
+                  ? parsed.meta
+                  : isObjectRecord(parsed.payload)
+                    ? parsed.payload
+                    : parsed;
+        normalized = normalizeSessionMeta(candidateMeta, filePath, mtimeMs);
+      } catch {
+        normalized = normalizeSessionMeta({}, filePath, mtimeMs);
+      }
+    }
+
+    return {
+      ...normalized,
+      label: tailSummary?.message || "(no agent message)",
+      updatedAt: tailSummary?.updatedAt || normalized.updatedAt,
+    };
+  } catch {
+    return normalizeSessionMeta({}, filePath, mtimeMs);
+  } finally {
+    await fileHandle?.close().catch(() => undefined);
+  }
+}
+
+async function listAgentSessions(): Promise<AgentSessionSummaryRecord[]> {
+  const sessionsRoot = getSessionsRootPath();
+  let sessionsRootStat;
+  try {
+    sessionsRootStat = await stat(sessionsRoot);
+  } catch {
+    return [];
+  }
+  if (!sessionsRootStat.isDirectory()) {
+    return [];
+  }
+  const files = await collectSessionJsonlFiles(sessionsRoot);
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath));
+  const sessions = await Promise.all(files.slice(0, 10).map((file) => readSessionSummary(file.filePath, file.mtimeMs)));
+  return sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || b.filePath.localeCompare(a.filePath));
+}
+
+function toSessionMessageRow(
+  rowId: number,
+  role: "user" | "assistant",
+  text: string,
+  timestamp: string | null,
+  type: "user_message" | "system_message",
+): AgentSessionMessageRecord {
+  return {
+    id: String(rowId),
+    role,
+    text,
+    timestamp,
+    type,
+    sourceFirstRowId: rowId,
+    sourceLastRowId: rowId,
+  };
+}
+
+async function getAgentSessionMessages(args: {
+  filePath: string;
+  beforeRowId: number | null;
+  pageSize: number;
+}): Promise<{
+  messages: AgentSessionMessageRecord[];
+  nextCursor: number;
+  hasMoreBefore: boolean;
+  oldestRowId: number | null;
+}> {
+  const resolvedFile = resolveSessionFilePath(args.filePath);
+  const raw = await readFile(resolvedFile, "utf8");
+  const lines = raw.split(/\r?\n/);
+  const rows: AgentSessionMessageRecord[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]?.trim();
+    if (!line) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line) as { type?: unknown; timestamp?: unknown; payload?: unknown };
+      if (parsed.type !== "event_msg" || !isObjectRecord(parsed.payload)) {
+        continue;
+      }
+      if (parsed.payload.type === "user_message" && typeof parsed.payload.message === "string" && parsed.payload.message.trim()) {
+        rows.push(toSessionMessageRow(index + 1, "user", parsed.payload.message.trim(), toTrimmedStringOrNull(parsed.timestamp), "user_message"));
+        continue;
+      }
+      if (parsed.payload.type === "agent_message" && typeof parsed.payload.message === "string" && parsed.payload.message.trim()) {
+        rows.push(
+          toSessionMessageRow(index + 1, "assistant", parsed.payload.message.trim(), toTrimmedStringOrNull(parsed.timestamp), "system_message"),
+        );
+      }
+    } catch {
+      // ignore malformed lines
+    }
+  }
+
+  const beforeRowId = args.beforeRowId;
+  const scoped = beforeRowId && beforeRowId > 0 ? rows.filter((row) => row.sourceFirstRowId < beforeRowId) : rows;
+  const page = scoped.slice(Math.max(0, scoped.length - args.pageSize));
+  return {
+    messages: page,
+    nextCursor: page.length > 0 ? page[page.length - 1].sourceLastRowId : 0,
+    hasMoreBefore: scoped.length > page.length,
+    oldestRowId: page.length > 0 ? page[0].sourceFirstRowId : null,
+  };
+}
+
+async function deleteAgentSession(filePath: string): Promise<void> {
+  const resolvedFile = resolveSessionFilePath(filePath);
+  await unlink(resolvedFile);
+  const sessionsRoot = path.resolve(getSessionsRootPath());
+  let currentDir = path.dirname(resolvedFile);
+  while (currentDir.startsWith(sessionsRoot + path.sep)) {
+    try {
+      const entries = await readdir(currentDir);
+      if (entries.length > 0) {
+        break;
+      }
+      await rmdir(currentDir);
+    } catch {
+      break;
+    }
+    currentDir = path.dirname(currentDir);
+  }
+}
+
+function publishSessionRpcResponse(args: {
+  nc: NatsConnection;
+  responseSubject: string;
+  payload: AgentSessionRpcResponse;
+}): void {
+  args.nc.publish(args.responseSubject, sessionRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+async function startSessionWatch(args: {
+  nc: NatsConnection;
+  requestId: string;
+  responseSubject: string;
+  filePath: string;
+}): Promise<string> {
+  const resolvedFile = resolveSessionFilePath(args.filePath);
+  const watchId = `watch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  let watcher: ReturnType<typeof watch> | null = null;
+  let active = true;
+
+  const emitEvent = (event: Record<string, unknown>) => {
+    if (!active) {
+      return;
+    }
+    publishSessionRpcResponse({
+      nc: args.nc,
+      responseSubject: args.responseSubject,
+      payload: {
+        requestId: args.requestId,
+        ok: true,
+        action: "watch",
+        watchId,
+        event,
+      },
+    });
+  };
+
+  const cleanup = () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    watcher?.close();
+    watcher = null;
+    activeSessionWatchers.delete(watchId);
+  };
+
+  const notifyFromContent = async () => {
+    try {
+      const raw = await readFile(resolvedFile, "utf8");
+      const lines = raw.split(/\r?\n/).reverse();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(trimmed) as { type?: unknown; timestamp?: unknown; payload?: unknown };
+          if (parsed.type !== "event_msg" || !isObjectRecord(parsed.payload)) {
+            continue;
+          }
+          if (parsed.payload.type === "user_message" || parsed.payload.type === "agent_message") {
+            emitEvent({
+              type: "messages.changed",
+              count: 1,
+              at: toTrimmedStringOrNull(parsed.timestamp),
+            });
+            return;
+          }
+        } catch {
+          // ignore malformed lines
+        }
+      }
+    } catch (error) {
+      emitEvent({
+        type: "stream.error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  watcher = watch(resolvedFile, () => {
+    void notifyFromContent();
+  });
+  activeSessionWatchers.set(watchId, cleanup);
+  emitEvent({ type: "stream.started", watchId, at: formatLocalTimestamp() });
+  return watchId;
+}
+
+async function handleSessionRpcMessage(args: {
+  msg: Msg;
+  jetstream: AgentJetStreamContext;
+  agentId: string;
+}): Promise<void> {
+  let requestId = "unknown";
+  let responseSubject = "";
+  try {
+    const payload = JSON.parse(sessionRpcCodec.decode(args.msg.data)) as AgentSessionRpcRequest;
+    const request = normalizeSessionRpcRequest({ request: payload, agentId: args.agentId });
+    requestId = request.requestId;
+    responseSubject = request.responseSubject;
+
+    if (request.action === "list") {
+      const sessions = await listAgentSessions();
+      publishSessionRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: true, action: "list", sessions },
+      });
+      return;
+    }
+
+    if (request.action === "messages") {
+      const result = await getAgentSessionMessages({
+        filePath: request.filePath ?? "",
+        beforeRowId: request.beforeRowId,
+        pageSize: request.pageSize,
+      });
+      publishSessionRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: true, action: "messages", ...result },
+      });
+      return;
+    }
+
+    if (request.action === "delete") {
+      await deleteAgentSession(request.filePath ?? "");
+      publishSessionRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: true, action: "delete" },
+      });
+      return;
+    }
+
+    if (request.action === "watch") {
+      const watchId = await startSessionWatch({
+        nc: args.jetstream.nc,
+        requestId,
+        responseSubject,
+        filePath: request.filePath ?? "",
+      });
+      publishSessionRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: true, action: "watch", watchId },
+      });
+      return;
+    }
+
+    const stop = request.watchId ? activeSessionWatchers.get(request.watchId) : null;
+    stop?.();
+    publishSessionRpcResponse({
+      nc: args.jetstream.nc,
+      responseSubject,
+      payload: { requestId, ok: true, action: "stop_watch", watchId: request.watchId },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (responseSubject) {
+      publishSessionRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: {
+          requestId,
+          ok: false,
+          error: message,
+        },
+      });
+    }
+    writeAgentError(`session rpc failed requestId=${requestId} error=${message}`);
+  }
+}
+
+function subscribeToSessionRpc(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): void {
+  const subject = buildAgentSessionRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`session rpc subscription error: ${message}`);
+        return;
+      }
+      void handleSessionRpcMessage({
+        msg,
+        jetstream: args.jetstream,
+        agentId: args.agentId,
+      });
+    },
+  });
+  writeAgentInfo(`session rpc subscribed subject=${subject}`);
 }
 
 async function handleFsRpcMessage(args: {
@@ -2329,6 +3594,23 @@ async function main() {
     userId,
     agentId: initialAgentId,
     agentToken,
+  });
+  subscribeToSessionRpc({
+    jetstream,
+    userId,
+    agentId: initialAgentId,
+  });
+  subscribeToCodexRpc({
+    jetstream,
+    serverBaseUrl,
+    userId,
+    agentId: initialAgentId,
+    agentToken,
+  });
+  subscribeToGitRpc({
+    jetstream,
+    userId,
+    agentId: initialAgentId,
   });
   subscribeToRunRpc({
     jetstream,
