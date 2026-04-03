@@ -91,6 +91,7 @@ interface AgentSessionRpcRequest {
   action?: unknown;
   agentId?: unknown;
   filePath?: unknown;
+  sinceLine?: unknown;
   beforeRowId?: unknown;
   pageSize?: unknown;
   responseSubject?: unknown;
@@ -102,7 +103,7 @@ interface AgentSessionRpcResponse {
   ok: boolean;
   action?: AgentSessionRpcAction;
   sessions?: unknown[];
-  eventRows?: unknown[];
+  rawRows?: unknown[];
   nextCursor?: number;
   hasMoreBefore?: boolean;
   oldestRowId?: number | null;
@@ -116,6 +117,7 @@ interface AgentSessionRpcNormalizedRequest {
   action: AgentSessionRpcAction;
   agentId: string;
   filePath: string | null;
+  sinceLine: number;
   beforeRowId: number | null;
   pageSize: number;
   responseSubject: string;
@@ -293,6 +295,7 @@ const gitRpcCodec = StringCodec();
 const activeRuns = new Map<string, ActiveRunRecord>();
 const retainedRuns = new Map<string, PublicRunTask>();
 const activeSessionWatchers = new Map<string, () => void>();
+const sessionLineIndexCache = new Map<string, SessionLineIndexCacheEntry>();
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -2037,9 +2040,15 @@ interface AgentSessionSummaryRecord {
   filePath: string;
 }
 
-interface AgentSessionEventRowRecord {
+interface AgentSessionRawRowRecord {
   id: number;
-  event: Record<string, unknown>;
+  raw: string;
+}
+
+interface SessionLineIndexCacheEntry {
+  size: number;
+  lineStartOffsets: number[];
+  endsWithNewline: boolean;
 }
 
 function normalizeSessionRpcRequest(args: {
@@ -2067,6 +2076,8 @@ function normalizeSessionRpcRequest(args: {
   if ((action === "messages" || action === "delete" || action === "watch") && !filePath) {
     throw new Error("missing filePath");
   }
+  const sinceLineRaw = Number(args.request.sinceLine);
+  const sinceLine = Number.isInteger(sinceLineRaw) && sinceLineRaw > 0 ? sinceLineRaw : 0;
   const beforeRowIdRaw = Number(args.request.beforeRowId);
   const beforeRowId = Number.isInteger(beforeRowIdRaw) && beforeRowIdRaw > 0 ? beforeRowIdRaw : null;
   const pageSizeRaw = Number(args.request.pageSize);
@@ -2080,6 +2091,7 @@ function normalizeSessionRpcRequest(args: {
     action,
     agentId: requestAgentId,
     filePath,
+    sinceLine,
     beforeRowId,
     pageSize,
     responseSubject,
@@ -2325,143 +2337,130 @@ async function listAgentSessions(): Promise<AgentSessionSummaryRecord[]> {
   return sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || b.filePath.localeCompare(a.filePath));
 }
 
-function normalizeSessionPayloadToEvent(
-  lineType: string,
-  payload: Record<string, unknown>,
-  timestamp: string | null,
-): Record<string, unknown> | null {
-  if (lineType === "response_item") {
-    const payloadType = typeof payload.type === "string" ? payload.type : "";
-    if (payloadType === "message" && payload.role === "user") {
-      return {
-        ...payload,
-        timestamp,
-      };
-    }
-    if (payloadType === "function_call") {
-      return {
-        type: "item.completed",
-        timestamp,
-        item: {
-          type: "function_call",
-          name: payload.name,
-          arguments: payload.arguments,
-          call_id: payload.call_id,
-          status: "completed",
-        },
-      };
-    }
-    if (payloadType === "function_call_output") {
-      return {
-        type: "item.completed",
-        timestamp,
-        item: {
-          type: "function_call_output",
-          call_id: payload.call_id,
-          output: payload.output,
-          status: "completed",
-        },
-      };
-    }
-    if (payloadType === "custom_tool_call") {
-      return {
-        type: "item.completed",
-        timestamp,
-        item: {
-          type: "custom_tool_call",
-          name: payload.name,
-          arguments: payload.input,
-          call_id: payload.call_id,
-          status: payload.status,
-        },
-      };
-    }
-    return null;
+async function readSessionLineIndex(filePath: string): Promise<SessionLineIndexCacheEntry> {
+  const resolvedFile = resolveSessionFilePath(filePath);
+  const entryStat = await stat(resolvedFile);
+  const nextSize = entryStat.size;
+  const cached = sessionLineIndexCache.get(resolvedFile) ?? null;
+
+  if (cached && cached.size === nextSize) {
+    return cached;
   }
 
-  if (lineType !== "event_msg") {
-    return null;
-  }
+  const fileHandle = await open(resolvedFile, "r");
+  try {
+    let lineStartOffsets = cached?.lineStartOffsets.slice() ?? [];
+    let scanStart = cached?.size ?? 0;
+    let endsWithNewline = cached?.endsWithNewline ?? false;
 
-  const payloadType = typeof payload.type === "string" ? payload.type : "";
-  if (payloadType === "task_started") {
-    return {
-      type: "turn.started",
-      timestamp,
-      turn_id: payload.turn_id,
-      turn: isObjectRecord(payload.turn) ? payload.turn : undefined,
-    };
-  }
-  if (payloadType === "task_complete") {
-    return {
-      type: "turn.completed",
-      timestamp,
-      turn_id: payload.turn_id,
-    };
-  }
-  if (payloadType === "user_message" && typeof payload.message === "string") {
-    return {
-      type: "user_message",
-      timestamp,
-      turn_id: payload.turn_id,
-      item: {
-        text: payload.message,
-      },
-    };
-  }
-  if (payloadType === "agent_message" && typeof payload.message === "string") {
-    return {
-      type: "item.completed",
-      timestamp,
-      turn_id: payload.turn_id,
-      item: {
-        type: "agent_message",
-        message: payload.message,
-      },
-    };
-  }
+    if (!cached || nextSize < cached.size) {
+      lineStartOffsets = nextSize > 0 ? [0] : [];
+      scanStart = 0;
+      endsWithNewline = false;
+    } else if (cached.endsWithNewline && nextSize > cached.size) {
+      lineStartOffsets.push(cached.size);
+    }
 
-  return {
-    ...payload,
-    timestamp,
-  };
+    let position = scanStart;
+    const chunkBytes = 65_536;
+    while (position < nextSize) {
+      const readSize = Math.min(chunkBytes, nextSize - position);
+      const buffer = Buffer.alloc(readSize);
+      const { bytesRead } = await fileHandle.read(buffer, 0, readSize, position);
+      if (bytesRead <= 0) {
+        break;
+      }
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (buffer[index] !== 0x0a) {
+          continue;
+        }
+        const nextLineStart = position + index + 1;
+        if (nextLineStart < nextSize) {
+          lineStartOffsets.push(nextLineStart);
+        }
+      }
+      position += bytesRead;
+    }
+
+    if (nextSize > 0) {
+      const tail = Buffer.alloc(1);
+      const { bytesRead } = await fileHandle.read(tail, 0, 1, nextSize - 1);
+      endsWithNewline = bytesRead > 0 && tail[0] === 0x0a;
+    } else {
+      endsWithNewline = false;
+    }
+
+    const nextEntry = {
+      size: nextSize,
+      lineStartOffsets,
+      endsWithNewline,
+    };
+    sessionLineIndexCache.set(resolvedFile, nextEntry);
+    return nextEntry;
+  } finally {
+    await fileHandle.close().catch(() => undefined);
+  }
 }
 
-async function getAgentSessionEventRows(filePath: string): Promise<AgentSessionEventRowRecord[]> {
-  const resolvedFile = resolveSessionFilePath(filePath);
-  const raw = await readFile(resolvedFile, "utf8");
-  const lines = raw.split(/\r?\n/);
-  const rows: AgentSessionEventRowRecord[] = [];
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]?.trim();
-    if (!line) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(line) as { type?: unknown; timestamp?: unknown; payload?: unknown };
-      const lineType = typeof parsed.type === "string" ? parsed.type : "";
-      if (!lineType || !isObjectRecord(parsed.payload)) {
-        continue;
-      }
-      const timestamp = toTrimmedStringOrNull(parsed.timestamp);
-      const event = normalizeSessionPayloadToEvent(lineType, parsed.payload, timestamp);
-      if (!event) {
-        continue;
-      }
-      rows.push({
-        id: index + 1,
-        event,
-      });
-    } catch {
-      // ignore malformed lines
-    }
+async function getAgentSessionRawRows(args: {
+  filePath: string;
+  sinceLine: number;
+}): Promise<{
+  rawRows: AgentSessionRawRowRecord[];
+  nextCursor: number;
+}> {
+  const resolvedFile = resolveSessionFilePath(args.filePath);
+  const index = await readSessionLineIndex(resolvedFile);
+  const totalLines = index.lineStartOffsets.length;
+  const sinceLine = Math.max(0, Math.floor(args.sinceLine));
+  if (totalLines === 0 || sinceLine >= totalLines) {
+    return {
+      rawRows: [],
+      nextCursor: totalLines,
+    };
   }
-  return rows;
+
+  const startOffset = sinceLine > 0 ? index.lineStartOffsets[sinceLine] ?? index.size : 0;
+  if (startOffset >= index.size) {
+    return {
+      rawRows: [],
+      nextCursor: totalLines,
+    };
+  }
+
+  const fileHandle = await open(resolvedFile, "r");
+  try {
+    const readSize = index.size - startOffset;
+    const buffer = Buffer.alloc(readSize);
+    const { bytesRead } = await fileHandle.read(buffer, 0, readSize, startOffset);
+    const raw = buffer.toString("utf8", 0, bytesRead);
+    const lines = raw.split(/\r?\n/);
+    if (lines.length > 0 && lines[lines.length - 1] === "") {
+      lines.pop();
+    }
+    const rawRows: AgentSessionRawRowRecord[] = [];
+    let lineNumber = sinceLine + 1;
+    for (const line of lines) {
+      if (line.trim()) {
+        rawRows.push({
+          id: lineNumber,
+          raw: line,
+        });
+      }
+      lineNumber += 1;
+    }
+    return {
+      rawRows,
+      nextCursor: totalLines,
+    };
+  } finally {
+    await fileHandle.close().catch(() => undefined);
+  }
 }
 
 async function deleteAgentSession(filePath: string): Promise<void> {
   const resolvedFile = resolveSessionFilePath(filePath);
+  sessionLineIndexCache.delete(resolvedFile);
   await unlink(resolvedFile);
   const sessionsRoot = path.resolve(getSessionsRootPath());
   let currentDir = path.dirname(resolvedFile);
@@ -2525,42 +2524,15 @@ async function startSessionWatch(args: {
     activeSessionWatchers.delete(watchId);
   };
 
-  const notifyFromContent = async () => {
-    try {
-      const raw = await readFile(resolvedFile, "utf8");
-      const lines = raw.split(/\r?\n/).reverse();
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(trimmed) as { type?: unknown; timestamp?: unknown; payload?: unknown };
-          if (parsed.type !== "event_msg" || !isObjectRecord(parsed.payload)) {
-            continue;
-          }
-          if (parsed.payload.type === "user_message" || parsed.payload.type === "agent_message") {
-            emitEvent({
-              type: "messages.changed",
-              count: 1,
-              at: toTrimmedStringOrNull(parsed.timestamp),
-            });
-            return;
-          }
-        } catch {
-          // ignore malformed lines
-        }
-      }
-    } catch (error) {
-      emitEvent({
-        type: "stream.error",
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
+  const notifyFromContent = () => {
+    emitEvent({
+      type: "messages.changed",
+      at: formatLocalTimestamp(),
+    });
   };
 
   watcher = watch(resolvedFile, () => {
-    void notifyFromContent();
+    notifyFromContent();
   });
   activeSessionWatchers.set(watchId, cleanup);
   emitEvent({ type: "stream.started", watchId, at: formatLocalTimestamp() });
@@ -2591,11 +2563,14 @@ async function handleSessionRpcMessage(args: {
     }
 
     if (request.action === "messages") {
-      const eventRows = await getAgentSessionEventRows(request.filePath ?? "");
+      const result = await getAgentSessionRawRows({
+        filePath: request.filePath ?? "",
+        sinceLine: request.sinceLine,
+      });
       publishSessionRpcResponse({
         nc: args.jetstream.nc,
         responseSubject,
-        payload: { requestId, ok: true, action: "messages", eventRows },
+        payload: { requestId, ok: true, action: "messages", rawRows: result.rawRows, nextCursor: result.nextCursor },
       });
       return;
     }
