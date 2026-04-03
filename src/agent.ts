@@ -2405,6 +2405,8 @@ async function readSessionLineIndex(filePath: string): Promise<SessionLineIndexC
 async function getAgentSessionRawRows(args: {
   filePath: string;
   sinceLine: number;
+  beforeRowId: number | null;
+  pageSize: number;
 }): Promise<{
   rawRows: AgentSessionRawRowRecord[];
   nextCursor: number;
@@ -2413,24 +2415,91 @@ async function getAgentSessionRawRows(args: {
   const index = await readSessionLineIndex(resolvedFile);
   const totalLines = index.lineStartOffsets.length;
   const sinceLine = Math.max(0, Math.floor(args.sinceLine));
-  if (totalLines === 0 || sinceLine >= totalLines) {
+  const beforeRowId = args.beforeRowId && args.beforeRowId > 0 ? Math.floor(args.beforeRowId) : null;
+  const maxRawRows = 200;
+  const maxRawBytes = 120_000;
+
+  if (totalLines === 0) {
     return {
       rawRows: [],
-      nextCursor: totalLines,
+      nextCursor: 0,
     };
   }
 
-  const startOffset = sinceLine > 0 ? index.lineStartOffsets[sinceLine] ?? index.size : 0;
-  if (startOffset >= index.size) {
+  let startLineIndex = 0;
+  let endLineIndex = totalLines;
+
+  const getLineSpanBytes = (lineIndex: number): number => {
+    const start = index.lineStartOffsets[lineIndex] ?? index.size;
+    const end = lineIndex + 1 < totalLines ? (index.lineStartOffsets[lineIndex + 1] ?? index.size) : index.size;
+    return Math.max(0, end - start);
+  };
+
+  if (beforeRowId !== null) {
+    endLineIndex = Math.max(0, Math.min(totalLines, beforeRowId - 1));
+    startLineIndex = endLineIndex;
+    let collectedRows = 0;
+    let collectedBytes = 0;
+    while (startLineIndex > 0 && collectedRows < maxRawRows) {
+      const nextIndex = startLineIndex - 1;
+      const nextBytes = getLineSpanBytes(nextIndex);
+      if (collectedRows > 0 && collectedBytes + nextBytes > maxRawBytes) {
+        break;
+      }
+      startLineIndex = nextIndex;
+      collectedRows += 1;
+      collectedBytes += nextBytes;
+    }
+  } else if (sinceLine > 0) {
+    startLineIndex = Math.min(totalLines, sinceLine);
+    endLineIndex = startLineIndex;
+    let collectedRows = 0;
+    let collectedBytes = 0;
+    while (endLineIndex < totalLines && collectedRows < maxRawRows) {
+      const nextBytes = getLineSpanBytes(endLineIndex);
+      if (collectedRows > 0 && collectedBytes + nextBytes > maxRawBytes) {
+        break;
+      }
+      endLineIndex += 1;
+      collectedRows += 1;
+      collectedBytes += nextBytes;
+    }
+  } else {
+    startLineIndex = totalLines;
+    let collectedRows = 0;
+    let collectedBytes = 0;
+    while (startLineIndex > 0 && collectedRows < maxRawRows) {
+      const nextIndex = startLineIndex - 1;
+      const nextBytes = getLineSpanBytes(nextIndex);
+      if (collectedRows > 0 && collectedBytes + nextBytes > maxRawBytes) {
+        break;
+      }
+      startLineIndex = nextIndex;
+      collectedRows += 1;
+      collectedBytes += nextBytes;
+    }
+  }
+
+  if (startLineIndex >= endLineIndex) {
     return {
       rawRows: [],
-      nextCursor: totalLines,
+      nextCursor: endLineIndex,
     };
   }
+
+  const startOffset = index.lineStartOffsets[startLineIndex] ?? index.size;
+  const endOffset = endLineIndex < totalLines ? (index.lineStartOffsets[endLineIndex] ?? index.size) : index.size;
+  if (startOffset >= endOffset) {
+    return {
+      rawRows: [],
+      nextCursor: endLineIndex,
+    };
+  }
+
 
   const fileHandle = await open(resolvedFile, "r");
   try {
-    const readSize = index.size - startOffset;
+    const readSize = endOffset - startOffset;
     const buffer = Buffer.alloc(readSize);
     const { bytesRead } = await fileHandle.read(buffer, 0, readSize, startOffset);
     const raw = buffer.toString("utf8", 0, bytesRead);
@@ -2439,7 +2508,7 @@ async function getAgentSessionRawRows(args: {
       lines.pop();
     }
     const rawRows: AgentSessionRawRowRecord[] = [];
-    let lineNumber = sinceLine + 1;
+    let lineNumber = startLineIndex + 1;
     for (const line of lines) {
       if (line.trim()) {
         rawRows.push({
@@ -2451,7 +2520,7 @@ async function getAgentSessionRawRows(args: {
     }
     return {
       rawRows,
-      nextCursor: totalLines,
+      nextCursor: endLineIndex,
     };
   } finally {
     await fileHandle.close().catch(() => undefined);
@@ -2566,6 +2635,8 @@ async function handleSessionRpcMessage(args: {
       const result = await getAgentSessionRawRows({
         filePath: request.filePath ?? "",
         sinceLine: request.sinceLine,
+        beforeRowId: request.beforeRowId,
+        pageSize: request.pageSize,
       });
       publishSessionRpcResponse({
         nc: args.jetstream.nc,
