@@ -102,7 +102,7 @@ interface AgentSessionRpcResponse {
   ok: boolean;
   action?: AgentSessionRpcAction;
   sessions?: unknown[];
-  messages?: unknown[];
+  eventRows?: unknown[];
   nextCursor?: number;
   hasMoreBefore?: boolean;
   oldestRowId?: number | null;
@@ -2037,14 +2037,9 @@ interface AgentSessionSummaryRecord {
   filePath: string;
 }
 
-interface AgentSessionMessageRecord {
-  id: string;
-  role: "user" | "assistant";
-  text: string;
-  timestamp: string | null;
-  type: "user_message" | "system_message";
-  sourceFirstRowId: number;
-  sourceLastRowId: number;
+interface AgentSessionEventRowRecord {
+  id: number;
+  event: Record<string, unknown>;
 }
 
 function normalizeSessionRpcRequest(args: {
@@ -2330,38 +2325,113 @@ async function listAgentSessions(): Promise<AgentSessionSummaryRecord[]> {
   return sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || b.filePath.localeCompare(a.filePath));
 }
 
-function toSessionMessageRow(
-  rowId: number,
-  role: "user" | "assistant",
-  text: string,
+function normalizeSessionPayloadToEvent(
+  lineType: string,
+  payload: Record<string, unknown>,
   timestamp: string | null,
-  type: "user_message" | "system_message",
-): AgentSessionMessageRecord {
+): Record<string, unknown> | null {
+  if (lineType === "response_item") {
+    const payloadType = typeof payload.type === "string" ? payload.type : "";
+    if (payloadType === "message" && payload.role === "user") {
+      return {
+        ...payload,
+        timestamp,
+      };
+    }
+    if (payloadType === "function_call") {
+      return {
+        type: "item.completed",
+        timestamp,
+        item: {
+          type: "function_call",
+          name: payload.name,
+          arguments: payload.arguments,
+          call_id: payload.call_id,
+          status: "completed",
+        },
+      };
+    }
+    if (payloadType === "function_call_output") {
+      return {
+        type: "item.completed",
+        timestamp,
+        item: {
+          type: "function_call_output",
+          call_id: payload.call_id,
+          output: payload.output,
+          status: "completed",
+        },
+      };
+    }
+    if (payloadType === "custom_tool_call") {
+      return {
+        type: "item.completed",
+        timestamp,
+        item: {
+          type: "custom_tool_call",
+          name: payload.name,
+          arguments: payload.input,
+          call_id: payload.call_id,
+          status: payload.status,
+        },
+      };
+    }
+    return null;
+  }
+
+  if (lineType !== "event_msg") {
+    return null;
+  }
+
+  const payloadType = typeof payload.type === "string" ? payload.type : "";
+  if (payloadType === "task_started") {
+    return {
+      type: "turn.started",
+      timestamp,
+      turn_id: payload.turn_id,
+      turn: isObjectRecord(payload.turn) ? payload.turn : undefined,
+    };
+  }
+  if (payloadType === "task_complete") {
+    return {
+      type: "turn.completed",
+      timestamp,
+      turn_id: payload.turn_id,
+    };
+  }
+  if (payloadType === "user_message" && typeof payload.message === "string") {
+    return {
+      type: "user_message",
+      timestamp,
+      turn_id: payload.turn_id,
+      item: {
+        text: payload.message,
+      },
+    };
+  }
+  if (payloadType === "agent_message" && typeof payload.message === "string") {
+    return {
+      type: "item.completed",
+      timestamp,
+      turn_id: payload.turn_id,
+      item: {
+        type: "agent_message",
+        message: payload.message,
+      },
+    };
+  }
+
   return {
-    id: String(rowId),
-    role,
-    text,
+    ...payload,
     timestamp,
-    type,
-    sourceFirstRowId: rowId,
-    sourceLastRowId: rowId,
   };
 }
 
-async function getAgentSessionMessages(args: {
-  filePath: string;
-  beforeRowId: number | null;
-  pageSize: number;
-}): Promise<{
-  messages: AgentSessionMessageRecord[];
-  nextCursor: number;
-  hasMoreBefore: boolean;
-  oldestRowId: number | null;
-}> {
-  const resolvedFile = resolveSessionFilePath(args.filePath);
+async function getAgentSessionEventRows(filePath: string): Promise<AgentSessionEventRowRecord[]> {
+  const resolvedFile = resolveSessionFilePath(filePath);
   const raw = await readFile(resolvedFile, "utf8");
   const lines = raw.split(/\r?\n/);
-  const rows: AgentSessionMessageRecord[] = [];
+  const rows: AgentSessionEventRowRecord[] = [];
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]?.trim();
@@ -2370,32 +2440,24 @@ async function getAgentSessionMessages(args: {
     }
     try {
       const parsed = JSON.parse(line) as { type?: unknown; timestamp?: unknown; payload?: unknown };
-      if (parsed.type !== "event_msg" || !isObjectRecord(parsed.payload)) {
+      const lineType = typeof parsed.type === "string" ? parsed.type : "";
+      if (!lineType || !isObjectRecord(parsed.payload)) {
         continue;
       }
-      if (parsed.payload.type === "user_message" && typeof parsed.payload.message === "string" && parsed.payload.message.trim()) {
-        rows.push(toSessionMessageRow(index + 1, "user", parsed.payload.message.trim(), toTrimmedStringOrNull(parsed.timestamp), "user_message"));
+      const timestamp = toTrimmedStringOrNull(parsed.timestamp);
+      const event = normalizeSessionPayloadToEvent(lineType, parsed.payload, timestamp);
+      if (!event) {
         continue;
       }
-      if (parsed.payload.type === "agent_message" && typeof parsed.payload.message === "string" && parsed.payload.message.trim()) {
-        rows.push(
-          toSessionMessageRow(index + 1, "assistant", parsed.payload.message.trim(), toTrimmedStringOrNull(parsed.timestamp), "system_message"),
-        );
-      }
+      rows.push({
+        id: index + 1,
+        event,
+      });
     } catch {
       // ignore malformed lines
     }
   }
-
-  const beforeRowId = args.beforeRowId;
-  const scoped = beforeRowId && beforeRowId > 0 ? rows.filter((row) => row.sourceFirstRowId < beforeRowId) : rows;
-  const page = scoped.slice(Math.max(0, scoped.length - args.pageSize));
-  return {
-    messages: page,
-    nextCursor: page.length > 0 ? page[page.length - 1].sourceLastRowId : 0,
-    hasMoreBefore: scoped.length > page.length,
-    oldestRowId: page.length > 0 ? page[0].sourceFirstRowId : null,
-  };
+  return rows;
 }
 
 async function deleteAgentSession(filePath: string): Promise<void> {
@@ -2529,15 +2591,11 @@ async function handleSessionRpcMessage(args: {
     }
 
     if (request.action === "messages") {
-      const result = await getAgentSessionMessages({
-        filePath: request.filePath ?? "",
-        beforeRowId: request.beforeRowId,
-        pageSize: request.pageSize,
-      });
+      const eventRows = await getAgentSessionEventRows(request.filePath ?? "");
       publishSessionRpcResponse({
         nc: args.jetstream.nc,
         responseSubject,
-        payload: { requestId, ok: true, action: "messages", ...result },
+        payload: { requestId, ok: true, action: "messages", eventRows },
       });
       return;
     }
