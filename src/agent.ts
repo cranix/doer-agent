@@ -1,10 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream, existsSync, statSync, watch } from "node:fs";
-import { chmod, mkdir, open, readFile, readdir, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { existsSync, statSync, watch } from "node:fs";
+import { chmod, mkdir, open, readFile, readdir, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
-import type { WriteStream } from "node:fs";
 
 interface PollResponse {
   task: {
@@ -15,8 +14,6 @@ interface PollResponse {
   } | null;
   error?: string;
 }
-
-type AgentEventType = "stdout" | "stderr" | "status" | "meta";
 
 interface CodexAuthBundleResponse {
   taskId?: string;
@@ -47,6 +44,8 @@ const DEFAULT_SERVER_BASE_URL = "https://doer.cranix.net";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 const AGENT_PACKAGE_JSON_PATH = path.join(AGENT_PROJECT_DIR, "package.json");
+
+type AgentEventType = "stdout" | "stderr" | "status" | "meta";
 
 interface AgentEventEnvelope {
   serverBaseUrl: string;
@@ -388,8 +387,8 @@ interface PublicRunTask {
   id: string;
   userId: string;
   agentId: string;
-  command: string;
-  cwd: string | null;
+  sessionId: string | null;
+  sessionFilePath: string | null;
   status: "queued" | "running" | "completed" | "failed" | "canceled";
   cancelRequested: boolean;
   resultExitCode: number | null;
@@ -399,20 +398,11 @@ interface PublicRunTask {
   updatedAt: string;
   startedAt: string | null;
   finishedAt: string | null;
-  agentEventAckSeq: number;
-  events: Array<{
-    seq: number;
-    type: AgentEventType;
-    timestamp: string;
-    payload: Record<string, unknown>;
-  }>;
 }
 
 interface ActiveRunRecord {
   task: PublicRunTask;
   child: ReturnType<typeof spawn>;
-  logPath: string;
-  logStream: WriteStream;
   requestCancel: () => void;
 }
 
@@ -962,11 +952,41 @@ function publishRunRpcResponse(args: { nc: NatsConnection; responseSubject: stri
   args.nc.publish(args.responseSubject, runRpcCodec.encode(JSON.stringify(args.payload)));
 }
 
-async function resolveRunLogsDir(): Promise<string> {
+async function resolveRunsDir(): Promise<string> {
   const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
   const dir = path.join(workspaceRoot, ".doer-agent", "runs");
   await mkdir(dir, { recursive: true });
   return dir;
+}
+
+async function resetRunsDir(): Promise<void> {
+  const dir = await resolveRunsDir();
+  await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  await mkdir(dir, { recursive: true });
+}
+
+async function persistRunTask(task: PublicRunTask): Promise<void> {
+  const dir = await resolveRunsDir();
+  const payload = {
+    runId: task.id,
+    agentId: task.agentId,
+    userId: task.userId,
+    sessionId: task.sessionId,
+    sessionFilePath: task.sessionFilePath,
+    status: task.status,
+    cancelRequested: task.cancelRequested,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    startedAt: task.startedAt,
+    finishedAt: task.finishedAt,
+    error: task.error,
+  };
+  await writeFile(path.join(dir, `${task.id}.json`), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+async function removeRunTask(runId: string): Promise<void> {
+  const dir = await resolveRunsDir();
+  await unlink(path.join(dir, `${runId}.json`)).catch(() => undefined);
 }
 
 function resolveAgentSettingsDir(): string {
@@ -1358,21 +1378,61 @@ function buildAgentSettingsEnvPatch(config: AgentSettingsConfig): Record<string,
   return envPatch;
 }
 
-function cloneRunTask(task: PublicRunTask, sinceSeq?: number | null): PublicRunTask {
+function cloneRunTask(task: PublicRunTask, _sinceSeq?: number | null): PublicRunTask {
   return {
     ...task,
-    events: task.events
-      .filter((event) => typeof sinceSeq === "number" ? event.seq > sinceSeq : true)
-      .map((event) => ({ ...event, payload: { ...event.payload } })),
   };
 }
 
-function appendRunEvent(task: PublicRunTask, type: AgentEventType, payload: Record<string, unknown>): void {
-  const timestamp = formatLocalTimestamp();
-  const seq = task.agentEventAckSeq + 1;
-  task.agentEventAckSeq = seq;
-  task.updatedAt = timestamp;
-  task.events.push({ seq, type, timestamp, payload });
+function extractCodexSessionMetadata(value: string): { sessionId: string | null; sessionFilePath: string | null } {
+  try {
+    const parsed = JSON.parse(value) as { type?: unknown; payload?: unknown };
+    const lineType = typeof parsed.type === "string" ? parsed.type : "";
+    if (!parsed.payload || typeof parsed.payload !== "object" || Array.isArray(parsed.payload)) {
+      return { sessionId: null, sessionFilePath: null };
+    }
+    const payload = parsed.payload as Record<string, unknown>;
+    const sessionIdCandidate =
+      typeof payload.sessionId === "string" && payload.sessionId.trim()
+        ? payload.sessionId.trim()
+        : typeof payload.session_id === "string" && payload.session_id.trim()
+          ? payload.session_id.trim()
+          : typeof payload.id === "string" && payload.id.trim() && (lineType === "session_meta" || lineType === "session.started")
+            ? payload.id.trim()
+            : null;
+    const filePathCandidate =
+      typeof payload.rollout_path === "string" && payload.rollout_path.trim()
+        ? payload.rollout_path.trim()
+        : typeof payload.filePath === "string" && payload.filePath.trim()
+          ? payload.filePath.trim()
+          : null;
+    return {
+      sessionId: sessionIdCandidate,
+      sessionFilePath: filePathCandidate,
+    };
+  } catch {
+    return { sessionId: null, sessionFilePath: null };
+  }
+}
+
+async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
+  sessionId?: string | null;
+  sessionFilePath?: string | null;
+}): Promise<void> {
+  let changed = false;
+  if (!task.sessionId && typeof metadata.sessionId === "string" && metadata.sessionId.trim()) {
+    task.sessionId = metadata.sessionId.trim();
+    changed = true;
+  }
+  if (!task.sessionFilePath && typeof metadata.sessionFilePath === "string" && metadata.sessionFilePath.trim()) {
+    task.sessionFilePath = metadata.sessionFilePath.trim();
+    changed = true;
+  }
+  if (!changed) {
+    return;
+  }
+  task.updatedAt = formatLocalTimestamp();
+  await persistRunTask(task).catch(() => undefined);
 }
 
 function persistRetainedRun(task: PublicRunTask): void {
@@ -1393,6 +1453,7 @@ async function startManagedRun(args: {
   serverBaseUrl: string;
   userId: string;
   agentId: string;
+  sessionId?: string | null;
   command: string;
   cwd: string | null;
   runtimeEnvPatch: Record<string, string>;
@@ -1415,16 +1476,13 @@ async function startManagedRun(args: {
     agentToken: args.agentToken,
   });
 
-  const logsDir = await resolveRunLogsDir();
-  const logPath = path.join(logsDir, `${args.runId}.log`);
-  const logStream = createWriteStream(logPath, { flags: "a", encoding: "utf8" });
   const now = formatLocalTimestamp();
   const task: PublicRunTask = {
     id: args.runId,
     userId: args.userId,
     agentId: args.agentId,
-    command: args.command,
-    cwd: args.cwd,
+    sessionId: typeof args.sessionId === "string" && args.sessionId.trim() ? args.sessionId.trim() : null,
+    sessionFilePath: null,
     status: "running",
     cancelRequested: false,
     resultExitCode: null,
@@ -1434,23 +1492,7 @@ async function startManagedRun(args: {
     updatedAt: now,
     startedAt: now,
     finishedAt: null,
-    agentEventAckSeq: 0,
-    events: [],
   };
-
-  appendRunEvent(task, "meta", {
-    host: process.platform,
-    pid: child.pid ?? null,
-    startedAt: now,
-    command: args.command,
-    cwd: prepared.taskWorkspace,
-    requestedCwd: args.cwd,
-    shell: prepared.shellPath,
-    logPath,
-    ...prepared.taskGitMeta,
-    ...prepared.codexAuthMeta,
-  });
-  appendRunEvent(task, "status", { status: "running" });
 
   const cancellation = createManagedCancellation(child);
   const requestCancel = () => {
@@ -1459,14 +1501,30 @@ async function startManagedRun(args: {
     }
     task.cancelRequested = true;
     task.updatedAt = formatLocalTimestamp();
+    void persistRunTask(task).catch(() => undefined);
     writeRunStatus(task.id, "cancel requested");
     cancellation.requestCancel();
   };
 
+  let stdoutBuffer = "";
   const recordChunk = (stream: "stdout" | "stderr", chunk: string) => {
-    appendRunEvent(task, stream, { chunk, at: formatLocalTimestamp() });
-    logStream.write(JSON.stringify({ at: formatLocalTimestamp(), stream, chunk }) + "\n");
     writeRunStream(task.id, stream, chunk);
+    if (stream !== "stdout" || (task.sessionId && task.sessionFilePath)) {
+      return;
+    }
+    stdoutBuffer += chunk;
+    const lines = stdoutBuffer.split(/\r?\n/);
+    stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      const metadata = extractCodexSessionMetadata(trimmed);
+      if (metadata.sessionId || metadata.sessionFilePath) {
+        void updateRunSessionMetadata(task, metadata);
+      }
+    }
   };
 
   child.stdout!.on("data", (chunk: string) => recordChunk("stdout", chunk));
@@ -1476,36 +1534,35 @@ async function startManagedRun(args: {
     task.status = "failed";
     task.error = message;
     task.finishedAt = formatLocalTimestamp();
-    appendRunEvent(task, "status", { status: "failed", error: message, finishedAt: task.finishedAt });
     persistRetainedRun(task);
     activeRuns.delete(task.id);
-    logStream.end();
+    void removeRunTask(task.id).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `failed error=${message}`);
   });
   child.once("close", (code, signal) => {
     cancellation.clear();
+    if (stdoutBuffer.trim() && (!task.sessionId || !task.sessionFilePath)) {
+      const metadata = extractCodexSessionMetadata(stdoutBuffer.trim());
+      if (metadata.sessionId || metadata.sessionFilePath) {
+        void updateRunSessionMetadata(task, metadata);
+      }
+    }
     task.resultExitCode = typeof code === "number" ? code : null;
     task.resultSignal = signal;
     task.finishedAt = formatLocalTimestamp();
     task.status = task.cancelRequested ? "canceled" : (task.resultExitCode ?? 1) === 0 ? "completed" : "failed";
     task.error = task.status === "failed" ? `Command exited with code ${task.resultExitCode ?? "null"}` : null;
-    appendRunEvent(task, "status", {
-      status: task.status,
-      exitCode: task.resultExitCode,
-      signal: task.resultSignal,
-      error: task.error,
-      finishedAt: task.finishedAt,
-    });
     persistRetainedRun(task);
     activeRuns.delete(task.id);
-    logStream.end();
+    void removeRunTask(task.id).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
   });
 
-  activeRuns.set(task.id, { task, child, logPath, logStream, requestCancel });
+  activeRuns.set(task.id, { task, child, requestCancel });
   persistRetainedRun(task);
+  void persistRunTask(task).catch(() => undefined);
   writeRunStatus(task.id, `started requestId=${args.requestId} cwd=${prepared.taskWorkspace}`);
   return cloneRunTask(task);
 }
@@ -2099,6 +2156,7 @@ async function handleCodexRpcMessage(args: {
       serverBaseUrl: args.serverBaseUrl,
       userId: args.userId,
       agentId: args.agentId,
+      sessionId: request.sessionId,
       command: buildManagedCodexCommand({
         prompt: request.prompt,
         sessionId: request.sessionId,
@@ -2541,6 +2599,7 @@ async function handleRunRpcMessage(args: {
         serverBaseUrl: args.serverBaseUrl,
         userId: args.userId,
         agentId: args.agentId,
+        sessionId: null,
         command: request.command ?? "",
         cwd: request.cwd,
         runtimeEnvPatch: request.runtimeEnvPatch,
@@ -4699,6 +4758,7 @@ async function main() {
   process.env.WORKSPACE = startupWorkspaceRoot;
   process.env.CODEX_HOME = path.join(startupWorkspaceRoot, ".codex");
   await mkdir(process.env.CODEX_HOME, { recursive: true }).catch(() => undefined);
+  await resetRunsDir();
 
   const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], DEFAULT_SERVER_BASE_URL);
   const requestedServerBaseUrl = serverBaseUrlRaw.replace(/\/$/, "");
