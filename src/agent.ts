@@ -1244,7 +1244,71 @@ function normalizeAgentSettingsPatch(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return {};
   }
-  return value as Record<string, unknown>;
+  const raw = value as Record<string, unknown>;
+  const patch: Record<string, unknown> = { ...raw };
+
+  const assignNested = (section: string, key: string, value: unknown) => {
+    const current =
+      patch[section] && typeof patch[section] === "object" && !Array.isArray(patch[section])
+        ? ({ ...(patch[section] as Record<string, unknown>) })
+        : {};
+    current[key] = value;
+    patch[section] = current;
+  };
+
+  const move = (flatKey: string, section: string, key: string) => {
+    if (!(flatKey in raw)) {
+      return;
+    }
+    assignNested(section, key, raw[flatKey]);
+    delete patch[flatKey];
+  };
+
+  move("firstTurnPrompt", "general", "firstTurnPrompt");
+
+  move("codexModel", "codex", "model");
+  move("codexAuthMode", "codex", "authMode");
+  move("codexApiKey", "codex", "apiKey");
+
+  move("realtimeModel", "realtime", "model");
+  move("realtimeVoice", "realtime", "voice");
+  move("realtimeWakeName", "realtime", "wakeName");
+  move("realtimeRequireWakeName", "realtime", "requireWakeName");
+  move("realtimeApiKey", "realtime", "apiKey");
+
+  move("gitEnabled", "git", "enabled");
+  move("gitName", "git", "name");
+  move("gitEmail", "git", "email");
+  move("gitAuthMode", "git", "authMode");
+  move("gitOauthToken", "git", "oauthToken");
+  move("gitOauthLogin", "git", "oauthLogin");
+  move("gitOauthScope", "git", "oauthScope");
+
+  move("awsEnabled", "aws", "enabled");
+  move("awsAccessKeyId", "aws", "accessKeyId");
+  move("awsDefaultRegion", "aws", "defaultRegion");
+  move("awsSecretAccessKey", "aws", "secretAccessKey");
+  move("awsSessionToken", "aws", "sessionToken");
+
+  move("jiraBaseUrl", "jira", "baseUrl");
+  move("jiraEmail", "jira", "email");
+  move("jiraEnabled", "jira", "enabled");
+  move("jiraApiToken", "jira", "apiToken");
+
+  move("notionBaseUrl", "notion", "baseUrl");
+  move("notionVersion", "notion", "version");
+  move("notionEnabled", "notion", "enabled");
+  move("notionApiToken", "notion", "apiToken");
+
+  move("slackBaseUrl", "slack", "baseUrl");
+  move("slackEnabled", "slack", "enabled");
+  move("slackBotToken", "slack", "botToken");
+
+  move("figmaBaseUrl", "figma", "baseUrl");
+  move("figmaEnabled", "figma", "enabled");
+  move("figmaApiToken", "figma", "apiToken");
+
+  return patch;
 }
 
 async function resolveAgentSettingsConfig(args: {
