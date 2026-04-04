@@ -965,17 +965,6 @@ async function startManagedRun(args: {
     activeRuns.delete(task.id);
     logStream.end();
     void prepared.codexAuthCleanup().catch(() => undefined);
-    if ((task.status === "completed" || task.status === "failed") && task.chatId) {
-      void notifyServerRunFinished({
-        serverBaseUrl: args.serverBaseUrl,
-        userId: args.userId,
-        agentToken: args.agentToken,
-        task,
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentInfraError(`run completion notify failed runId=${task.id}: ${message}`);
-      });
-    }
     writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
   });
 
@@ -1889,29 +1878,6 @@ function subscribeToGitRpc(args: {
     },
   });
   writeAgentInfo(`git rpc subscribed subject=${subject}`);
-}
-
-async function notifyServerRunFinished(args: {
-  serverBaseUrl: string;
-  userId: string;
-  agentToken: string;
-  task: PublicRunTask;
-}): Promise<void> {
-  if (!args.task.chatId || (args.task.status !== "completed" && args.task.status !== "failed")) {
-    return;
-  }
-  await postJson<{ ok?: boolean }>(`${args.serverBaseUrl}/api/agent/run-finished`, {
-    userId: args.userId,
-    agentToken: args.agentToken,
-    chatId: args.task.chatId,
-    runId: args.task.id,
-    command: args.task.command,
-    status: args.task.status,
-    exitCode: args.task.resultExitCode,
-    signal: args.task.resultSignal,
-    finishedAt: args.task.finishedAt,
-    error: args.task.error,
-  });
 }
 
 async function handleRunRpcMessage(args: {
