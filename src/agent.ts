@@ -68,13 +68,14 @@ interface AgentJetStreamContext {
   servers: string[];
 }
 
-type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file" | "write_file";
+type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file" | "write_file" | "download_file";
 
 interface AgentFsRpcRequest {
   requestId?: unknown;
   action?: unknown;
   path?: unknown;
   contentBase64?: unknown;
+  downloadPath?: unknown;
   offset?: unknown;
   length?: unknown;
   limit?: unknown;
@@ -2850,7 +2851,8 @@ function parseFsRpcAction(value: unknown): AgentFsRpcAction {
     value === "fetch_file" ||
     value === "read_text" ||
     value === "read_file" ||
-    value === "write_file"
+    value === "write_file" ||
+    value === "download_file"
   ) {
     return value;
   }
@@ -2914,6 +2916,7 @@ function inferMimeType(filePath: string): string {
 
 async function executeFsRpc(args: {
   request: AgentFsRpcRequest;
+  serverBaseUrl: string;
   agentToken: string;
 }): Promise<Record<string, unknown>> {
   const action = parseFsRpcAction(args.request.action);
@@ -3010,6 +3013,38 @@ async function executeFsRpc(args: {
     const parentDir = path.dirname(abs);
     await mkdir(parentDir, { recursive: true });
     const bytes = Buffer.from(contentBase64, "base64");
+    await writeFile(abs, bytes);
+    const entry = await stat(abs);
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      absolutePath: abs.split(path.sep).join("/"),
+      size: entry.size,
+      mimeType: inferMimeType(abs),
+      mtimeMs: entry.mtimeMs,
+    };
+  }
+
+  if (action === "download_file") {
+    const downloadPath = typeof args.request.downloadPath === "string" ? args.request.downloadPath.trim() : "";
+    if (!downloadPath) {
+      throw new Error("downloadPath is required");
+    }
+    const downloadUrl = new URL(downloadPath, `${args.serverBaseUrl}/`).toString();
+    const response = await fetch(downloadUrl, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${args.agentToken}`,
+      },
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(text || `download failed: ${response.status}`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const parentDir = path.dirname(abs);
+    await mkdir(parentDir, { recursive: true });
     await writeFile(abs, bytes);
     const entry = await stat(abs);
     return {
@@ -3779,7 +3814,11 @@ async function handleFsRpcMessage(args: {
     if (typeof payload.agentId === "string" && payload.agentId.trim() && payload.agentId !== args.agentId) {
       throw new Error("agent id mismatch");
     }
-    const result = await executeFsRpc({ request: payload, agentToken: args.agentToken });
+    const result = await executeFsRpc({
+      request: payload,
+      serverBaseUrl: args.serverBaseUrl,
+      agentToken: args.agentToken,
+    });
     args.msg.respond(fsRpcCodec.encode(JSON.stringify(result)));
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown error";
