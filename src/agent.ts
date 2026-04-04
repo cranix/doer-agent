@@ -166,6 +166,23 @@ interface AgentCodexRpcRequest {
   codexAuth?: unknown;
 }
 
+interface AgentCodexAuthRpcRequest {
+  requestId?: unknown;
+  responseSubject?: unknown;
+  agentId?: unknown;
+  action?: unknown;
+}
+
+interface AgentCodexAuthRpcResponse {
+  requestId: string;
+  ok: boolean;
+  loggedIn?: boolean;
+  output?: string;
+  verificationUri?: string | null;
+  userCode?: string | null;
+  error?: string;
+}
+
 interface AgentCodexRpcResponse {
   requestId: string;
   ok: boolean;
@@ -291,11 +308,20 @@ const shellRpcCodec = StringCodec();
 const runRpcCodec = StringCodec();
 const sessionRpcCodec = StringCodec();
 const codexRpcCodec = StringCodec();
+const codexAuthRpcCodec = StringCodec();
 const gitRpcCodec = StringCodec();
 const activeRuns = new Map<string, ActiveRunRecord>();
 const retainedRuns = new Map<string, PublicRunTask>();
 const activeSessionWatchers = new Map<string, () => void>();
 const sessionLineIndexCache = new Map<string, SessionLineIndexCacheEntry>();
+const ANSI_RE = /\u001b\[[0-9;]*m/g;
+
+interface PendingCodexDeviceAuth {
+  child: ReturnType<typeof spawn>;
+  output: string;
+}
+
+let pendingCodexDeviceAuth: PendingCodexDeviceAuth | null = null;
 
 function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -312,6 +338,10 @@ function buildAgentSessionRpcSubject(userId: string, agentId: string): string {
 
 function buildAgentCodexRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.codex.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function buildAgentCodexAuthRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.codex.auth.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function buildAgentGitRpcSubject(userId: string, agentId: string): string {
@@ -959,6 +989,10 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_RE, "");
+}
+
 function normalizeCodexModel(value: unknown): string {
   const normalized = typeof value === "string" ? value.trim() : "";
   return normalized || "gpt-5.4";
@@ -1028,6 +1062,392 @@ function publishCodexRpcResponse(args: {
   payload: AgentCodexRpcResponse;
 }): void {
   args.nc.publish(args.responseSubject, codexRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+function buildLocalCodexCliCommand(args: string[]): string {
+  const quotedArgs = args.map(shellSingleQuote).join(" ");
+  const direct = `exec codex ${quotedArgs}`;
+  const fallback = `exec npm exec --yes --package doer-agent -- codex ${quotedArgs}`;
+  const script = [
+    "if command -v codex >/dev/null 2>&1; then",
+    `  ${direct}`,
+    "fi",
+    fallback,
+  ].join("\n");
+  return `bash -lc ${shellSingleQuote(script)}`;
+}
+
+async function runLocalCodexCli(args: string[], timeoutMs: number): Promise<{
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}> {
+  const command = buildLocalCodexCliCommand(args);
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    WORKSPACE: workspaceRoot,
+    CODEX_HOME: resolveCodexHomePath(),
+  };
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      cwd: workspaceRoot,
+      shell: resolveShellPath(),
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    let timedOut = false;
+
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr!.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      sendSignalToTaskProcess(child, "SIGTERM");
+      setTimeout(() => sendSignalToTaskProcess(child, "SIGKILL"), 1000);
+    }, Math.max(500, timeoutMs));
+
+    child.once("error", (error) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    child.once("exit", (code) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr, timedOut });
+    });
+  });
+}
+
+function parseCodexDeviceAuthOutput(raw: string): { verificationUri: string | null; userCode: string | null } {
+  const text = stripAnsi(raw);
+  const urlMatch = text.match(/https?:\/\/[^\s]+/i);
+  const codeMatch = text.match(/\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b/);
+  return {
+    verificationUri: urlMatch?.[0] ?? null,
+    userCode: codeMatch?.[0] ?? null,
+  };
+}
+
+function pendingCodexDeviceAuthMessage(state: PendingCodexDeviceAuth): string {
+  const parsed = parseCodexDeviceAuthOutput(state.output);
+  if (parsed.verificationUri && parsed.userCode) {
+    return `Waiting for approval. Enter code ${parsed.userCode} at ${parsed.verificationUri}`;
+  }
+  return stripAnsi(state.output).trim() || "Waiting for approval";
+}
+
+async function getLocalCodexLoginStatus(): Promise<{ loggedIn: boolean; output: string }> {
+  const result = await runLocalCodexCli(["login", "status"], 5000);
+  const merged = stripAnsi([result.stdout, result.stderr].filter(Boolean).join("\n")).trim();
+  return {
+    loggedIn: (result.code ?? 1) === 0,
+    output: merged || ((result.code ?? 1) === 0 ? "Logged in" : "Not logged in"),
+  };
+}
+
+async function waitForCodexDeviceCode(state: PendingCodexDeviceAuth, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const parsed = parseCodexDeviceAuthOutput(state.output);
+    if (parsed.verificationUri && parsed.userCode) {
+      return;
+    }
+    if (state.child.exitCode !== null) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+async function startLocalCodexDeviceAuth(): Promise<{
+  loggedIn: false;
+  output: string;
+  verificationUri: string | null;
+  userCode: string | null;
+}> {
+  if (pendingCodexDeviceAuth && pendingCodexDeviceAuth.child.exitCode === null) {
+    const parsed = parseCodexDeviceAuthOutput(pendingCodexDeviceAuth.output);
+    return {
+      loggedIn: false,
+      output: pendingCodexDeviceAuthMessage(pendingCodexDeviceAuth),
+      verificationUri: parsed.verificationUri,
+      userCode: parsed.userCode,
+    };
+  }
+
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  const child = spawn(buildLocalCodexCliCommand(["login", "--device-auth"]), {
+    cwd: workspaceRoot,
+    shell: resolveShellPath(),
+    detached: process.platform !== "win32",
+    env: {
+      ...process.env,
+      WORKSPACE: workspaceRoot,
+      CODEX_HOME: resolveCodexHomePath(),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  child.stdout!.setEncoding("utf8");
+  child.stderr!.setEncoding("utf8");
+
+  const state: PendingCodexDeviceAuth = { child, output: "" };
+  pendingCodexDeviceAuth = state;
+
+  const appendOutput = (chunk: string) => {
+    state.output += chunk;
+  };
+  child.stdout!.on("data", appendOutput);
+  child.stderr!.on("data", appendOutput);
+  child.once("exit", () => {
+    if (pendingCodexDeviceAuth === state) {
+      pendingCodexDeviceAuth = null;
+    }
+  });
+
+  await waitForCodexDeviceCode(state, 8000);
+
+  const parsed = parseCodexDeviceAuthOutput(state.output);
+  if ((!parsed.verificationUri || !parsed.userCode) && state.child.exitCode !== null) {
+    throw new Error("Failed to read device code from Codex CLI");
+  }
+
+  return {
+    loggedIn: false,
+    output: pendingCodexDeviceAuthMessage(state),
+    verificationUri: parsed.verificationUri,
+    userCode: parsed.userCode,
+  };
+}
+
+async function startLocalCodexLogin(): Promise<{
+  loggedIn: boolean;
+  output: string;
+  verificationUri: string | null;
+  userCode: string | null;
+}> {
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  const child = spawn(buildLocalCodexCliCommand(["login"]), {
+    cwd: workspaceRoot,
+    shell: resolveShellPath(),
+    detached: process.platform !== "win32",
+    env: {
+      ...process.env,
+      WORKSPACE: workspaceRoot,
+      CODEX_HOME: resolveCodexHomePath(),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  let output = "";
+  child.stdout!.setEncoding("utf8");
+  child.stderr!.setEncoding("utf8");
+  child.stdout!.on("data", (chunk: string) => {
+    output += chunk;
+  });
+  child.stderr!.on("data", (chunk: string) => {
+    output += chunk;
+  });
+
+  const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => resolve({ code, output }));
+  });
+
+  const normalized = stripAnsi(result.output).trim();
+  const parsed = parseCodexDeviceAuthOutput(result.output);
+  if ((result.code ?? 1) === 0) {
+    const status = await getLocalCodexLoginStatus().catch(() => null);
+    return {
+      loggedIn: status?.loggedIn === true,
+      output: status?.output || normalized || "Login started",
+      verificationUri: parsed.verificationUri,
+      userCode: parsed.userCode,
+    };
+  }
+
+  throw new Error(normalized || `Codex login failed with code ${result.code ?? "null"}`);
+}
+
+async function logoutLocalCodexAuth(): Promise<{ loggedIn: false; output: string }> {
+  if (pendingCodexDeviceAuth && pendingCodexDeviceAuth.child.exitCode === null) {
+    sendSignalToTaskProcess(pendingCodexDeviceAuth.child, "SIGTERM");
+    setTimeout(() => {
+      if (pendingCodexDeviceAuth?.child.exitCode === null) {
+        sendSignalToTaskProcess(pendingCodexDeviceAuth.child, "SIGKILL");
+      }
+    }, 1000);
+    pendingCodexDeviceAuth = null;
+  }
+  const result = await runLocalCodexCli(["logout"], 5000);
+  let merged = stripAnsi([result.stdout, result.stderr].filter(Boolean).join("\n")).trim();
+  const statusAfterLogout = await getLocalCodexLoginStatus().catch(() => null);
+  if (statusAfterLogout?.loggedIn) {
+    const authFile = path.join(resolveCodexHomePath(), "auth.json");
+    await unlink(authFile).catch(() => undefined);
+    const statusAfterDelete = await getLocalCodexLoginStatus().catch(() => null);
+    if (statusAfterDelete?.output) {
+      merged = [merged, statusAfterDelete.output].filter(Boolean).join("\n");
+    }
+  }
+  return {
+    loggedIn: false,
+    output: merged || "Logged out",
+  };
+}
+
+function normalizeCodexAuthRpcRequest(args: {
+  request: AgentCodexAuthRpcRequest;
+  agentId: string;
+}): {
+  requestId: string;
+  responseSubject: string;
+  action: "start" | "status" | "logout";
+} {
+  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
+  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
+  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
+  const actionRaw = typeof args.request.action === "string" ? args.request.action.trim() : "";
+  const action = actionRaw === "start" || actionRaw === "logout" ? actionRaw : "status";
+  if (!requestId || !responseSubject || !requestAgentId || requestAgentId !== args.agentId) {
+    throw new Error("invalid codex auth rpc request");
+  }
+  return { requestId, responseSubject, action };
+}
+
+function publishCodexAuthRpcResponse(args: {
+  nc: NatsConnection;
+  responseSubject: string;
+  payload: AgentCodexAuthRpcResponse;
+}): void {
+  args.nc.publish(args.responseSubject, codexAuthRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+async function handleCodexAuthRpcMessage(args: {
+  msg: Msg;
+  jetstream: AgentJetStreamContext;
+  agentId: string;
+}): Promise<void> {
+  let requestId = "unknown";
+  let responseSubject = "";
+  try {
+    const payload = JSON.parse(codexAuthRpcCodec.decode(args.msg.data)) as AgentCodexAuthRpcRequest;
+    const request = normalizeCodexAuthRpcRequest({ request: payload, agentId: args.agentId });
+    requestId = request.requestId;
+    responseSubject = request.responseSubject;
+
+    let result:
+      | { loggedIn: boolean; output: string; verificationUri?: string | null; userCode?: string | null }
+      | null = null;
+
+    if (request.action === "start") {
+      const status = await getLocalCodexLoginStatus();
+      if (status.loggedIn) {
+        result = { loggedIn: true, output: status.output };
+      } else {
+        try {
+          result = await startLocalCodexDeviceAuth();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const normalized = message.toLowerCase();
+          if (
+            normalized.includes("operation not permitted") ||
+            normalized.includes("failed to read device code") ||
+            normalized.includes("panic") ||
+            normalized.includes("null object")
+          ) {
+            result = await startLocalCodexLogin();
+          } else {
+            throw error;
+          }
+        }
+      }
+    } else if (request.action === "logout") {
+      result = await logoutLocalCodexAuth();
+    } else {
+      const status = await getLocalCodexLoginStatus();
+      if (status.loggedIn) {
+        result = { loggedIn: true, output: status.output };
+      } else if (pendingCodexDeviceAuth && pendingCodexDeviceAuth.child.exitCode === null) {
+        const parsed = parseCodexDeviceAuthOutput(pendingCodexDeviceAuth.output);
+        result = {
+          loggedIn: false,
+          output: pendingCodexDeviceAuthMessage(pendingCodexDeviceAuth),
+          verificationUri: parsed.verificationUri,
+          userCode: parsed.userCode,
+        };
+      } else {
+        result = { loggedIn: false, output: status.output || "Not logged in" };
+      }
+    }
+
+    publishCodexAuthRpcResponse({
+      nc: args.jetstream.nc,
+      responseSubject,
+      payload: {
+        requestId,
+        ok: true,
+        loggedIn: result.loggedIn,
+        output: result.output,
+        verificationUri: result.verificationUri ?? null,
+        userCode: result.userCode ?? null,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (responseSubject) {
+      publishCodexAuthRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: false, error: message },
+      });
+    }
+    writeAgentError(`codex auth rpc failed requestId=${requestId} error=${message}`);
+  }
+}
+
+function subscribeToCodexAuthRpc(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): void {
+  const subject = buildAgentCodexAuthRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`codex auth rpc subscription error: ${message}`);
+        return;
+      }
+      void handleCodexAuthRpcMessage({
+        msg,
+        jetstream: args.jetstream,
+        agentId: args.agentId,
+      });
+    },
+  });
+  writeAgentInfo(`codex auth rpc subscribed subject=${subject}`);
 }
 
 async function handleCodexRpcMessage(args: {
@@ -3199,19 +3619,15 @@ async function prepareTaskCodexAuth(args: {
   cleanup: () => Promise<void>;
   meta: Record<string, unknown>;
 } | null> {
-  const bundle = await postJson<CodexAuthBundleResponse>(
-    `${args.serverBaseUrl}/api/agent/tasks/${encodeURIComponent(args.taskId)}/codex-auth`,
-    {
-      userId: args.userId,
-      agentToken: args.agentToken,
+  void args;
+  return {
+    envPatch: {},
+    cleanup: async () => {},
+    meta: {
+      codexAuthSource: "agent_local",
+      codexAuthSynced: false,
     },
-  ).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    writeAgentError(`task=${args.taskId} codex auth sync skipped: ${message}`);
-    return null;
-  });
-
-  return await prepareCodexAuthBundle(bundle);
+  };
 }
 
 async function prepareCodexAuthBundle(bundle: CodexAuthBundleResponse | null): Promise<{
@@ -3219,34 +3635,13 @@ async function prepareCodexAuthBundle(bundle: CodexAuthBundleResponse | null): P
   cleanup: () => Promise<void>;
   meta: Record<string, unknown>;
 } | null> {
-
-  if (!bundle || typeof bundle.authJson !== "string") {
-    return null;
-  }
-
-  const codexHome = resolveCodexHomePath();
-  await mkdir(codexHome, { recursive: true });
-  const authFile = path.join(codexHome, "auth.json");
-  await writeFile(authFile, bundle.authJson, "utf8");
-  await chmod(authFile, 0o600).catch(() => undefined);
-
-  const envPatch: Record<string, string> = {
-    CODEX_HOME: codexHome,
-  };
-  if (typeof bundle.apiKey === "string" && bundle.apiKey.trim()) {
-    envPatch.OPENAI_API_KEY = bundle.apiKey.trim();
-  }
-
-  const cleanup = async () => {};
-
+  void bundle;
   return {
-    envPatch,
-    cleanup,
+    envPatch: {},
+    cleanup: async () => {},
     meta: {
-      codexAuthMode: bundle.authMode ?? null,
-      codexAuthIssuedAt: bundle.issuedAt ?? null,
-      codexAuthExpiresAt: bundle.expiresAt ?? null,
-      codexAuthSynced: true,
+      codexAuthSource: "agent_local",
+      codexAuthSynced: false,
     },
   };
 }
@@ -3710,6 +4105,11 @@ async function main() {
     userId,
     agentId: initialAgentId,
     agentToken,
+  });
+  subscribeToCodexAuthRpc({
+    jetstream,
+    userId,
+    agentId: initialAgentId,
   });
   subscribeToGitRpc({
     jetstream,
