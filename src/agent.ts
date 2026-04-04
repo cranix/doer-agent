@@ -68,19 +68,19 @@ interface AgentJetStreamContext {
   servers: string[];
 }
 
-type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file";
+type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file" | "write_file";
 
 interface AgentFsRpcRequest {
   requestId?: unknown;
   action?: unknown;
   path?: unknown;
+  contentBase64?: unknown;
   offset?: unknown;
   length?: unknown;
   limit?: unknown;
   maxBytes?: unknown;
   encoding?: unknown;
   uploadUrl?: unknown;
-  chatId?: unknown;
   agentId?: unknown;
 }
 
@@ -143,7 +143,6 @@ interface AgentRunRpcRequest {
   runId?: unknown;
   command?: unknown;
   cwd?: unknown;
-  chatId?: unknown;
   responseSubject?: unknown;
   agentId?: unknown;
   sinceSeq?: unknown;
@@ -160,7 +159,6 @@ interface AgentCodexRpcRequest {
   prompt?: unknown;
   sessionId?: unknown;
   cwd?: unknown;
-  chatId?: unknown;
   model?: unknown;
   runtimeEnvPatch?: unknown;
   codexAuth?: unknown;
@@ -378,7 +376,6 @@ interface AgentRunRpcNormalizedRequest {
   runId: string | null;
   command: string | null;
   cwd: string | null;
-  chatId: string | null;
   responseSubject: string;
   sinceSeq: number | null;
   limit: number;
@@ -392,7 +389,6 @@ interface PublicRunTask {
   agentId: string;
   command: string;
   cwd: string | null;
-  chatId: string | null;
   status: "queued" | "running" | "completed" | "failed" | "canceled";
   cancelRequested: boolean;
   resultExitCode: number | null;
@@ -943,7 +939,6 @@ function normalizeRunRpcRequest(args: { request: AgentRunRpcRequest; agentId: st
     throw new Error("missing runId");
   }
   const cwd = typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null;
-  const chatId = typeof args.request.chatId === "string" && args.request.chatId.trim() ? args.request.chatId.trim() : null;
   const sinceSeqRaw = Number(args.request.sinceSeq);
   const sinceSeq = Number.isInteger(sinceSeqRaw) && sinceSeqRaw >= 0 ? sinceSeqRaw : null;
   const limitRaw = Number(args.request.limit);
@@ -954,7 +949,6 @@ function normalizeRunRpcRequest(args: { request: AgentRunRpcRequest; agentId: st
     runId,
     command,
     cwd,
-    chatId,
     responseSubject,
     sinceSeq,
     limit,
@@ -1400,7 +1394,6 @@ async function startManagedRun(args: {
   agentId: string;
   command: string;
   cwd: string | null;
-  chatId: string | null;
   runtimeEnvPatch: Record<string, string>;
   codexAuthBundle: CodexAuthBundleResponse | null;
   agentToken: string;
@@ -1431,7 +1424,6 @@ async function startManagedRun(args: {
     agentId: args.agentId,
     command: args.command,
     cwd: args.cwd,
-    chatId: args.chatId,
     status: "running",
     cancelRequested: false,
     resultExitCode: null,
@@ -1540,7 +1532,6 @@ function normalizeCodexRpcRequest(args: {
   prompt: string;
   sessionId: string | null;
   cwd: string | null;
-  chatId: string | null;
   model: string;
   runtimeEnvPatch: Record<string, string>;
   codexAuthBundle: CodexAuthBundleResponse | null;
@@ -1560,7 +1551,6 @@ function normalizeCodexRpcRequest(args: {
     prompt,
     sessionId: typeof args.request.sessionId === "string" && args.request.sessionId.trim() ? args.request.sessionId.trim() : null,
     cwd: typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null,
-    chatId: typeof args.request.chatId === "string" && args.request.chatId.trim() ? args.request.chatId.trim() : null,
     model: normalizeCodexModel(args.request.model),
     runtimeEnvPatch: normalizeEnvPatch(args.request.runtimeEnvPatch),
     codexAuthBundle: normalizeShellRpcCodexAuthBundle(args.request.codexAuth),
@@ -2114,7 +2104,6 @@ async function handleCodexRpcMessage(args: {
         model: request.model,
       }),
       cwd: request.cwd,
-      chatId: request.chatId,
       runtimeEnvPatch: request.runtimeEnvPatch,
       codexAuthBundle: request.codexAuthBundle,
       agentToken: args.agentToken,
@@ -2553,7 +2542,6 @@ async function handleRunRpcMessage(args: {
         agentId: args.agentId,
         command: request.command ?? "",
         cwd: request.cwd,
-        chatId: request.chatId,
         runtimeEnvPatch: request.runtimeEnvPatch,
         codexAuthBundle: request.codexAuthBundle,
         agentToken: args.agentToken,
@@ -2856,7 +2844,14 @@ function normalizeFsRpcPath(rawPath: unknown): { abs: string; formatPath: (targe
 }
 
 function parseFsRpcAction(value: unknown): AgentFsRpcAction {
-  if (value === "list" || value === "stat" || value === "fetch_file" || value === "read_text" || value === "read_file") {
+  if (
+    value === "list" ||
+    value === "stat" ||
+    value === "fetch_file" ||
+    value === "read_text" ||
+    value === "read_file" ||
+    value === "write_file"
+  ) {
     return value;
   }
   throw new Error("unsupported action");
@@ -2973,16 +2968,14 @@ async function executeFsRpc(args: {
       throw new Error("path is not a file");
     }
     const uploadUrl = typeof args.request.uploadUrl === "string" ? args.request.uploadUrl : "";
-    const chatId = typeof args.request.chatId === "string" ? args.request.chatId : "";
     const agentId = typeof args.request.agentId === "string" ? args.request.agentId : "";
-    if (!uploadUrl || !chatId || !agentId) {
+    if (!uploadUrl || !agentId) {
       throw new Error("missing upload parameters");
     }
     const data = await readFile(abs);
     const fileName = path.basename(abs) || "file";
     const form = new FormData();
     form.append("file", new File([data], fileName));
-    form.append("chatId", chatId);
     form.append("agentId", agentId);
     const response = await fetch(uploadUrl, {
       method: "POST",
@@ -3006,6 +2999,27 @@ async function executeFsRpc(args: {
       path: formatPath(abs),
       size: entry.size,
       upload,
+    };
+  }
+
+  if (action === "write_file") {
+    const contentBase64 = typeof args.request.contentBase64 === "string" ? args.request.contentBase64 : "";
+    if (!contentBase64) {
+      throw new Error("contentBase64 is required");
+    }
+    const parentDir = path.dirname(abs);
+    await mkdir(parentDir, { recursive: true });
+    const bytes = Buffer.from(contentBase64, "base64");
+    await writeFile(abs, bytes);
+    const entry = await stat(abs);
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      absolutePath: abs.split(path.sep).join("/"),
+      size: entry.size,
+      mimeType: inferMimeType(abs),
+      mtimeMs: entry.mtimeMs,
     };
   }
 
