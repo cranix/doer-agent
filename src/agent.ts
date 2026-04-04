@@ -1407,7 +1407,8 @@ async function startManagedRun(args: {
 }): Promise<PublicRunTask> {
   const prepared = await prepareCommandExecution({
     cwd: args.cwd,
-    runtimeEnvPatch: args.runtimeEnvPatch,
+    userId: args.userId,
+    taskId: args.runId,
     codexAuthBundle: args.codexAuthBundle,
   });
   const child = spawnPreparedCommand({
@@ -3881,6 +3882,7 @@ function publishShellRpcResponse(args: {
 async function handleShellRpcMessage(args: {
   msg: Msg;
   jetstream: AgentJetStreamContext;
+  userId: string;
   agentId: string;
   agentToken: string;
 }): Promise<void> {
@@ -3896,7 +3898,8 @@ async function handleShellRpcMessage(args: {
     const startedAtMs = Date.now();
     const prepared = await prepareCommandExecution({
       cwd: request.cwd,
-      runtimeEnvPatch: request.runtimeEnvPatch,
+      userId: args.userId,
+      taskId: request.requestId,
       codexAuthBundle: request.codexAuthBundle,
     });
     const child = spawnPreparedCommand({
@@ -3998,6 +4001,7 @@ function subscribeToShellRpc(args: {
       void handleShellRpcMessage({
         msg,
         jetstream: args.jetstream,
+        userId: args.userId,
         agentId: args.agentId,
         agentToken: args.agentToken,
       });
@@ -4261,7 +4265,8 @@ async function prepareCodexAuthBundle(bundle: CodexAuthBundleResponse | null): P
 
 async function prepareCommandExecution(args: {
   cwd: string | null;
-  runtimeEnvPatch: Record<string, string>;
+  userId: string;
+  taskId: string;
   codexAuthBundle: CodexAuthBundleResponse | null;
 }): Promise<{
   shellPath: string;
@@ -4280,8 +4285,9 @@ async function prepareCommandExecution(args: {
   const localAgentSettings = await readAgentSettingsConfig(null);
   const baseTaskEnvPatch = {
     CODEX_HOME: codexHome,
+    DOER_USER_ID: args.userId,
+    DOER_AGENT_TASK_ID: args.taskId,
     ...buildAgentSettingsEnvPatch(localAgentSettings),
-    ...args.runtimeEnvPatch,
     ...(codexAuth?.envPatch ?? {}),
     WORKSPACE: taskWorkspace,
   };
