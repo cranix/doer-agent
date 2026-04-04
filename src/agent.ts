@@ -183,6 +183,154 @@ interface AgentCodexAuthRpcResponse {
   error?: string;
 }
 
+type AgentSettingsRpcAction = "get" | "update";
+
+interface AgentSettingsConfig {
+  general: {
+    firstTurnPrompt: string | null;
+  };
+  codex: {
+    model: string;
+    authMode: "api_key" | "oauth";
+    apiKey: string | null;
+  };
+  realtime: {
+    model: string;
+    voice: string;
+    wakeName: string | null;
+    requireWakeName: boolean;
+    apiKey: string | null;
+  };
+  git: {
+    enabled: boolean;
+    name: string | null;
+    email: string | null;
+    authMode: "none" | "oauth_app";
+    oauthToken: string | null;
+    oauthLogin: string | null;
+    oauthScope: string | null;
+  };
+  aws: {
+    enabled: boolean;
+    accessKeyId: string | null;
+    defaultRegion: string | null;
+    secretAccessKey: string | null;
+    sessionToken: string | null;
+  };
+  jira: {
+    baseUrl: string | null;
+    email: string | null;
+    enabled: boolean;
+    apiToken: string | null;
+  };
+  notion: {
+    baseUrl: string | null;
+    version: string | null;
+    enabled: boolean;
+    apiToken: string | null;
+  };
+  slack: {
+    baseUrl: string | null;
+    enabled: boolean;
+    botToken: string | null;
+  };
+  figma: {
+    baseUrl: string | null;
+    enabled: boolean;
+    apiToken: string | null;
+  };
+}
+
+interface AgentSettingsPublic {
+  general: {
+    firstTurnPrompt: string | null;
+  };
+  codex: {
+    model: string;
+    authMode: "api_key" | "oauth";
+    hasApiKey: boolean;
+    apiKeyMasked: string | null;
+    apiKeyLength: number | null;
+  };
+  realtime: {
+    model: string;
+    voice: string;
+    wakeName: string | null;
+    requireWakeName: boolean;
+    hasApiKey: boolean;
+    apiKeyMasked: string | null;
+    apiKeyLength: number | null;
+  };
+  git: {
+    enabled: boolean;
+    name: string | null;
+    email: string | null;
+    authMode: "none" | "oauth_app";
+    hasOauthToken: boolean;
+    oauthTokenMasked: string | null;
+    oauthTokenLength: number | null;
+    oauthLogin: string | null;
+    oauthScope: string | null;
+  };
+  aws: {
+    enabled: boolean;
+    accessKeyId: string | null;
+    defaultRegion: string | null;
+    hasSecretAccessKey: boolean;
+    secretAccessKeyMasked: string | null;
+    secretAccessKeyLength: number | null;
+    hasSessionToken: boolean;
+    sessionTokenMasked: string | null;
+    sessionTokenLength: number | null;
+  };
+  jira: {
+    baseUrl: string | null;
+    email: string | null;
+    enabled: boolean;
+    hasApiToken: boolean;
+    apiTokenMasked: string | null;
+    apiTokenLength: number | null;
+  };
+  notion: {
+    baseUrl: string | null;
+    version: string | null;
+    enabled: boolean;
+    hasApiToken: boolean;
+    apiTokenMasked: string | null;
+    apiTokenLength: number | null;
+  };
+  slack: {
+    baseUrl: string | null;
+    enabled: boolean;
+    hasBotToken: boolean;
+    botTokenMasked: string | null;
+    botTokenLength: number | null;
+  };
+  figma: {
+    baseUrl: string | null;
+    enabled: boolean;
+    hasApiToken: boolean;
+    apiTokenMasked: string | null;
+    apiTokenLength: number | null;
+  };
+}
+
+interface AgentSettingsRpcRequest {
+  requestId?: unknown;
+  responseSubject?: unknown;
+  agentId?: unknown;
+  action?: unknown;
+  patch?: unknown;
+  defaults?: unknown;
+}
+
+interface AgentSettingsRpcResponse {
+  requestId: string;
+  ok: boolean;
+  settings?: AgentSettingsPublic;
+  error?: string;
+}
+
 interface AgentCodexRpcResponse {
   requestId: string;
   ok: boolean;
@@ -309,6 +457,7 @@ const runRpcCodec = StringCodec();
 const sessionRpcCodec = StringCodec();
 const codexRpcCodec = StringCodec();
 const codexAuthRpcCodec = StringCodec();
+const settingsRpcCodec = StringCodec();
 const gitRpcCodec = StringCodec();
 const activeRuns = new Map<string, ActiveRunRecord>();
 const retainedRuns = new Map<string, PublicRunTask>();
@@ -342,6 +491,10 @@ function buildAgentCodexRpcSubject(userId: string, agentId: string): string {
 
 function buildAgentCodexAuthRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.codex.auth.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function buildAgentSettingsRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.settings.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function buildAgentGitRpcSubject(userId: string, agentId: string): string {
@@ -821,6 +974,331 @@ async function resolveRunLogsDir(): Promise<string> {
   return dir;
 }
 
+function resolveAgentSettingsDir(): string {
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  return path.join(workspaceRoot, ".doer-agent");
+}
+
+function resolveAgentSettingsFilePath(): string {
+  return path.join(resolveAgentSettingsDir(), "config.json");
+}
+
+function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
+  return {
+    general: {
+      firstTurnPrompt: null,
+    },
+    codex: {
+      model: "gpt-5.4",
+      authMode: "api_key",
+      apiKey: null,
+    },
+    realtime: {
+      model: process.env.OPENAI_REALTIME_MODEL?.trim() || "gpt-realtime",
+      voice: process.env.OPENAI_REALTIME_VOICE?.trim() || "alloy",
+      wakeName: null,
+      requireWakeName: true,
+      apiKey: null,
+    },
+    git: {
+      enabled: true,
+      name: null,
+      email: null,
+      authMode: "none",
+      oauthToken: null,
+      oauthLogin: null,
+      oauthScope: null,
+    },
+    aws: {
+      enabled: true,
+      accessKeyId: null,
+      defaultRegion: null,
+      secretAccessKey: null,
+      sessionToken: null,
+    },
+    jira: {
+      baseUrl: null,
+      email: null,
+      enabled: false,
+      apiToken: null,
+    },
+    notion: {
+      baseUrl: "https://api.notion.com",
+      version: "2022-06-28",
+      enabled: false,
+      apiToken: null,
+    },
+    slack: {
+      baseUrl: "https://slack.com/api",
+      enabled: false,
+      botToken: null,
+    },
+    figma: {
+      baseUrl: "https://api.figma.com",
+      enabled: false,
+      apiToken: null,
+    },
+  };
+}
+
+function normalizeNullableString(value: unknown): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeAgentSettingsConfig(value: unknown, fallback?: AgentSettingsConfig | null): AgentSettingsConfig {
+  const base = fallback ?? createDefaultAgentSettingsConfig();
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  const general = raw.general && typeof raw.general === "object" ? (raw.general as Record<string, unknown>) : {};
+  const codex = raw.codex && typeof raw.codex === "object" ? (raw.codex as Record<string, unknown>) : {};
+  const realtime = raw.realtime && typeof raw.realtime === "object" ? (raw.realtime as Record<string, unknown>) : {};
+  const git = raw.git && typeof raw.git === "object" ? (raw.git as Record<string, unknown>) : {};
+  const aws = raw.aws && typeof raw.aws === "object" ? (raw.aws as Record<string, unknown>) : {};
+  const jira = raw.jira && typeof raw.jira === "object" ? (raw.jira as Record<string, unknown>) : {};
+  const notion = raw.notion && typeof raw.notion === "object" ? (raw.notion as Record<string, unknown>) : {};
+  const slack = raw.slack && typeof raw.slack === "object" ? (raw.slack as Record<string, unknown>) : {};
+  const figma = raw.figma && typeof raw.figma === "object" ? (raw.figma as Record<string, unknown>) : {};
+  return {
+    general: {
+      firstTurnPrompt: normalizeNullableString(general.firstTurnPrompt) ?? base.general.firstTurnPrompt,
+    },
+    codex: {
+      model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
+      authMode: codex.authMode === "oauth" ? "oauth" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
+      apiKey: codex.apiKey === null ? null : normalizeNullableString(codex.apiKey) ?? base.codex.apiKey,
+    },
+    realtime: {
+      model: typeof realtime.model === "string" && realtime.model.trim() ? realtime.model.trim() : base.realtime.model,
+      voice: typeof realtime.voice === "string" && realtime.voice.trim() ? realtime.voice.trim() : base.realtime.voice,
+      wakeName: realtime.wakeName === null ? null : normalizeNullableString(realtime.wakeName) ?? base.realtime.wakeName,
+      requireWakeName: typeof realtime.requireWakeName === "boolean" ? realtime.requireWakeName : base.realtime.requireWakeName,
+      apiKey: realtime.apiKey === null ? null : normalizeNullableString(realtime.apiKey) ?? base.realtime.apiKey,
+    },
+    git: {
+      enabled: typeof git.enabled === "boolean" ? git.enabled : base.git.enabled,
+      name: git.name === null ? null : normalizeNullableString(git.name) ?? base.git.name,
+      email: git.email === null ? null : normalizeNullableString(git.email) ?? base.git.email,
+      authMode: git.authMode === "oauth_app" ? "oauth_app" : git.authMode === "none" ? "none" : base.git.authMode,
+      oauthToken: git.oauthToken === null ? null : normalizeNullableString(git.oauthToken) ?? base.git.oauthToken,
+      oauthLogin: git.oauthLogin === null ? null : normalizeNullableString(git.oauthLogin) ?? base.git.oauthLogin,
+      oauthScope: git.oauthScope === null ? null : normalizeNullableString(git.oauthScope) ?? base.git.oauthScope,
+    },
+    aws: {
+      enabled: typeof aws.enabled === "boolean" ? aws.enabled : base.aws.enabled,
+      accessKeyId: aws.accessKeyId === null ? null : normalizeNullableString(aws.accessKeyId) ?? base.aws.accessKeyId,
+      defaultRegion: aws.defaultRegion === null ? null : normalizeNullableString(aws.defaultRegion) ?? base.aws.defaultRegion,
+      secretAccessKey: aws.secretAccessKey === null ? null : normalizeNullableString(aws.secretAccessKey) ?? base.aws.secretAccessKey,
+      sessionToken: aws.sessionToken === null ? null : normalizeNullableString(aws.sessionToken) ?? base.aws.sessionToken,
+    },
+    jira: {
+      baseUrl: jira.baseUrl === null ? null : normalizeNullableString(jira.baseUrl) ?? base.jira.baseUrl,
+      email: jira.email === null ? null : normalizeNullableString(jira.email) ?? base.jira.email,
+      enabled: typeof jira.enabled === "boolean" ? jira.enabled : base.jira.enabled,
+      apiToken: jira.apiToken === null ? null : normalizeNullableString(jira.apiToken) ?? base.jira.apiToken,
+    },
+    notion: {
+      baseUrl: notion.baseUrl === null ? null : normalizeNullableString(notion.baseUrl) ?? base.notion.baseUrl,
+      version: notion.version === null ? null : normalizeNullableString(notion.version) ?? base.notion.version,
+      enabled: typeof notion.enabled === "boolean" ? notion.enabled : base.notion.enabled,
+      apiToken: notion.apiToken === null ? null : normalizeNullableString(notion.apiToken) ?? base.notion.apiToken,
+    },
+    slack: {
+      baseUrl: slack.baseUrl === null ? null : normalizeNullableString(slack.baseUrl) ?? base.slack.baseUrl,
+      enabled: typeof slack.enabled === "boolean" ? slack.enabled : base.slack.enabled,
+      botToken: slack.botToken === null ? null : normalizeNullableString(slack.botToken) ?? base.slack.botToken,
+    },
+    figma: {
+      baseUrl: figma.baseUrl === null ? null : normalizeNullableString(figma.baseUrl) ?? base.figma.baseUrl,
+      enabled: typeof figma.enabled === "boolean" ? figma.enabled : base.figma.enabled,
+      apiToken: figma.apiToken === null ? null : normalizeNullableString(figma.apiToken) ?? base.figma.apiToken,
+    },
+  };
+}
+
+async function readAgentSettingsConfig(defaults?: AgentSettingsConfig | null): Promise<AgentSettingsConfig> {
+  const fallback = normalizeAgentSettingsConfig(defaults ?? null);
+  const filePath = resolveAgentSettingsFilePath();
+  const raw = await readFile(filePath, "utf8").catch(() => "");
+  if (!raw.trim()) {
+    return fallback;
+  }
+  try {
+    return normalizeAgentSettingsConfig(JSON.parse(raw), fallback);
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeAgentSettingsConfig(config: AgentSettingsConfig): Promise<void> {
+  const dir = resolveAgentSettingsDir();
+  await mkdir(dir, { recursive: true });
+  await writeFile(resolveAgentSettingsFilePath(), `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
+function maskSecretPreview(secret: string): string {
+  if (secret.length <= 6) {
+    return `${secret.slice(0, 1)}***${secret.slice(-1)}`;
+  }
+  return `${secret.slice(0, 4)}...${secret.slice(-4)}`;
+}
+
+function toMaskedSecret(value: string | null): { has: boolean; masked: string | null; length: number | null } {
+  if (!value) {
+    return { has: false, masked: null, length: null };
+  }
+  return { has: true, masked: maskSecretPreview(value), length: value.length };
+}
+
+function toAgentSettingsPublic(config: AgentSettingsConfig): AgentSettingsPublic {
+  const codexKey = toMaskedSecret(config.codex.apiKey);
+  const realtimeKey = toMaskedSecret(config.realtime.apiKey);
+  const gitOauth = toMaskedSecret(config.git.oauthToken);
+  const awsSecret = toMaskedSecret(config.aws.secretAccessKey);
+  const awsSession = toMaskedSecret(config.aws.sessionToken);
+  const jiraToken = toMaskedSecret(config.jira.apiToken);
+  const notionToken = toMaskedSecret(config.notion.apiToken);
+  const slackToken = toMaskedSecret(config.slack.botToken);
+  const figmaToken = toMaskedSecret(config.figma.apiToken);
+  return {
+    general: {
+      firstTurnPrompt: config.general.firstTurnPrompt,
+    },
+    codex: {
+      model: config.codex.model,
+      authMode: config.codex.authMode,
+      hasApiKey: codexKey.has,
+      apiKeyMasked: codexKey.masked,
+      apiKeyLength: codexKey.length,
+    },
+    realtime: {
+      model: config.realtime.model,
+      voice: config.realtime.voice,
+      wakeName: config.realtime.wakeName,
+      requireWakeName: config.realtime.requireWakeName,
+      hasApiKey: realtimeKey.has,
+      apiKeyMasked: realtimeKey.masked,
+      apiKeyLength: realtimeKey.length,
+    },
+    git: {
+      enabled: config.git.enabled,
+      name: config.git.name,
+      email: config.git.email,
+      authMode: config.git.authMode,
+      hasOauthToken: gitOauth.has,
+      oauthTokenMasked: gitOauth.masked,
+      oauthTokenLength: gitOauth.length,
+      oauthLogin: config.git.oauthLogin,
+      oauthScope: config.git.oauthScope,
+    },
+    aws: {
+      enabled: config.aws.enabled,
+      accessKeyId: config.aws.accessKeyId,
+      defaultRegion: config.aws.defaultRegion,
+      hasSecretAccessKey: awsSecret.has,
+      secretAccessKeyMasked: awsSecret.masked,
+      secretAccessKeyLength: awsSecret.length,
+      hasSessionToken: awsSession.has,
+      sessionTokenMasked: awsSession.masked,
+      sessionTokenLength: awsSession.length,
+    },
+    jira: {
+      baseUrl: config.jira.baseUrl,
+      email: config.jira.email,
+      enabled: config.jira.enabled,
+      hasApiToken: jiraToken.has,
+      apiTokenMasked: jiraToken.masked,
+      apiTokenLength: jiraToken.length,
+    },
+    notion: {
+      baseUrl: config.notion.baseUrl,
+      version: config.notion.version,
+      enabled: config.notion.enabled,
+      hasApiToken: notionToken.has,
+      apiTokenMasked: notionToken.masked,
+      apiTokenLength: notionToken.length,
+    },
+    slack: {
+      baseUrl: config.slack.baseUrl,
+      enabled: config.slack.enabled,
+      hasBotToken: slackToken.has,
+      botTokenMasked: slackToken.masked,
+      botTokenLength: slackToken.length,
+    },
+    figma: {
+      baseUrl: config.figma.baseUrl,
+      enabled: config.figma.enabled,
+      hasApiToken: figmaToken.has,
+      apiTokenMasked: figmaToken.masked,
+      apiTokenLength: figmaToken.length,
+    },
+  };
+}
+
+function normalizeAgentSettingsPatch(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+}
+
+async function resolveAgentSettingsConfig(args: {
+  defaults?: AgentSettingsConfig | null;
+  patch?: Record<string, unknown> | null;
+}): Promise<AgentSettingsConfig> {
+  const existing = await readAgentSettingsConfig(args.defaults ?? null);
+  const next = normalizeAgentSettingsConfig(args.patch ?? null, existing);
+  return next;
+}
+
+function buildAgentSettingsEnvPatch(config: AgentSettingsConfig): Record<string, string> {
+  const envPatch: Record<string, string> = {};
+  if (config.codex.authMode === "api_key" && config.codex.apiKey) {
+    envPatch.OPENAI_API_KEY = config.codex.apiKey;
+  }
+  if (config.git.enabled) {
+    if (config.git.name) envPatch.GIT_AUTHOR_NAME = config.git.name;
+    if (config.git.name) envPatch.GIT_COMMITTER_NAME = config.git.name;
+    if (config.git.email) envPatch.GIT_AUTHOR_EMAIL = config.git.email;
+    if (config.git.email) envPatch.GIT_COMMITTER_EMAIL = config.git.email;
+    if (config.git.oauthToken) envPatch.GITHUB_TOKEN = config.git.oauthToken;
+    if (config.git.oauthToken) envPatch.GH_TOKEN = config.git.oauthToken;
+    if (config.git.oauthLogin) envPatch.DOER_GIT_OAUTH_LOGIN = config.git.oauthLogin;
+    if (config.git.oauthScope) envPatch.DOER_GIT_OAUTH_SCOPE = config.git.oauthScope;
+  }
+  if (config.aws.enabled) {
+    if (config.aws.accessKeyId) envPatch.AWS_ACCESS_KEY_ID = config.aws.accessKeyId;
+    if (config.aws.defaultRegion) envPatch.AWS_DEFAULT_REGION = config.aws.defaultRegion;
+    if (config.aws.defaultRegion) envPatch.AWS_REGION = config.aws.defaultRegion;
+    if (config.aws.secretAccessKey) envPatch.AWS_SECRET_ACCESS_KEY = config.aws.secretAccessKey;
+    if (config.aws.sessionToken) envPatch.AWS_SESSION_TOKEN = config.aws.sessionToken;
+  }
+  if (config.jira.enabled) {
+    if (config.jira.baseUrl) envPatch.JIRA_BASE_URL = config.jira.baseUrl;
+    if (config.jira.email) envPatch.JIRA_EMAIL = config.jira.email;
+    if (config.jira.apiToken) envPatch.JIRA_API_TOKEN = config.jira.apiToken;
+  }
+  if (config.notion.enabled) {
+    if (config.notion.baseUrl) envPatch.NOTION_BASE_URL = config.notion.baseUrl;
+    if (config.notion.version) envPatch.NOTION_VERSION = config.notion.version;
+    if (config.notion.apiToken) envPatch.NOTION_API_TOKEN = config.notion.apiToken;
+  }
+  if (config.slack.enabled) {
+    if (config.slack.baseUrl) envPatch.SLACK_BASE_URL = config.slack.baseUrl;
+    if (config.slack.botToken) envPatch.SLACK_BOT_TOKEN = config.slack.botToken;
+  }
+  if (config.figma.enabled) {
+    if (config.figma.baseUrl) envPatch.FIGMA_BASE_URL = config.figma.baseUrl;
+    if (config.figma.apiToken) envPatch.FIGMA_API_TOKEN = config.figma.apiToken;
+  }
+  return envPatch;
+}
+
 function cloneRunTask(task: PublicRunTask, sinceSeq?: number | null): PublicRunTask {
   return {
     ...task,
@@ -1167,6 +1645,111 @@ async function waitForCodexDeviceCode(state: PendingCodexDeviceAuth, timeoutMs: 
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+}
+
+function normalizeSettingsRpcRequest(args: {
+  request: AgentSettingsRpcRequest;
+  agentId: string;
+}): {
+  requestId: string;
+  responseSubject: string;
+  action: AgentSettingsRpcAction;
+  patch: Record<string, unknown>;
+  defaults: AgentSettingsConfig | null;
+} {
+  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
+  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
+  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
+  const action = args.request.action === "update" ? "update" : "get";
+  if (!requestId || !responseSubject || !requestAgentId || requestAgentId !== args.agentId) {
+    throw new Error("invalid settings rpc request");
+  }
+  return {
+    requestId,
+    responseSubject,
+    action,
+    patch: normalizeAgentSettingsPatch(args.request.patch),
+    defaults:
+      args.request.defaults && typeof args.request.defaults === "object" && !Array.isArray(args.request.defaults)
+        ? normalizeAgentSettingsConfig(args.request.defaults)
+        : null,
+  };
+}
+
+function publishSettingsRpcResponse(args: {
+  nc: NatsConnection;
+  responseSubject: string;
+  payload: AgentSettingsRpcResponse;
+}): void {
+  args.nc.publish(args.responseSubject, settingsRpcCodec.encode(JSON.stringify(args.payload)));
+}
+
+async function handleSettingsRpcMessage(args: {
+  msg: Msg;
+  jetstream: AgentJetStreamContext;
+  agentId: string;
+}): Promise<void> {
+  let requestId = "unknown";
+  let responseSubject = "";
+  try {
+    const payload = JSON.parse(settingsRpcCodec.decode(args.msg.data)) as AgentSettingsRpcRequest;
+    const request = normalizeSettingsRpcRequest({ request: payload, agentId: args.agentId });
+    requestId = request.requestId;
+    responseSubject = request.responseSubject;
+    const existing = await readAgentSettingsConfig(request.defaults);
+    const next = request.action === "update" ? normalizeAgentSettingsConfig(request.patch, existing) : existing;
+    if (request.action === "update") {
+      await writeAgentSettingsConfig(next);
+    } else if (request.defaults) {
+      const filePath = resolveAgentSettingsFilePath();
+      const raw = await readFile(filePath, "utf8").catch(() => "");
+      if (!raw.trim()) {
+        await writeAgentSettingsConfig(next);
+      }
+    }
+    publishSettingsRpcResponse({
+      nc: args.jetstream.nc,
+      responseSubject,
+      payload: {
+        requestId,
+        ok: true,
+        settings: toAgentSettingsPublic(next),
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (responseSubject) {
+      publishSettingsRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: false, error: message },
+      });
+    }
+    writeAgentError(`settings rpc failed requestId=${requestId} error=${message}`);
+  }
+}
+
+function subscribeToSettingsRpc(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): void {
+  const subject = buildAgentSettingsRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`settings rpc subscription error: ${message}`);
+        return;
+      }
+      void handleSettingsRpcMessage({
+        msg,
+        jetstream: args.jetstream,
+        agentId: args.agentId,
+      });
+    },
+  });
+  writeAgentInfo(`settings rpc subscribed subject=${subject}`);
 }
 
 async function startLocalCodexDeviceAuth(): Promise<{
@@ -3630,8 +4213,10 @@ async function prepareCommandExecution(args: {
   const codexHome = resolveCodexHomePath();
   await mkdir(codexHome, { recursive: true });
   const codexAuth = await prepareCodexAuthBundle(args.codexAuthBundle);
+  const localAgentSettings = await readAgentSettingsConfig(null);
   const baseTaskEnvPatch = {
     CODEX_HOME: codexHome,
+    ...buildAgentSettingsEnvPatch(localAgentSettings),
     ...args.runtimeEnvPatch,
     ...(codexAuth?.envPatch ?? {}),
     WORKSPACE: taskWorkspace,
@@ -3759,8 +4344,10 @@ async function runTask(args: {
     userId: args.userId,
     agentToken: args.agentToken,
   });
+  const localAgentSettings = await readAgentSettingsConfig(null);
   const baseTaskEnvPatch = {
     CODEX_HOME: codexHome,
+    ...buildAgentSettingsEnvPatch(localAgentSettings),
     ...(runtimeConfig?.envPatch ?? {}),
     ...(codexAuth?.envPatch ?? {}),
     WORKSPACE: taskWorkspace,
@@ -4073,6 +4660,11 @@ async function main() {
     agentToken,
   });
   subscribeToCodexAuthRpc({
+    jetstream,
+    userId,
+    agentId: initialAgentId,
+  });
+  subscribeToSettingsRpc({
     jetstream,
     userId,
     agentId: initialAgentId,
