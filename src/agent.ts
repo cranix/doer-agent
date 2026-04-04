@@ -91,6 +91,7 @@ interface AgentSessionRpcRequest {
   action?: unknown;
   agentId?: unknown;
   filePath?: unknown;
+  sessionId?: unknown;
   sinceLine?: unknown;
   beforeRowId?: unknown;
   pageSize?: unknown;
@@ -117,6 +118,7 @@ interface AgentSessionRpcNormalizedRequest {
   action: AgentSessionRpcAction;
   agentId: string;
   filePath: string | null;
+  sessionId: string | null;
   sinceLine: number;
   beforeRowId: number | null;
   pageSize: number;
@@ -3233,6 +3235,7 @@ function normalizeSessionRpcRequest(args: {
     action,
     agentId: requestAgentId,
     filePath,
+    sessionId: typeof args.request.sessionId === "string" && args.request.sessionId.trim() ? args.request.sessionId.trim() : null,
     sinceLine,
     beforeRowId,
     pageSize,
@@ -3669,10 +3672,19 @@ async function getAgentSessionRawRows(args: {
   }
 }
 
-async function deleteAgentSession(filePath: string): Promise<void> {
+function resolveSessionUploadsDir(sessionId: string): string {
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  const safeSessionId = sessionId.trim().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160) || "session";
+  return path.join(workspaceRoot, ".doer-agent", "sessions", safeSessionId);
+}
+
+async function deleteAgentSession(filePath: string, sessionId: string | null): Promise<void> {
   const resolvedFile = resolveSessionFilePath(filePath);
   sessionLineIndexCache.delete(resolvedFile);
   await unlink(resolvedFile);
+  if (sessionId) {
+    await rm(resolveSessionUploadsDir(sessionId), { recursive: true, force: true }).catch(() => undefined);
+  }
   const sessionsRoot = path.resolve(getSessionsRootPath());
   let currentDir = path.dirname(resolvedFile);
   while (currentDir.startsWith(sessionsRoot + path.sep)) {
@@ -3789,7 +3801,7 @@ async function handleSessionRpcMessage(args: {
     }
 
     if (request.action === "delete") {
-      await deleteAgentSession(request.filePath ?? "");
+      await deleteAgentSession(request.filePath ?? "", request.sessionId);
       publishSessionRpcResponse({
         nc: args.jetstream.nc,
         responseSubject,
