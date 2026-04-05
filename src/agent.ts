@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync, watch } from "node:fs";
-import { chmod, mkdir, open, readFile, readdir, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
@@ -143,25 +143,14 @@ interface AgentRunRpcRequest {
   requestId?: unknown;
   action?: unknown;
   runId?: unknown;
-  command?: unknown;
+  prompt?: unknown;
+  sessionId?: unknown;
+  model?: unknown;
   cwd?: unknown;
   responseSubject?: unknown;
   agentId?: unknown;
   sinceSeq?: unknown;
   limit?: unknown;
-  runtimeEnvPatch?: unknown;
-  codexAuth?: unknown;
-}
-
-interface AgentCodexRpcRequest {
-  requestId?: unknown;
-  responseSubject?: unknown;
-  agentId?: unknown;
-  runId?: unknown;
-  prompt?: unknown;
-  sessionId?: unknown;
-  cwd?: unknown;
-  model?: unknown;
   runtimeEnvPatch?: unknown;
   codexAuth?: unknown;
 }
@@ -331,13 +320,6 @@ interface AgentSettingsRpcResponse {
   error?: string;
 }
 
-interface AgentCodexRpcResponse {
-  requestId: string;
-  ok: boolean;
-  task?: PublicRunTask | null;
-  error?: string;
-}
-
 interface AgentGitRpcRequest {
   requestId?: unknown;
   responseSubject?: unknown;
@@ -376,7 +358,9 @@ interface AgentRunRpcNormalizedRequest {
   requestId: string;
   action: AgentRunRpcAction;
   runId: string | null;
-  command: string | null;
+  prompt: string | null;
+  sessionId: string | null;
+  model: string;
   cwd: string | null;
   responseSubject: string;
   sinceSeq: number | null;
@@ -444,7 +428,6 @@ const fsRpcCodec = StringCodec();
 const shellRpcCodec = StringCodec();
 const runRpcCodec = StringCodec();
 const sessionRpcCodec = StringCodec();
-const codexRpcCodec = StringCodec();
 const codexAuthRpcCodec = StringCodec();
 const settingsRpcCodec = StringCodec();
 const gitRpcCodec = StringCodec();
@@ -472,10 +455,6 @@ function buildAgentRunRpcSubject(userId: string, agentId: string): string {
 
 function buildAgentSessionRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.session.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
-}
-
-function buildAgentCodexRpcSubject(userId: string, agentId: string): string {
-  return `doer.agent.codex.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function buildAgentCodexAuthRpcSubject(userId: string, agentId: string): string {
@@ -924,9 +903,11 @@ function normalizeRunRpcRequest(args: { request: AgentRunRpcRequest; agentId: st
     throw new Error("missing responseSubject");
   }
   const runId = typeof args.request.runId === "string" && args.request.runId.trim() ? args.request.runId.trim() : null;
-  const command = typeof args.request.command === "string" && args.request.command.trim() ? args.request.command.trim() : null;
-  if (action === "start" && !command) {
-    throw new Error("missing command");
+  const prompt = typeof args.request.prompt === "string" && args.request.prompt.trim() ? args.request.prompt.trim() : null;
+  const sessionId = typeof args.request.sessionId === "string" && args.request.sessionId.trim() ? args.request.sessionId.trim() : null;
+  const model = normalizeCodexModel(args.request.model);
+  if (action === "start" && !prompt) {
+    throw new Error("missing prompt");
   }
   if ((action === "get" || action === "cancel") && !runId) {
     throw new Error("missing runId");
@@ -940,7 +921,9 @@ function normalizeRunRpcRequest(args: { request: AgentRunRpcRequest; agentId: st
     requestId,
     action,
     runId,
-    command,
+    prompt,
+    sessionId,
+    model,
     cwd,
     responseSubject,
     sinceSeq,
@@ -991,18 +974,32 @@ async function removeRunTask(runId: string): Promise<void> {
   await unlink(path.join(dir, `${runId}.json`)).catch(() => undefined);
 }
 
-async function resolveActiveRunLockPath(): Promise<string> {
-  const dir = await resolveRunsDir();
-  return path.join(dir, "active.lock");
+function sanitizeRunLockSegment(value: string): string {
+  return value.trim().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160) || "lock";
 }
 
-async function claimRunStartSlot(runId: string): Promise<void> {
-  const lockPath = await resolveActiveRunLockPath();
+async function resolveRunLocksDir(): Promise<string> {
+  const dir = path.join(await resolveRunsDir(), "locks");
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
+
+async function resolveRunStartLockPath(args: { runId: string; sessionId?: string | null }): Promise<string> {
+  const dir = await resolveRunLocksDir();
+  if (typeof args.sessionId === "string" && args.sessionId.trim()) {
+    return path.join(dir, `session__${sanitizeRunLockSegment(args.sessionId)}.lock`);
+  }
+  return path.join(dir, `run__${sanitizeRunLockSegment(args.runId)}.lock`);
+}
+
+async function claimRunStartSlot(args: { runId: string; sessionId?: string | null }): Promise<void> {
+  const lockPath = await resolveRunStartLockPath(args);
   try {
     const handle = await open(lockPath, "wx");
     try {
       const payload = {
-        runId,
+        runId: args.runId,
+        sessionId: typeof args.sessionId === "string" && args.sessionId.trim() ? args.sessionId.trim() : null,
         pid: process.pid,
         createdAt: formatLocalTimestamp(),
       };
@@ -1027,21 +1024,54 @@ async function claimRunStartSlot(runId: string): Promise<void> {
   }
 }
 
-async function releaseRunStartSlot(runId: string): Promise<void> {
-  const lockPath = await resolveActiveRunLockPath();
-  const lockContents = await readFile(lockPath, "utf8").catch(() => "");
-  if (lockContents) {
-    try {
-      const parsed = JSON.parse(lockContents) as { runId?: unknown };
-      const lockedRunId = typeof parsed.runId === "string" ? parsed.runId.trim() : "";
-      if (lockedRunId && lockedRunId !== runId) {
-        return;
-      }
-    } catch {
-      // Ignore malformed lock contents and best-effort remove below.
-    }
+async function updateRunStartSlotSession(args: {
+  runId: string;
+  previousSessionId?: string | null;
+  sessionId: string;
+}): Promise<void> {
+  const nextSessionId = args.sessionId.trim();
+  if (!nextSessionId) {
+    return;
   }
-  await unlink(lockPath).catch(() => undefined);
+  const previousSessionId = typeof args.previousSessionId === "string" && args.previousSessionId.trim() ? args.previousSessionId.trim() : null;
+  if (previousSessionId === nextSessionId) {
+    return;
+  }
+  const currentPath = await resolveRunStartLockPath({ runId: args.runId, sessionId: previousSessionId });
+  const nextPath = await resolveRunStartLockPath({ runId: args.runId, sessionId: nextSessionId });
+  if (currentPath === nextPath) {
+    return;
+  }
+  try {
+    await rename(currentPath, nextPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT") {
+      // Lock may already be released; nothing to migrate.
+      return;
+    }
+    if (code === "EEXIST") {
+      throw new Error(`Another run is already active for session: ${nextSessionId}`);
+    }
+    throw error;
+  }
+
+  const payload = {
+    runId: args.runId,
+    sessionId: nextSessionId,
+    pid: process.pid,
+    createdAt: formatLocalTimestamp(),
+  };
+  await writeFile(nextPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+
+async function releaseRunStartSlot(args: { runId: string; sessionId?: string | null }): Promise<void> {
+  const paths = new Set<string>();
+  paths.add(await resolveRunStartLockPath({ runId: args.runId, sessionId: args.sessionId ?? null }));
+  paths.add(await resolveRunStartLockPath({ runId: args.runId, sessionId: null }));
+  for (const lockPath of paths) {
+    await unlink(lockPath).catch(() => undefined);
+  }
 }
 
 function resolveAgentSettingsDir(): string {
@@ -1475,6 +1505,7 @@ async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
   sessionFilePath?: string | null;
 }): Promise<void> {
   let changed = false;
+  const previousSessionId = task.sessionId;
   if (!task.sessionId && typeof metadata.sessionId === "string" && metadata.sessionId.trim()) {
     task.sessionId = metadata.sessionId.trim();
     changed = true;
@@ -1488,6 +1519,13 @@ async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
   }
   task.updatedAt = formatLocalTimestamp();
   await persistRunTask(task).catch(() => undefined);
+  if (!previousSessionId && task.sessionId) {
+    await updateRunStartSlotSession({
+      runId: task.id,
+      previousSessionId,
+      sessionId: task.sessionId,
+    }).catch(() => undefined);
+  }
 }
 
 function persistRetainedRun(task: PublicRunTask): void {
@@ -1509,7 +1547,7 @@ async function startManagedRun(args: {
   userId: string;
   agentId: string;
   sessionId?: string | null;
-  command: string;
+  codexArgs: string[];
   cwd: string | null;
   runtimeEnvPatch: Record<string, string>;
   codexAuthBundle: CodexAuthBundleResponse | null;
@@ -1521,11 +1559,8 @@ async function startManagedRun(args: {
     taskId: args.runId,
     codexAuthBundle: args.codexAuthBundle,
   });
-  const child = spawnPreparedCommand({
-    kind: "shell",
-    command: args.command,
-    patch: null,
-    shellPath: prepared.shellPath,
+  const child = spawnManagedCodexCommand({
+    codexArgs: args.codexArgs,
     taskWorkspace: prepared.taskWorkspace,
     env: prepared.env,
     agentToken: args.agentToken,
@@ -1592,7 +1627,7 @@ async function startManagedRun(args: {
     persistRetainedRun(task);
     activeRuns.delete(task.id);
     void removeRunTask(task.id).catch(() => undefined);
-    void releaseRunStartSlot(task.id).catch(() => undefined);
+    void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `failed error=${message}`);
   });
@@ -1612,7 +1647,7 @@ async function startManagedRun(args: {
     persistRetainedRun(task);
     activeRuns.delete(task.id);
     void removeRunTask(task.id).catch(() => undefined);
-    void releaseRunStartSlot(task.id).catch(() => undefined);
+    void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
   });
@@ -1637,68 +1672,21 @@ function normalizeCodexModel(value: unknown): string {
   return normalized || "gpt-5.4";
 }
 
-function normalizeCodexRpcRequest(args: {
-  request: AgentCodexRpcRequest;
-  agentId: string;
-}): {
-  requestId: string;
-  responseSubject: string;
-  runId: string;
-  prompt: string;
-  sessionId: string | null;
-  cwd: string | null;
-  model: string;
-  runtimeEnvPatch: Record<string, string>;
-  codexAuthBundle: CodexAuthBundleResponse | null;
-} {
-  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
-  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
-  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
-  const runId = typeof args.request.runId === "string" ? args.request.runId.trim() : "";
-  const prompt = typeof args.request.prompt === "string" ? args.request.prompt.trim() : "";
-  if (!requestId || !responseSubject || !requestAgentId || requestAgentId !== args.agentId || !runId || !prompt) {
-    throw new Error("invalid codex rpc request");
-  }
-  return {
-    requestId,
-    responseSubject,
-    runId,
-    prompt,
-    sessionId: typeof args.request.sessionId === "string" && args.request.sessionId.trim() ? args.request.sessionId.trim() : null,
-    cwd: typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null,
-    model: normalizeCodexModel(args.request.model),
-    runtimeEnvPatch: normalizeEnvPatch(args.request.runtimeEnvPatch),
-    codexAuthBundle: normalizeShellRpcCodexAuthBundle(args.request.codexAuth),
-  };
-}
-
-function buildManagedCodexCommand(args: {
+function buildManagedCodexArgs(args: {
   prompt: string;
   sessionId: string | null;
   model: string;
-}): string {
+}): string[] {
+  const promptArgs = ["--", args.prompt];
   const fixedArgs = ["--dangerously-bypass-approvals-and-sandbox"];
-  const codexArgs = args.sessionId
-    ? ["exec", "resume", "--json", args.sessionId, args.prompt]
-    : ["exec", "--json", args.prompt];
-  const commandArgs = [...fixedArgs, "--model", args.model, ...codexArgs].map(shellSingleQuote).join(" ");
-  const direct = `exec codex ${commandArgs}`;
-  const fallback = `exec npm exec --yes --package doer-agent -- codex ${commandArgs}`;
-  const script = [
-    "if command -v codex >/dev/null 2>&1; then",
-    `  ${direct}`,
-    "fi",
-    fallback,
-  ].join("\n");
-  return `bash -lc ${shellSingleQuote(script)}`;
-}
-
-function publishCodexRpcResponse(args: {
-  nc: NatsConnection;
-  responseSubject: string;
-  payload: AgentCodexRpcResponse;
-}): void {
-  args.nc.publish(args.responseSubject, codexRpcCodec.encode(JSON.stringify(args.payload)));
+  return [
+    ...fixedArgs,
+    "--model",
+    args.model,
+    ...(args.sessionId
+    ? ["exec", "resume", "--json", args.sessionId, ...promptArgs]
+    : ["exec", "--json", ...promptArgs]),
+  ];
 }
 
 function buildLocalCodexCliCommand(args: string[]): string {
@@ -1712,6 +1700,41 @@ function buildLocalCodexCliCommand(args: string[]): string {
     fallback,
   ].join("\n");
   return `bash -lc ${shellSingleQuote(script)}`;
+}
+
+function hasDirectCodexBinary(): boolean {
+  const result = spawnSync("bash", ["-lc", "command -v codex >/dev/null 2>&1"], {
+    stdio: "ignore",
+  });
+  return result.status === 0;
+}
+
+function spawnManagedCodexCommand(args: {
+  codexArgs: string[];
+  taskWorkspace: string;
+  env: NodeJS.ProcessEnv;
+  agentToken: string;
+}): ReturnType<typeof spawn> {
+  const env = {
+    ...args.env,
+    DOER_AGENT_TOKEN: args.agentToken,
+  };
+  const child = hasDirectCodexBinary()
+    ? spawn("codex", args.codexArgs, {
+      cwd: args.taskWorkspace,
+      detached: process.platform !== "win32",
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    : spawn("npm", ["exec", "--yes", "--package", "doer-agent", "--", "codex", ...args.codexArgs], {
+      cwd: args.taskWorkspace,
+      detached: process.platform !== "win32",
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  return child;
 }
 
 async function runLocalCodexCli(args: string[], timeoutMs: number): Promise<{
@@ -2192,90 +2215,6 @@ function subscribeToCodexAuthRpc(args: {
   writeAgentInfo(`codex auth rpc subscribed subject=${subject}`);
 }
 
-async function handleCodexRpcMessage(args: {
-  msg: Msg;
-  jetstream: AgentJetStreamContext;
-  serverBaseUrl: string;
-  userId: string;
-  agentId: string;
-  agentToken: string;
-}): Promise<void> {
-  let requestId = "unknown";
-  let responseSubject = "";
-  try {
-    const payload = JSON.parse(codexRpcCodec.decode(args.msg.data)) as AgentCodexRpcRequest;
-    const request = normalizeCodexRpcRequest({ request: payload, agentId: args.agentId });
-    requestId = request.requestId;
-    responseSubject = request.responseSubject;
-    await claimRunStartSlot(request.runId);
-    try {
-      const task = await startManagedRun({
-        requestId,
-        runId: request.runId,
-        serverBaseUrl: args.serverBaseUrl,
-        userId: args.userId,
-        agentId: args.agentId,
-        sessionId: request.sessionId,
-        command: buildManagedCodexCommand({
-          prompt: request.prompt,
-          sessionId: request.sessionId,
-          model: request.model,
-        }),
-        cwd: request.cwd,
-        runtimeEnvPatch: request.runtimeEnvPatch,
-        codexAuthBundle: request.codexAuthBundle,
-        agentToken: args.agentToken,
-      });
-      publishCodexRpcResponse({
-        nc: args.jetstream.nc,
-        responseSubject,
-        payload: { requestId, ok: true, task },
-      });
-    } catch (error) {
-      await releaseRunStartSlot(request.runId).catch(() => undefined);
-      throw error;
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (responseSubject) {
-      publishCodexRpcResponse({
-        nc: args.jetstream.nc,
-        responseSubject,
-        payload: { requestId, ok: false, error: message },
-      });
-    }
-    writeAgentError(`codex rpc failed requestId=${requestId} error=${message}`);
-  }
-}
-
-function subscribeToCodexRpc(args: {
-  jetstream: AgentJetStreamContext;
-  serverBaseUrl: string;
-  userId: string;
-  agentId: string;
-  agentToken: string;
-}): void {
-  const subject = buildAgentCodexRpcSubject(args.userId, args.agentId);
-  args.jetstream.nc.subscribe(subject, {
-    callback: (error, msg) => {
-      if (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`codex rpc subscription error: ${message}`);
-        return;
-      }
-      void handleCodexRpcMessage({
-        msg,
-        jetstream: args.jetstream,
-        serverBaseUrl: args.serverBaseUrl,
-        userId: args.userId,
-        agentId: args.agentId,
-        agentToken: args.agentToken,
-      });
-    },
-  });
-  writeAgentInfo(`codex rpc subscribed subject=${subject}`);
-}
-
 type AgentGitDiffFormat = "patch" | "name-only" | "name-status" | "stat" | "numstat" | "raw";
 type AgentGitDiffIgnoreWhitespace = "none" | "at-eol" | "change" | "all";
 type AgentGitDiffAlgorithm = "default" | "minimal" | "patience" | "histogram";
@@ -2657,7 +2596,7 @@ async function handleRunRpcMessage(args: {
 
     if (request.action === "start") {
       const runId = request.runId ?? requestId;
-      await claimRunStartSlot(runId);
+      await claimRunStartSlot({ runId, sessionId: request.sessionId });
       try {
         const task = await startManagedRun({
           requestId,
@@ -2665,8 +2604,12 @@ async function handleRunRpcMessage(args: {
           serverBaseUrl: args.serverBaseUrl,
           userId: args.userId,
           agentId: args.agentId,
-          sessionId: null,
-          command: request.command ?? "",
+          sessionId: request.sessionId,
+          codexArgs: buildManagedCodexArgs({
+            prompt: request.prompt ?? "",
+            sessionId: request.sessionId,
+            model: request.model,
+          }),
           cwd: request.cwd,
           runtimeEnvPatch: request.runtimeEnvPatch,
           codexAuthBundle: request.codexAuthBundle,
@@ -2674,7 +2617,7 @@ async function handleRunRpcMessage(args: {
         });
         publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
       } catch (error) {
-        await releaseRunStartSlot(runId).catch(() => undefined);
+        await releaseRunStartSlot({ runId, sessionId: request.sessionId }).catch(() => undefined);
         throw error;
       }
       return;
@@ -4914,13 +4857,6 @@ async function main() {
     jetstream,
     userId,
     agentId: initialAgentId,
-  });
-  subscribeToCodexRpc({
-    jetstream,
-    serverBaseUrl,
-    userId,
-    agentId: initialAgentId,
-    agentToken,
   });
   subscribeToCodexAuthRpc({
     jetstream,
