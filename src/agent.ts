@@ -991,6 +991,59 @@ async function removeRunTask(runId: string): Promise<void> {
   await unlink(path.join(dir, `${runId}.json`)).catch(() => undefined);
 }
 
+async function resolveActiveRunLockPath(): Promise<string> {
+  const dir = await resolveRunsDir();
+  return path.join(dir, "active.lock");
+}
+
+async function claimRunStartSlot(runId: string): Promise<void> {
+  const lockPath = await resolveActiveRunLockPath();
+  try {
+    const handle = await open(lockPath, "wx");
+    try {
+      const payload = {
+        runId,
+        pid: process.pid,
+        createdAt: formatLocalTimestamp(),
+      };
+      await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === "EEXIST") {
+      const lockContents = await readFile(lockPath, "utf8").catch(() => "");
+      const existingRunId = (() => {
+        try {
+          const parsed = JSON.parse(lockContents) as { runId?: unknown };
+          return typeof parsed.runId === "string" && parsed.runId.trim() ? parsed.runId.trim() : null;
+        } catch {
+          return null;
+        }
+      })();
+      throw new Error(existingRunId ? `Another run is already active: ${existingRunId}` : "Another run is already active");
+    }
+    throw error;
+  }
+}
+
+async function releaseRunStartSlot(runId: string): Promise<void> {
+  const lockPath = await resolveActiveRunLockPath();
+  const lockContents = await readFile(lockPath, "utf8").catch(() => "");
+  if (lockContents) {
+    try {
+      const parsed = JSON.parse(lockContents) as { runId?: unknown };
+      const lockedRunId = typeof parsed.runId === "string" ? parsed.runId.trim() : "";
+      if (lockedRunId && lockedRunId !== runId) {
+        return;
+      }
+    } catch {
+      // Ignore malformed lock contents and best-effort remove below.
+    }
+  }
+  await unlink(lockPath).catch(() => undefined);
+}
+
 function resolveAgentSettingsDir(): string {
   const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
   return path.join(workspaceRoot, ".doer-agent");
@@ -1539,6 +1592,7 @@ async function startManagedRun(args: {
     persistRetainedRun(task);
     activeRuns.delete(task.id);
     void removeRunTask(task.id).catch(() => undefined);
+    void releaseRunStartSlot(task.id).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `failed error=${message}`);
   });
@@ -1558,6 +1612,7 @@ async function startManagedRun(args: {
     persistRetainedRun(task);
     activeRuns.delete(task.id);
     void removeRunTask(task.id).catch(() => undefined);
+    void releaseRunStartSlot(task.id).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
   });
@@ -2152,28 +2207,34 @@ async function handleCodexRpcMessage(args: {
     const request = normalizeCodexRpcRequest({ request: payload, agentId: args.agentId });
     requestId = request.requestId;
     responseSubject = request.responseSubject;
-    const task = await startManagedRun({
-      requestId,
-      runId: request.runId,
-      serverBaseUrl: args.serverBaseUrl,
-      userId: args.userId,
-      agentId: args.agentId,
-      sessionId: request.sessionId,
-      command: buildManagedCodexCommand({
-        prompt: request.prompt,
+    await claimRunStartSlot(request.runId);
+    try {
+      const task = await startManagedRun({
+        requestId,
+        runId: request.runId,
+        serverBaseUrl: args.serverBaseUrl,
+        userId: args.userId,
+        agentId: args.agentId,
         sessionId: request.sessionId,
-        model: request.model,
-      }),
-      cwd: request.cwd,
-      runtimeEnvPatch: request.runtimeEnvPatch,
-      codexAuthBundle: request.codexAuthBundle,
-      agentToken: args.agentToken,
-    });
-    publishCodexRpcResponse({
-      nc: args.jetstream.nc,
-      responseSubject,
-      payload: { requestId, ok: true, task },
-    });
+        command: buildManagedCodexCommand({
+          prompt: request.prompt,
+          sessionId: request.sessionId,
+          model: request.model,
+        }),
+        cwd: request.cwd,
+        runtimeEnvPatch: request.runtimeEnvPatch,
+        codexAuthBundle: request.codexAuthBundle,
+        agentToken: args.agentToken,
+      });
+      publishCodexRpcResponse({
+        nc: args.jetstream.nc,
+        responseSubject,
+        payload: { requestId, ok: true, task },
+      });
+    } catch (error) {
+      await releaseRunStartSlot(request.runId).catch(() => undefined);
+      throw error;
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (responseSubject) {
@@ -2595,20 +2656,27 @@ async function handleRunRpcMessage(args: {
     responseSubject = request.responseSubject;
 
     if (request.action === "start") {
-      const task = await startManagedRun({
-        requestId,
-        runId: request.runId ?? requestId,
-        serverBaseUrl: args.serverBaseUrl,
-        userId: args.userId,
-        agentId: args.agentId,
-        sessionId: null,
-        command: request.command ?? "",
-        cwd: request.cwd,
-        runtimeEnvPatch: request.runtimeEnvPatch,
-        codexAuthBundle: request.codexAuthBundle,
-        agentToken: args.agentToken,
-      });
-      publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
+      const runId = request.runId ?? requestId;
+      await claimRunStartSlot(runId);
+      try {
+        const task = await startManagedRun({
+          requestId,
+          runId,
+          serverBaseUrl: args.serverBaseUrl,
+          userId: args.userId,
+          agentId: args.agentId,
+          sessionId: null,
+          command: request.command ?? "",
+          cwd: request.cwd,
+          runtimeEnvPatch: request.runtimeEnvPatch,
+          codexAuthBundle: request.codexAuthBundle,
+          agentToken: args.agentToken,
+        });
+        publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
+      } catch (error) {
+        await releaseRunStartSlot(runId).catch(() => undefined);
+        throw error;
+      }
       return;
     }
 
