@@ -1,6 +1,6 @@
 {
   "name": "doer-agent",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Reverse-polling agent runtime for doer",
   "type": "module",
   "main": "dist/agent.js",
