@@ -3273,6 +3273,77 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+const SESSION_RPC_BLOB_KEYS = new Set([
+  "image_url",
+  "image_base64",
+  "content_base64",
+  "file_data",
+  "bytes",
+  "data",
+]);
+
+function isInlineBlobString(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+  return trimmed.startsWith("data:") || trimmed.includes(";base64,");
+}
+
+function buildInlineBlobMarker(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("data:")) {
+    const mimeEnd = trimmed.indexOf(";");
+    const mimeType = mimeEnd > 5 ? trimmed.slice(5, mimeEnd) : "";
+    if (mimeType) {
+      return `[inline blob omitted: ${mimeType}]`;
+    }
+  }
+  return "[inline blob omitted]";
+}
+
+function sanitizeSessionRpcPayload(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeSessionRpcPayload(entry));
+  }
+  if (!isObjectRecord(value)) {
+    return value;
+  }
+
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (SESSION_RPC_BLOB_KEYS.has(key) && typeof entry === "string" && isInlineBlobString(entry)) {
+      sanitized[key] = buildInlineBlobMarker(entry);
+      continue;
+    }
+    sanitized[key] = sanitizeSessionRpcPayload(entry);
+  }
+  return sanitized;
+}
+
+function sanitizeSessionRpcRawLine(line: string): string {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) {
+    return line;
+  }
+
+  try {
+    const parsed = JSON.parse(line) as { type?: unknown; payload?: unknown };
+    if (!isObjectRecord(parsed) || !isObjectRecord(parsed.payload) || parsed.type !== "response_item") {
+      return line;
+    }
+    return JSON.stringify({
+      ...parsed,
+      payload: sanitizeSessionRpcPayload(parsed.payload),
+    });
+  } catch {
+    return line;
+  }
+}
+
 function toTrimmedStringOrNull(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -3573,7 +3644,9 @@ async function getAgentSessionRawRows(args: {
   const sinceLine = Math.max(0, Math.floor(args.sinceLine));
   const beforeRowId = args.beforeRowId && args.beforeRowId > 0 ? Math.floor(args.beforeRowId) : null;
   const maxRawRows = 200;
-  const maxRawBytes = 120_000;
+  const maxSelectionBytes = 120_000;
+  const maxLineSelectionBytes = 4_096;
+  const maxReadBytes = 2_000_000;
 
   if (totalLines === 0) {
     return {
@@ -3595,44 +3668,62 @@ async function getAgentSessionRawRows(args: {
     endLineIndex = Math.max(0, Math.min(totalLines, beforeRowId - 1));
     startLineIndex = endLineIndex;
     let collectedRows = 0;
-    let collectedBytes = 0;
+    let collectedSelectionBytes = 0;
+    let collectedReadBytes = 0;
     while (startLineIndex > 0 && collectedRows < maxRawRows) {
       const nextIndex = startLineIndex - 1;
-      const nextBytes = getLineSpanBytes(nextIndex);
-      if (collectedRows > 0 && collectedBytes + nextBytes > maxRawBytes) {
+      const nextReadBytes = getLineSpanBytes(nextIndex);
+      const nextSelectionBytes = Math.min(nextReadBytes, maxLineSelectionBytes);
+      if (collectedRows > 0 && collectedSelectionBytes + nextSelectionBytes > maxSelectionBytes) {
+        break;
+      }
+      if (collectedRows > 0 && collectedReadBytes + nextReadBytes > maxReadBytes) {
         break;
       }
       startLineIndex = nextIndex;
       collectedRows += 1;
-      collectedBytes += nextBytes;
+      collectedSelectionBytes += nextSelectionBytes;
+      collectedReadBytes += nextReadBytes;
     }
   } else if (sinceLine > 0) {
     startLineIndex = Math.min(totalLines, sinceLine);
     endLineIndex = startLineIndex;
     let collectedRows = 0;
-    let collectedBytes = 0;
+    let collectedSelectionBytes = 0;
+    let collectedReadBytes = 0;
     while (endLineIndex < totalLines && collectedRows < maxRawRows) {
-      const nextBytes = getLineSpanBytes(endLineIndex);
-      if (collectedRows > 0 && collectedBytes + nextBytes > maxRawBytes) {
+      const nextReadBytes = getLineSpanBytes(endLineIndex);
+      const nextSelectionBytes = Math.min(nextReadBytes, maxLineSelectionBytes);
+      if (collectedRows > 0 && collectedSelectionBytes + nextSelectionBytes > maxSelectionBytes) {
+        break;
+      }
+      if (collectedRows > 0 && collectedReadBytes + nextReadBytes > maxReadBytes) {
         break;
       }
       endLineIndex += 1;
       collectedRows += 1;
-      collectedBytes += nextBytes;
+      collectedSelectionBytes += nextSelectionBytes;
+      collectedReadBytes += nextReadBytes;
     }
   } else {
     startLineIndex = totalLines;
     let collectedRows = 0;
-    let collectedBytes = 0;
+    let collectedSelectionBytes = 0;
+    let collectedReadBytes = 0;
     while (startLineIndex > 0 && collectedRows < maxRawRows) {
       const nextIndex = startLineIndex - 1;
-      const nextBytes = getLineSpanBytes(nextIndex);
-      if (collectedRows > 0 && collectedBytes + nextBytes > maxRawBytes) {
+      const nextReadBytes = getLineSpanBytes(nextIndex);
+      const nextSelectionBytes = Math.min(nextReadBytes, maxLineSelectionBytes);
+      if (collectedRows > 0 && collectedSelectionBytes + nextSelectionBytes > maxSelectionBytes) {
+        break;
+      }
+      if (collectedRows > 0 && collectedReadBytes + nextReadBytes > maxReadBytes) {
         break;
       }
       startLineIndex = nextIndex;
       collectedRows += 1;
-      collectedBytes += nextBytes;
+      collectedSelectionBytes += nextSelectionBytes;
+      collectedReadBytes += nextReadBytes;
     }
   }
 
@@ -3669,7 +3760,7 @@ async function getAgentSessionRawRows(args: {
       if (line.trim()) {
         rawRows.push({
           id: lineNumber,
-          raw: line,
+          raw: sanitizeSessionRpcRawLine(line),
         });
       }
       lineNumber += 1;
