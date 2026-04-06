@@ -126,19 +126,6 @@ interface AgentSessionRpcNormalizedRequest {
   watchId: string | null;
 }
 
-interface AgentShellRpcRequest {
-  kind?: unknown;
-  requestId?: unknown;
-  command?: unknown;
-  patch?: unknown;
-  cwd?: unknown;
-  timeoutMs?: unknown;
-  responseSubject?: unknown;
-  agentId?: unknown;
-  runtimeEnvPatch?: unknown;
-  codexAuth?: unknown;
-}
-
 interface AgentRunRpcRequest {
   requestId?: unknown;
   action?: unknown;
@@ -387,34 +374,6 @@ interface PublicRunTask {
   finishedAt: string | null;
 }
 
-interface ActiveRunRecord {
-  task: PublicRunTask;
-  child: ReturnType<typeof spawn>;
-  requestCancel: () => void;
-}
-
-interface AgentShellRpcResponse {
-  requestId: string;
-  ok: boolean;
-  exitCode: number | null;
-  signal: string | null;
-  stdout: string;
-  stderr: string;
-  error?: string;
-}
-
-interface AgentShellRpcNormalizedRequest {
-  kind: "shell" | "apply_patch";
-  requestId: string;
-  command: string | null;
-  patch: string | null;
-  cwd: string | null;
-  timeoutMs: number;
-  responseSubject: string;
-  runtimeEnvPatch: Record<string, string>;
-  codexAuthBundle: CodexAuthBundleResponse | null;
-}
-
 interface ActiveTaskLogContext {
   jetstream: AgentJetStreamContext;
   serverBaseUrl: string;
@@ -425,13 +384,11 @@ interface ActiveTaskLogContext {
 let activeTaskLogContext: ActiveTaskLogContext | null = null;
 let workspaceRootOverride: string | null = null;
 const fsRpcCodec = StringCodec();
-const shellRpcCodec = StringCodec();
 const runRpcCodec = StringCodec();
 const sessionRpcCodec = StringCodec();
 const codexAuthRpcCodec = StringCodec();
 const settingsRpcCodec = StringCodec();
 const gitRpcCodec = StringCodec();
-const activeRuns = new Map<string, ActiveRunRecord>();
 const retainedRuns = new Map<string, PublicRunTask>();
 const activeSessionWatchers = new Map<string, () => void>();
 const sessionLineIndexCache = new Map<string, SessionLineIndexCacheEntry>();
@@ -1651,18 +1608,6 @@ async function startManagedRun(args: {
     finishedAt: null,
   };
 
-  const cancellation = createManagedCancellation(child);
-  const requestCancel = () => {
-    if (task.status === "completed" || task.status === "failed" || task.status === "canceled") {
-      return;
-    }
-    task.cancelRequested = true;
-    task.updatedAt = formatLocalTimestamp();
-    void persistRunTask(task).catch(() => undefined);
-    writeRunStatus(task.id, "cancel requested");
-    cancellation.requestCancel();
-  };
-
   let stdoutBuffer = "";
   const recordChunk = (stream: "stdout" | "stderr", chunk: string) => {
     writeRunStream(task.id, stream, chunk);
@@ -1692,19 +1637,21 @@ async function startManagedRun(args: {
     task.error = message;
     task.finishedAt = formatLocalTimestamp();
     persistRetainedRun(task);
-    activeRuns.delete(task.id);
     void removeRunTask(task.id).catch(() => undefined);
     void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `failed error=${message}`);
   });
-  child.once("close", (code, signal) => {
-    cancellation.clear();
+  child.once("close", async (code, signal) => {
     if (stdoutBuffer.trim() && (!task.sessionId || !task.sessionFilePath)) {
       const metadata = extractCodexSessionMetadata(stdoutBuffer.trim());
       if (metadata.sessionId || metadata.sessionFilePath) {
         void updateRunSessionMetadata(task, metadata);
       }
+    }
+    const latest = await getStoredRun(task.id).catch(() => null);
+    if (latest?.cancelRequested) {
+      task.cancelRequested = true;
     }
     task.resultExitCode = typeof code === "number" ? code : null;
     task.resultSignal = signal;
@@ -1712,14 +1659,12 @@ async function startManagedRun(args: {
     task.status = task.cancelRequested ? "canceled" : (task.resultExitCode ?? 1) === 0 ? "completed" : "failed";
     task.error = task.status === "failed" ? `Command exited with code ${task.resultExitCode ?? "null"}` : null;
     persistRetainedRun(task);
-    activeRuns.delete(task.id);
     void removeRunTask(task.id).catch(() => undefined);
     void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
   });
 
-  activeRuns.set(task.id, { task, child, requestCancel });
   persistRetainedRun(task);
   void persistRunTask(task).catch(() => undefined);
   writeRunStatus(task.id, `started requestId=${args.requestId} cwd=${prepared.taskWorkspace}`);
@@ -2714,20 +2659,16 @@ async function handleRunRpcMessage(args: {
     }
 
     if (request.action === "cancel") {
-      const active = activeRuns.get(stored.id);
-      if (active) {
-        active.requestCancel();
-      } else {
-        if (stored.processPid === null) {
-          throw new Error("Run pid not found");
-        }
-        stored.cancelRequested = true;
-        stored.updatedAt = formatLocalTimestamp();
-        await persistRunTask(stored);
-        writeRunStatus(stored.id, `cancel requested pid=${stored.processPid}`);
-        sendSignalToPid(stored.processPid, "SIGINT");
+      const target = stored;
+      if (target.processPid === null) {
+        throw new Error("Run pid not found");
       }
-      const task = cloneRunTask(active?.task ?? stored);
+      target.cancelRequested = true;
+      target.updatedAt = formatLocalTimestamp();
+      await persistRunTask(target);
+      writeRunStatus(target.id, `cancel requested pid=${target.processPid}`);
+      sendSignalToPid(target.processPid, "SIGINT");
+      const task = cloneRunTask(target);
       publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
       return;
     }
@@ -2973,10 +2914,6 @@ function resolveTaskWorkspace(rawCwd: string | null): string {
 
 function buildAgentFsRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.fs.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
-}
-
-function buildAgentShellRpcSubject(userId: string, agentId: string): string {
-  return `doer.agent.shell.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function normalizeFsRpcPath(rawPath: unknown): { abs: string; formatPath: (target: string) => string } {
@@ -4116,50 +4053,6 @@ function subscribeToFsRpc(args: {
   writeAgentInfo(`fs rpc subscribed subject=${subject}`);
 }
 
-function normalizeShellRpcRequest(args: {
-  request: AgentShellRpcRequest;
-  agentId: string;
-}): AgentShellRpcNormalizedRequest {
-  const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
-  if (!requestId) {
-    throw new Error("missing requestId");
-  }
-  const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
-  if (!requestAgentId) {
-    throw new Error("missing agentId");
-  }
-  if (requestAgentId !== args.agentId) {
-    throw new Error("agent id mismatch");
-  }
-  const kind = args.request.kind === "apply_patch" ? "apply_patch" : "shell";
-  const command = typeof args.request.command === "string" ? args.request.command.trim() : "";
-  const patch = typeof args.request.patch === "string" ? args.request.patch : "";
-  if (kind === "shell" && !command) {
-    throw new Error("missing command");
-  }
-  if (kind === "apply_patch" && !patch.trim()) {
-    throw new Error("missing patch");
-  }
-  const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
-  if (!responseSubject) {
-    throw new Error("missing responseSubject");
-  }
-  const cwd = typeof args.request.cwd === "string" && args.request.cwd.trim() ? args.request.cwd.trim() : null;
-  const timeoutRaw = Number(args.request.timeoutMs);
-  const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(1000, Math.min(Math.floor(timeoutRaw), 300000)) : 30000;
-  return {
-    kind,
-    requestId,
-    command: kind === "shell" ? command : null,
-    patch: kind === "apply_patch" ? patch : null,
-    cwd,
-    timeoutMs,
-    responseSubject,
-    runtimeEnvPatch: normalizeEnvPatch(args.request.runtimeEnvPatch),
-    codexAuthBundle: normalizeShellRpcCodexAuthBundle(args.request.codexAuth),
-  };
-}
-
 function normalizeShellRpcCodexAuthBundle(value: unknown): CodexAuthBundleResponse | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -4177,145 +4070,6 @@ function normalizeShellRpcCodexAuthBundle(value: unknown): CodexAuthBundleRespon
     authJson,
     apiKey: typeof row.apiKey === "string" || row.apiKey === null ? row.apiKey : undefined,
   };
-}
-
-function publishShellRpcResponse(args: {
-  nc: NatsConnection;
-  responseSubject: string;
-  payload: AgentShellRpcResponse;
-}): void {
-  args.nc.publish(args.responseSubject, shellRpcCodec.encode(JSON.stringify(args.payload)));
-}
-
-async function handleShellRpcMessage(args: {
-  msg: Msg;
-  jetstream: AgentJetStreamContext;
-  userId: string;
-  agentId: string;
-  agentToken: string;
-}): Promise<void> {
-  let requestId = "unknown";
-  let responseSubject = "";
-  let stdout = "";
-  let stderr = "";
-  try {
-    const payload = JSON.parse(shellRpcCodec.decode(args.msg.data)) as AgentShellRpcRequest;
-    const request = normalizeShellRpcRequest({ request: payload, agentId: args.agentId });
-    requestId = request.requestId;
-    responseSubject = request.responseSubject;
-    const startedAtMs = Date.now();
-    const prepared = await prepareCommandExecution({
-      cwd: request.cwd,
-      userId: args.userId,
-      taskId: request.requestId,
-      codexAuthBundle: request.codexAuthBundle,
-    });
-    const child = spawnPreparedCommand({
-      kind: request.kind,
-      command: request.command,
-      patch: request.patch,
-      shellPath: prepared.shellPath,
-      taskWorkspace: prepared.taskWorkspace,
-      env: prepared.env,
-      agentToken: args.agentToken,
-    });
-
-    writeRpcStatus(
-      requestId,
-      `started kind=${request.kind} cwd=${prepared.taskWorkspace} shell=${request.kind === "shell" ? prepared.shellPath : "apply_patch"}`,
-    );
-    child.stdout!.on("data", (chunk: string) => {
-      stdout += chunk;
-      writeRpcStream(requestId, "stdout", chunk);
-    });
-    child.stderr!.on("data", (chunk: string) => {
-      stderr += chunk;
-      writeRpcStream(requestId, "stderr", chunk);
-    });
-
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      sendSignalToTaskProcess(child, "SIGTERM");
-      setTimeout(() => {
-        sendSignalToTaskProcess(child, "SIGKILL");
-      }, 1000).unref?.();
-    }, request.timeoutMs);
-    timeout.unref?.();
-
-    const result = await new Promise<{ exitCode: number | null; signal: string | null }>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (code, signal) => {
-        resolve({ exitCode: typeof code === "number" ? code : null, signal });
-      });
-    }).finally(() => {
-      clearTimeout(timeout);
-    });
-    await prepared.codexAuthCleanup().catch(() => undefined);
-
-    publishShellRpcResponse({
-      nc: args.jetstream.nc,
-      responseSubject,
-      payload: {
-        requestId,
-        ok: !timedOut,
-        exitCode: result.exitCode,
-        signal: result.signal,
-        stdout,
-        stderr,
-        ...(timedOut ? { error: `Command timed out after ${request.timeoutMs}ms` } : {}),
-      },
-    });
-    writeRpcStatus(
-      requestId,
-      `${timedOut ? "timed_out" : "completed"} exitCode=${result.exitCode ?? "null"} signal=${result.signal ?? "null"} durationMs=${Date.now() - startedAtMs}`,
-    );
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (responseSubject) {
-      publishShellRpcResponse({
-        nc: args.jetstream.nc,
-        responseSubject,
-        payload: {
-          requestId,
-          ok: false,
-          exitCode: null,
-          signal: null,
-          stdout,
-          stderr,
-          error: message,
-        },
-      });
-    }
-    writeRpcStatus(requestId, `failed error=${message}`);
-    writeAgentError(`shell rpc failed requestId=${requestId} error=${message}`);
-  }
-}
-
-function subscribeToShellRpc(args: {
-  jetstream: AgentJetStreamContext;
-  userId: string;
-  agentId: string;
-  agentToken: string;
-}): void {
-  const subject = buildAgentShellRpcSubject(args.userId, args.agentId);
-  args.jetstream.nc.subscribe(subject, {
-    callback: (error, msg) => {
-      if (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`shell rpc subscription error: ${message}`);
-        return;
-      }
-      void handleShellRpcMessage({
-        msg,
-        jetstream: args.jetstream,
-        userId: args.userId,
-        agentId: args.agentId,
-        agentToken: args.agentToken,
-      });
-    },
-  });
-  writeAgentInfo(`shell rpc subscribed subject=${subject}`);
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
@@ -4657,40 +4411,6 @@ function spawnPreparedCommand(args: {
   return child;
 }
 
-function createManagedCancellation(child: ReturnType<typeof spawn>): {
-  requestCancel: () => void;
-  clear: () => void;
-} {
-  let cancelStage1Timer: NodeJS.Timeout | null = null;
-  let cancelStage2Timer: NodeJS.Timeout | null = null;
-  let cancelSignalSent = false;
-  return {
-    requestCancel: () => {
-      if (cancelSignalSent) {
-        return;
-      }
-      cancelSignalSent = true;
-      sendSignalToTaskProcess(child, "SIGINT");
-      cancelStage1Timer = setTimeout(() => {
-        sendSignalToTaskProcess(child, "SIGTERM");
-      }, 1200);
-      cancelStage1Timer.unref?.();
-      cancelStage2Timer = setTimeout(() => {
-        sendSignalToTaskProcess(child, "SIGKILL");
-      }, 3500);
-      cancelStage2Timer.unref?.();
-    },
-    clear: () => {
-      if (cancelStage1Timer) {
-        clearTimeout(cancelStage1Timer);
-      }
-      if (cancelStage2Timer) {
-        clearTimeout(cancelStage2Timer);
-      }
-    },
-  };
-}
-
 async function runTask(args: {
   serverBaseUrl: string;
   taskId: string;
@@ -5014,12 +4734,6 @@ async function main() {
   subscribeToFsRpc({
     jetstream,
     serverBaseUrl,
-    userId,
-    agentId: initialAgentId,
-    agentToken,
-  });
-  subscribeToShellRpc({
-    jetstream,
     userId,
     agentId: initialAgentId,
     agentToken,
