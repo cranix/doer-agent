@@ -518,14 +518,6 @@ async function initJetStreamContext(args: {
   const jsm = await nc.jetstreamManager();
   await ensureJetStreamInfra({ jsm, stream, subject, durable });
 
-  void nc.closed().then((error) => {
-    if (error) {
-      writeAgentInfraError(`nats connection closed with error: ${error.message}`);
-      return;
-    }
-    writeAgentInfraError("nats connection closed cleanly");
-  });
-
   void (async () => {
     try {
       for await (const status of nc.status()) {
@@ -3827,7 +3819,24 @@ function publishSessionRpcResponse(args: {
   responseSubject: string;
   payload: AgentSessionRpcResponse;
 }): void {
-  args.nc.publish(args.responseSubject, sessionRpcCodec.encode(JSON.stringify(args.payload)));
+  try {
+    args.nc.publish(args.responseSubject, sessionRpcCodec.encode(JSON.stringify(args.payload)));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeAgentError(`session rpc publish failed responseSubject=${args.responseSubject}: ${message}`);
+  }
+}
+
+function stopAllSessionWatchers(): void {
+  const stops = [...activeSessionWatchers.values()];
+  for (const stop of stops) {
+    try {
+      stop();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeAgentError(`session watcher cleanup failed: ${message}`);
+    }
+  }
 }
 
 async function startSessionWatch(args: {
@@ -4684,90 +4693,105 @@ async function main() {
     throw new Error("user-id and agent-secret are required");
   }
   const agentToken = agentSecret;
-  const { natsBootstrap, jetstream } = await connectBootstrapWithRetry({
-    serverBaseUrl,
-    userId,
-    agentToken,
-  });
   const agentVersion = await resolveAgentVersion();
-  const initialAgentId = typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "";
-  if (!initialAgentId) {
-    throw new Error("agent id missing from bootstrap");
-  }
+  let bannerShown = false;
 
-  process.stdout.write(`\n[doer-agent v${agentVersion}]\n`);
-  if (!usesDefaultServer) {
-    process.stdout.write(`- server: ${serverBaseUrl}\n`);
-  }
-  process.stdout.write(`- userId: ${userId}\n`);
-  process.stdout.write(`- agentId: ${initialAgentId}\n`);
-  process.stdout.write(`\n- transport: nats\n`);
-  process.stdout.write(`- natsServers: ${jetstream.servers.join(",")}\n`);
-  process.stdout.write(`- natsStream: ${jetstream.stream}\n`);
-  process.stdout.write(`- natsSubject: ${jetstream.subject}\n`);
-  process.stdout.write(`- natsDurable: ${jetstream.durable}\n\n`);
-  process.stdout.write(`- workspace: ${process.cwd()}\n\n`);
-  if (requestedServerBaseUrl !== serverBaseUrl) {
-    writeAgentInfo(
-      `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
-    );
-  }
+  while (true) {
+    const { natsBootstrap, jetstream } = await connectBootstrapWithRetry({
+      serverBaseUrl,
+      userId,
+      agentToken,
+    });
+    const initialAgentId = typeof natsBootstrap.agentId === "string" ? natsBootstrap.agentId : "";
+    if (!initialAgentId) {
+      throw new Error("agent id missing from bootstrap");
+    }
 
-  let heartbeatHealthy: boolean | null = null;
-  const heartbeatTimer = setInterval(() => {
-    void heartbeatAgent({ serverBaseUrl, userId, agentToken })
-      .then(() => {
-        if (heartbeatHealthy === false) {
-          writeAgentInfraError(`heartbeat reconnected at=${formatLocalTimestamp()}`);
-        }
-        heartbeatHealthy = true;
-      })
-      .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        if (heartbeatHealthy !== false) {
-          writeAgentInfraError(`heartbeat failed: ${message}`);
-        }
-        heartbeatHealthy = false;
-      });
-  }, 10_000);
+    if (!bannerShown) {
+      process.stdout.write(`\n[doer-agent v${agentVersion}]\n`);
+      if (!usesDefaultServer) {
+        process.stdout.write(`- server: ${serverBaseUrl}\n`);
+      }
+      process.stdout.write(`- userId: ${userId}\n`);
+      process.stdout.write(`- agentId: ${initialAgentId}\n`);
+      process.stdout.write(`\n- transport: nats\n`);
+      process.stdout.write(`- natsServers: ${jetstream.servers.join(",")}\n`);
+      process.stdout.write(`- natsStream: ${jetstream.stream}\n`);
+      process.stdout.write(`- natsSubject: ${jetstream.subject}\n`);
+      process.stdout.write(`- natsDurable: ${jetstream.durable}\n\n`);
+      process.stdout.write(`- workspace: ${process.cwd()}\n\n`);
+      if (requestedServerBaseUrl !== serverBaseUrl) {
+        writeAgentInfo(
+          `detected container runtime, server endpoint rewritten: ${requestedServerBaseUrl} -> ${serverBaseUrl}`,
+        );
+      }
+      bannerShown = true;
+    } else {
+      writeAgentInfraError(
+        `nats session restored agentId=${initialAgentId} servers=${jetstream.servers.join(",")} at=${formatLocalTimestamp()}`,
+      );
+    }
 
-  subscribeToFsRpc({
-    jetstream,
-    serverBaseUrl,
-    userId,
-    agentId: initialAgentId,
-    agentToken,
-  });
-  subscribeToSessionRpc({
-    jetstream,
-    userId,
-    agentId: initialAgentId,
-  });
-  subscribeToCodexAuthRpc({
-    jetstream,
-    userId,
-    agentId: initialAgentId,
-  });
-  subscribeToSettingsRpc({
-    jetstream,
-    userId,
-    agentId: initialAgentId,
-  });
-  subscribeToGitRpc({
-    jetstream,
-    userId,
-    agentId: initialAgentId,
-  });
-  subscribeToRunRpc({
-    jetstream,
-    serverBaseUrl,
-    userId,
-    agentId: initialAgentId,
-    agentToken,
-  });
-  await new Promise<never>(() => {
-    // Keep the long-lived agent process alive for RPC subscriptions and heartbeat.
-  });
+    let heartbeatHealthy: boolean | null = null;
+    const heartbeatTimer = setInterval(() => {
+      void heartbeatAgent({ serverBaseUrl, userId, agentToken })
+        .then(() => {
+          if (heartbeatHealthy === false) {
+            writeAgentInfraError(`heartbeat reconnected at=${formatLocalTimestamp()}`);
+          }
+          heartbeatHealthy = true;
+        })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          if (heartbeatHealthy !== false) {
+            writeAgentInfraError(`heartbeat failed: ${message}`);
+          }
+          heartbeatHealthy = false;
+        });
+    }, 10_000);
+
+    subscribeToFsRpc({
+      jetstream,
+      serverBaseUrl,
+      userId,
+      agentId: initialAgentId,
+      agentToken,
+    });
+    subscribeToSessionRpc({
+      jetstream,
+      userId,
+      agentId: initialAgentId,
+    });
+    subscribeToCodexAuthRpc({
+      jetstream,
+      userId,
+      agentId: initialAgentId,
+    });
+    subscribeToSettingsRpc({
+      jetstream,
+      userId,
+      agentId: initialAgentId,
+    });
+    subscribeToGitRpc({
+      jetstream,
+      userId,
+      agentId: initialAgentId,
+    });
+    subscribeToRunRpc({
+      jetstream,
+      serverBaseUrl,
+      userId,
+      agentId: initialAgentId,
+      agentToken,
+    });
+
+    const closeError = await jetstream.nc.closed();
+    clearInterval(heartbeatTimer);
+    stopAllSessionWatchers();
+    const detail = closeError instanceof Error ? closeError.message : "clean close";
+    writeAgentInfraError(`nats session ended: ${detail}; reconnecting`);
+    await sleep(1000);
+  }
 }
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
