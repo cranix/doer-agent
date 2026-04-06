@@ -373,6 +373,7 @@ interface PublicRunTask {
   id: string;
   userId: string;
   agentId: string;
+  processPid: number | null;
   sessionId: string | null;
   sessionFilePath: string | null;
   status: "queued" | "running" | "completed" | "failed" | "canceled";
@@ -956,10 +957,13 @@ async function persistRunTask(task: PublicRunTask): Promise<void> {
     runId: task.id,
     agentId: task.agentId,
     userId: task.userId,
+    processPid: task.processPid,
     sessionId: task.sessionId,
     sessionFilePath: task.sessionFilePath,
     status: task.status,
     cancelRequested: task.cancelRequested,
+    resultExitCode: task.resultExitCode,
+    resultSignal: task.resultSignal,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     startedAt: task.startedAt,
@@ -1532,10 +1536,73 @@ function persistRetainedRun(task: PublicRunTask): void {
   retainedRuns.set(task.id, cloneRunTask(task));
 }
 
-function getStoredRun(runId: string): PublicRunTask | null {
-  const active = activeRuns.get(runId);
-  if (active) {
-    return active.task;
+function normalizePersistedRunTask(value: unknown): PublicRunTask | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const id = typeof record.runId === "string" && record.runId.trim()
+    ? record.runId.trim()
+    : typeof record.id === "string" && record.id.trim()
+      ? record.id.trim()
+      : "";
+  const userId = typeof record.userId === "string" ? record.userId : "";
+  const agentId = typeof record.agentId === "string" ? record.agentId : "";
+  const status = record.status;
+  if (!id || !userId || !agentId || !["queued", "running", "completed", "failed", "canceled"].includes(String(status))) {
+    return null;
+  }
+  return {
+    id,
+    userId,
+    agentId,
+    processPid: typeof record.processPid === "number" ? record.processPid : null,
+    sessionId: typeof record.sessionId === "string" && record.sessionId.trim() ? record.sessionId.trim() : null,
+    sessionFilePath: typeof record.sessionFilePath === "string" && record.sessionFilePath.trim() ? record.sessionFilePath.trim() : null,
+    status: status as PublicRunTask["status"],
+    cancelRequested: Boolean(record.cancelRequested),
+    resultExitCode: typeof record.resultExitCode === "number" ? record.resultExitCode : null,
+    resultSignal: typeof record.resultSignal === "string" && record.resultSignal.trim() ? record.resultSignal.trim() : null,
+    error: typeof record.error === "string" && record.error.trim() ? record.error : null,
+    createdAt: typeof record.createdAt === "string" ? record.createdAt : "",
+    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : "",
+    startedAt: typeof record.startedAt === "string" && record.startedAt.trim() ? record.startedAt : null,
+    finishedAt: typeof record.finishedAt === "string" && record.finishedAt.trim() ? record.finishedAt : null,
+  };
+}
+
+async function listPersistedRunTasks(): Promise<PublicRunTask[]> {
+  const dir = await resolveRunsDir();
+  const names = await readdir(dir).catch(() => [] as string[]);
+  const tasks = await Promise.all(
+    names
+      .filter((name) => name.endsWith(".json"))
+      .map(async (name) => {
+        const raw = await readFile(path.join(dir, name), "utf8").catch(() => null);
+        if (!raw) {
+          return null;
+        }
+        try {
+          return normalizePersistedRunTask(JSON.parse(raw));
+        } catch {
+          return null;
+        }
+      }),
+  );
+  return tasks.filter((task): task is PublicRunTask => task !== null);
+}
+
+async function getStoredRun(runId: string): Promise<PublicRunTask | null> {
+  const persisted = await readFile(path.join(await resolveRunsDir(), `${runId}.json`), "utf8").catch(() => null);
+  if (persisted) {
+    try {
+      const parsed = normalizePersistedRunTask(JSON.parse(persisted));
+      if (parsed) {
+        return parsed;
+      }
+    } catch {
+      // Ignore malformed persisted state and fall back to retained memory.
+    }
   }
   return retainedRuns.get(runId) ?? null;
 }
@@ -1571,6 +1638,7 @@ async function startManagedRun(args: {
     id: args.runId,
     userId: args.userId,
     agentId: args.agentId,
+    processPid: typeof child.pid === "number" ? child.pid : null,
     sessionId: typeof args.sessionId === "string" && args.sessionId.trim() ? args.sessionId.trim() : null,
     sessionFilePath: null,
     status: "running",
@@ -2624,23 +2692,42 @@ async function handleRunRpcMessage(args: {
     }
 
     if (request.action === "list") {
-      const tasks = [...activeRuns.values()].map((entry) => cloneRunTask(entry.task));
-      const retained = [...retainedRuns.values()].filter((task) => !activeRuns.has(task.id)).map((task) => cloneRunTask(task));
-      const merged = [...tasks, ...retained]
+      const persisted = await listPersistedRunTasks();
+      const mergedById = new Map<string, PublicRunTask>();
+      for (const task of persisted) {
+        mergedById.set(task.id, cloneRunTask(task));
+      }
+      for (const task of retainedRuns.values()) {
+        if (!mergedById.has(task.id)) {
+          mergedById.set(task.id, cloneRunTask(task));
+        }
+      }
+      const merged = [...mergedById.values()]
         .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
         .slice(0, request.limit);
       publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, tasks: merged } });
       return;
     }
 
-    const stored = request.runId ? getStoredRun(request.runId) : null;
+    const stored = request.runId ? await getStoredRun(request.runId) : null;
     if (!stored || stored.agentId !== args.agentId || stored.userId !== args.userId) {
       throw new Error("Run not found");
     }
 
     if (request.action === "cancel") {
       const active = activeRuns.get(stored.id);
-      active?.requestCancel();
+      if (active) {
+        active.requestCancel();
+      } else {
+        if (stored.processPid === null) {
+          throw new Error("Run pid not found");
+        }
+        stored.cancelRequested = true;
+        stored.updatedAt = formatLocalTimestamp();
+        await persistRunTask(stored);
+        writeRunStatus(stored.id, `cancel requested pid=${stored.processPid}`);
+        sendSignalToPid(stored.processPid, "SIGINT");
+      }
       const task = cloneRunTask(active?.task ?? stored);
       publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
       return;
@@ -2728,6 +2815,18 @@ function sendSignalToTaskProcess(child: ReturnType<typeof spawn>, signal: NodeJS
   } catch {
     // noop
   }
+}
+
+function sendSignalToPid(pid: number, signal: NodeJS.Signals): void {
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch {
+      // Fall back to direct pid signaling.
+    }
+  }
+  process.kill(pid, signal);
 }
 
 function requestTaskCancellation(taskId: string, reason: string): boolean {
