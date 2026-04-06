@@ -423,7 +423,6 @@ interface ActiveTaskLogContext {
 }
 
 let activeTaskLogContext: ActiveTaskLogContext | null = null;
-const activeTaskCancelRequests = new Map<string, () => void>();
 let workspaceRootOverride: string | null = null;
 const fsRpcCodec = StringCodec();
 const shellRpcCodec = StringCodec();
@@ -2829,22 +2828,6 @@ function sendSignalToPid(pid: number, signal: NodeJS.Signals): void {
   process.kill(pid, signal);
 }
 
-function requestTaskCancellation(taskId: string, reason: string): boolean {
-  const requestCancel = activeTaskCancelRequests.get(taskId);
-  if (!requestCancel) {
-    return false;
-  }
-  try {
-    requestCancel();
-    writeAgentInfo(`task cancel requested taskId=${taskId} via=${reason}`);
-    return true;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    writeAgentError(`task cancel request failed taskId=${taskId} via=${reason}: ${message}`);
-    return false;
-  }
-}
-
 function resolveLogTimeZone(): string {
   const configured = process.env.DOER_AGENT_LOG_TIMEZONE?.trim() || process.env.TZ?.trim();
   return configured && configured.length > 0 ? configured : "Asia/Seoul";
@@ -4815,7 +4798,6 @@ async function runTask(args: {
       }, 3500);
       cancelStage2Timer.unref?.();
     };
-    activeTaskCancelRequests.set(args.taskId, requestCancel);
 
     child.stdout.on("data", (chunk: string) => {
       writeTaskStream(args.taskId, "stdout", chunk);
@@ -4919,7 +4901,6 @@ async function runTask(args: {
       `task=${args.taskId} status=${status} exitCode=${typeof result.code === "number" ? result.code : "null"} signal=${result.signal ?? "null"}`,
     );
   } finally {
-    activeTaskCancelRequests.delete(args.taskId);
     activeTaskLogContext = null;
     await codexAuth?.cleanup().catch(() => undefined);
   }
