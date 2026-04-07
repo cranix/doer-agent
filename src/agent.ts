@@ -131,6 +131,7 @@ interface AgentRunRpcRequest {
   action?: unknown;
   runId?: unknown;
   prompt?: unknown;
+  imagePaths?: unknown;
   sessionId?: unknown;
   model?: unknown;
   cwd?: unknown;
@@ -346,6 +347,7 @@ interface AgentRunRpcNormalizedRequest {
   action: AgentRunRpcAction;
   runId: string | null;
   prompt: string | null;
+  imagePaths: string[];
   sessionId: string | null;
   model: string;
   cwd: string | null;
@@ -707,6 +709,26 @@ function normalizeEnvPatch(value: unknown): Record<string, string> {
   return out;
 }
 
+function normalizeRunImagePaths(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+    const normalized = item.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
 async function prepareTaskRuntimeConfig(args: {
   serverBaseUrl: string;
   taskId: string;
@@ -853,6 +875,7 @@ function normalizeRunRpcRequest(args: { request: AgentRunRpcRequest; agentId: st
   }
   const runId = typeof args.request.runId === "string" && args.request.runId.trim() ? args.request.runId.trim() : null;
   const prompt = typeof args.request.prompt === "string" && args.request.prompt.trim() ? args.request.prompt.trim() : null;
+  const imagePaths = normalizeRunImagePaths(args.request.imagePaths);
   const sessionId = typeof args.request.sessionId === "string" && args.request.sessionId.trim() ? args.request.sessionId.trim() : null;
   const model = normalizeCodexModel(args.request.model);
   if (action === "start" && !prompt) {
@@ -871,6 +894,7 @@ function normalizeRunRpcRequest(args: { request: AgentRunRpcRequest; agentId: st
     action,
     runId,
     prompt,
+    imagePaths,
     sessionId,
     model,
     cwd,
@@ -1678,18 +1702,20 @@ function normalizeCodexModel(value: unknown): string {
 
 function buildManagedCodexArgs(args: {
   prompt: string;
+  imagePaths: string[];
   sessionId: string | null;
   model: string;
 }): string[] {
   const promptArgs = ["--", args.prompt];
   const fixedArgs = ["--dangerously-bypass-approvals-and-sandbox"];
+  const imageArgs = args.imagePaths.flatMap((imagePath) => ["--image", imagePath]);
   return [
     ...fixedArgs,
     "--model",
     args.model,
     ...(args.sessionId
-    ? ["exec", "resume", "--json", args.sessionId, ...promptArgs]
-    : ["exec", "--json", ...promptArgs]),
+    ? ["exec", "resume", "--json", ...imageArgs, args.sessionId, ...promptArgs]
+    : ["exec", "--json", ...imageArgs, ...promptArgs]),
   ];
 }
 
@@ -2611,6 +2637,7 @@ async function handleRunRpcMessage(args: {
           sessionId: request.sessionId,
           codexArgs: buildManagedCodexArgs({
             prompt: request.prompt ?? "",
+            imagePaths: request.imagePaths,
             sessionId: request.sessionId,
             model: request.model,
           }),
