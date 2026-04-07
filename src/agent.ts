@@ -67,7 +67,7 @@ interface AgentJetStreamContext {
   servers: string[];
 }
 
-type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file" | "write_file" | "download_file";
+type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file" | "write_file" | "download_file" | "delete_path";
 
 interface AgentFsRpcRequest {
   requestId?: unknown;
@@ -2962,7 +2962,8 @@ function parseFsRpcAction(value: unknown): AgentFsRpcAction {
     value === "read_text" ||
     value === "read_file" ||
     value === "write_file" ||
-    value === "download_file"
+    value === "download_file" ||
+    value === "delete_path"
   ) {
     return value;
   }
@@ -3133,6 +3134,16 @@ async function executeFsRpc(args: {
       size: entry.size,
       mimeType: inferMimeType(abs),
       mtimeMs: entry.mtimeMs,
+    };
+  }
+
+  if (action === "delete_path") {
+    await rm(abs, { recursive: true, force: true });
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      absolutePath: abs.split(path.sep).join("/"),
     };
   }
 
