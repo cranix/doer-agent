@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { chmod, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -4118,8 +4118,10 @@ async function startSessionWatch(args: {
   filePath: string;
 }): Promise<string> {
   const resolvedFile = resolveSessionFilePath(args.filePath);
+  const canonicalFile = await realpath(resolvedFile).catch(() => resolvedFile);
   const watchId = `watch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-  const watchDir = path.dirname(resolvedFile);
+  const watchDir = path.dirname(canonicalFile);
+  const candidatePaths = new Set([path.normalize(resolvedFile), path.normalize(canonicalFile)]);
   let watcher: ParcelWatcherSubscription | null = null;
   let active = true;
 
@@ -4174,8 +4176,8 @@ async function startSessionWatch(args: {
       return;
     }
     for (const event of events) {
-      const changedPath = path.resolve(event.path);
-      if (changedPath !== resolvedFile) {
+      const changedPath = path.normalize(path.resolve(event.path));
+      if (!candidatePaths.has(changedPath)) {
         continue;
       }
       notifyFromContent();
