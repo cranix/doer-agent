@@ -1,9 +1,27 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, statSync, watch } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { chmod, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
+
+const require = createRequire(import.meta.url);
+type ParcelWatcherEvent = {
+  path: string;
+  type: "create" | "update" | "delete";
+};
+
+type ParcelWatcherSubscription = {
+  unsubscribe(): Promise<void>;
+};
+
+const parcelWatcher = require("@parcel/watcher") as {
+  subscribe(
+    dir: string,
+    fn: (error: Error | null, events: ParcelWatcherEvent[]) => unknown,
+  ): Promise<ParcelWatcherSubscription>;
+};
 
 interface PollResponse {
   task: {
@@ -82,6 +100,21 @@ interface AgentFsRpcRequest {
   encoding?: unknown;
   uploadUrl?: unknown;
   agentId?: unknown;
+}
+
+interface AgentSkillRpcRequest {
+  requestId?: unknown;
+  action?: unknown;
+  prompt?: unknown;
+  agentId?: unknown;
+}
+
+interface AgentSkillRpcResponse {
+  ok?: unknown;
+  error?: unknown;
+  skillName?: unknown;
+  skillPath?: unknown;
+  skillFilePath?: unknown;
 }
 
 type AgentSessionRpcAction = "list" | "messages" | "delete" | "watch" | "stop_watch";
@@ -391,6 +424,7 @@ const sessionRpcCodec = StringCodec();
 const codexAuthRpcCodec = StringCodec();
 const settingsRpcCodec = StringCodec();
 const gitRpcCodec = StringCodec();
+const skillRpcCodec = StringCodec();
 const retainedRuns = new Map<string, PublicRunTask>();
 const activeSessionWatchers = new Map<string, () => void>();
 const sessionLineIndexCache = new Map<string, SessionLineIndexCacheEntry>();
@@ -426,6 +460,10 @@ function buildAgentSettingsRpcSubject(userId: string, agentId: string): string {
 
 function buildAgentGitRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.git.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function buildAgentSkillRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.skill.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function normalizeNatsServers(value: unknown): string[] {
@@ -1767,7 +1805,7 @@ function spawnManagedCodexCommand(args: {
   return child;
 }
 
-async function runLocalCodexCli(args: string[], timeoutMs: number): Promise<{
+async function runLocalCodexCli(args: string[], timeoutMs: number, envPatch?: Record<string, string>): Promise<{
   code: number | null;
   stdout: string;
   stderr: string;
@@ -1777,6 +1815,7 @@ async function runLocalCodexCli(args: string[], timeoutMs: number): Promise<{
   const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
   const env: NodeJS.ProcessEnv = {
     ...process.env,
+    ...(envPatch ?? {}),
     WORKSPACE: workspaceRoot,
     CODEX_HOME: resolveCodexHomePath(),
   };
@@ -1827,6 +1866,186 @@ async function runLocalCodexCli(args: string[], timeoutMs: number): Promise<{
       resolve({ code, stdout, stderr, timedOut });
     });
   });
+}
+
+function buildSkillGeneratorPrompt(userPrompt: string): string {
+  return [
+    "Create a Codex skill from the user's description.",
+    "",
+    "Return JSON only with this shape:",
+    '{ "skillName": "kebab-or-dot-or-underscore-name", "skillMd": "full SKILL.md content" }',
+    "",
+    "Requirements:",
+    "- skillName must be lowercase ASCII and use only letters, numbers, dot, underscore, or dash.",
+    "- skillName must not start with a dot and must not be .system.",
+    "- skillMd must be a complete SKILL.md file.",
+    "- skillMd must start with YAML frontmatter containing name and description.",
+    "- Keep the skill concise and action-oriented.",
+    "- Include when to use the skill, the core workflow, and any important constraints.",
+    "- Do not add README, changelog, or any extra files.",
+    "",
+    "User request:",
+    userPrompt.trim(),
+  ].join("\n");
+}
+
+function extractJsonObject(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return trimmed.slice(start, end + 1);
+  }
+  throw new Error("Codex did not return JSON");
+}
+
+function slugifySkillName(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+}
+
+function normalizeGeneratedSkill(value: unknown): { skillName: string; skillMd: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid generated skill payload");
+  }
+  const row = value as Record<string, unknown>;
+  const skillName = slugifySkillName(typeof row.skillName === "string" ? row.skillName : "");
+  const skillMd = typeof row.skillMd === "string" ? row.skillMd.trim() : "";
+  if (!skillName || skillName.startsWith(".") || skillName === ".system") {
+    throw new Error("Codex returned an invalid skill name");
+  }
+  if (!skillMd) {
+    throw new Error("Codex returned an empty SKILL.md");
+  }
+  if (!/^---\s*\n[\s\S]*?\n---\s*\n/m.test(skillMd)) {
+    throw new Error("Generated SKILL.md is missing YAML frontmatter");
+  }
+  if (!/\nname:\s*[^\n]+/i.test(skillMd) || !/\ndescription:\s*[^\n]+/i.test(skillMd)) {
+    throw new Error("Generated SKILL.md frontmatter is incomplete");
+  }
+  return { skillName, skillMd };
+}
+
+function buildSkillGeneratorCodexArgs(prompt: string, model: string): string[] {
+  return ["--dangerously-bypass-approvals-and-sandbox", "--model", model, "exec", "--", prompt];
+}
+
+async function generateSkillViaCodex(userPrompt: string): Promise<{
+  skillName: string;
+  skillPath: string;
+  skillFilePath: string;
+}> {
+  const localAgentSettings = await readAgentSettingsConfig(null);
+  const envPatch = buildAgentSettingsEnvPatch(localAgentSettings);
+  const prompt = buildSkillGeneratorPrompt(userPrompt);
+  const result = await runLocalCodexCli(
+    buildSkillGeneratorCodexArgs(prompt, localAgentSettings.codex.model || "gpt-5.4"),
+    120_000,
+    envPatch,
+  );
+
+  if (result.timedOut) {
+    throw new Error("Codex timed out while generating the skill");
+  }
+  if ((result.code ?? 1) !== 0) {
+    const details = stripAnsi(result.stderr || result.stdout).trim();
+    throw new Error(details || `Codex exited with code ${result.code ?? "null"}`);
+  }
+
+  const payload = JSON.parse(extractJsonObject(stripAnsi(result.stdout))) as unknown;
+  const generated = normalizeGeneratedSkill(payload);
+  const skillPath = path.join(resolveCodexHomePath(), "skills", generated.skillName);
+  const skillFilePath = path.join(skillPath, "SKILL.md");
+
+  try {
+    await stat(skillPath);
+    throw new Error("A skill with that name already exists");
+  } catch (error) {
+    if (!(error instanceof Error) || !/ENOENT/i.test(error.message)) {
+      throw error;
+    }
+  }
+
+  await mkdir(skillPath, { recursive: true });
+  await writeFile(skillFilePath, `${generated.skillMd}\n`, "utf8");
+
+  return {
+    skillName: generated.skillName,
+    skillPath: `.codex/skills/${generated.skillName}`,
+    skillFilePath: `.codex/skills/${generated.skillName}/SKILL.md`,
+  };
+}
+
+async function handleSkillRpcMessage(args: {
+  msg: Msg;
+  agentId: string;
+}): Promise<void> {
+  let payload: AgentSkillRpcRequest = {};
+  try {
+    payload = JSON.parse(skillRpcCodec.decode(args.msg.data)) as AgentSkillRpcRequest;
+    if (typeof payload.agentId === "string" && payload.agentId.trim() && payload.agentId !== args.agentId) {
+      throw new Error("agent id mismatch");
+    }
+    const prompt = typeof payload.prompt === "string" ? payload.prompt.trim() : "";
+    if (!prompt) {
+      throw new Error("prompt is required");
+    }
+    const result = await generateSkillViaCodex(prompt);
+    args.msg.respond(
+      skillRpcCodec.encode(
+        JSON.stringify({
+          ok: true,
+          skillName: result.skillName,
+          skillPath: result.skillPath,
+          skillFilePath: result.skillFilePath,
+        }),
+      ),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    args.msg.respond(
+      skillRpcCodec.encode(
+        JSON.stringify({
+          ok: false,
+          error: message,
+        }),
+      ),
+    );
+    writeAgentError(`skill rpc failed error=${message}`);
+  }
+}
+
+function subscribeToSkillRpc(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): void {
+  const subject = buildAgentSkillRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`skill rpc subscription error: ${message}`);
+        return;
+      }
+      void handleSkillRpcMessage({
+        msg,
+        agentId: args.agentId,
+      });
+    },
+  });
+  writeAgentInfo(`skill rpc subscribed subject=${subject}`);
 }
 
 function parseCodexDeviceAuthOutput(raw: string): { verificationUri: string | null; userCode: string | null } {
@@ -3900,7 +4119,8 @@ async function startSessionWatch(args: {
 }): Promise<string> {
   const resolvedFile = resolveSessionFilePath(args.filePath);
   const watchId = `watch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-  let watcher: ReturnType<typeof watch> | null = null;
+  const watchDir = path.dirname(resolvedFile);
+  let watcher: ParcelWatcherSubscription | null = null;
   let active = true;
 
   const emitEvent = (event: Record<string, unknown>) => {
@@ -3925,9 +4145,13 @@ async function startSessionWatch(args: {
       return;
     }
     active = false;
-    watcher?.close();
-    watcher = null;
     activeSessionWatchers.delete(watchId);
+    const currentWatcher = watcher;
+    watcher = null;
+    void currentWatcher?.unsubscribe().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      writeAgentError(`session watcher unsubscribe failed watchId=${watchId}: ${message}`);
+    });
   };
 
   const notifyFromContent = () => {
@@ -3937,8 +4161,26 @@ async function startSessionWatch(args: {
     });
   };
 
-  watcher = watch(resolvedFile, () => {
-    notifyFromContent();
+  watcher = await parcelWatcher.subscribe(watchDir, (error: Error | null, events: ParcelWatcherEvent[]) => {
+    if (!active) {
+      return;
+    }
+    if (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeAgentError(`session watcher event failed watchId=${watchId}: ${message}`);
+      return;
+    }
+    if (!Array.isArray(events) || events.length === 0) {
+      return;
+    }
+    for (const event of events) {
+      const changedPath = path.resolve(event.path);
+      if (changedPath !== resolvedFile) {
+        continue;
+      }
+      notifyFromContent();
+      break;
+    }
   });
   activeSessionWatchers.set(watchId, cleanup);
   emitEvent({ type: "stream.started", watchId, at: formatLocalTimestamp() });
@@ -4826,6 +5068,11 @@ async function main() {
       agentId: initialAgentId,
     });
     subscribeToGitRpc({
+      jetstream,
+      userId,
+      agentId: initialAgentId,
+    });
+    subscribeToSkillRpc({
       jetstream,
       userId,
       agentId: initialAgentId,
