@@ -3362,7 +3362,7 @@ function sanitizeSessionRpcPayload(value: unknown): unknown {
   return sanitized;
 }
 
-function sanitizeSessionRpcRawLine(line: string): string {
+function sanitizeSessionRpcRawLine(line: string): string | null {
   const trimmed = line.trim();
   if (!trimmed.startsWith("{")) {
     return line;
@@ -3370,8 +3370,18 @@ function sanitizeSessionRpcRawLine(line: string): string {
 
   try {
     const parsed = JSON.parse(line) as { type?: unknown; payload?: unknown };
-    if (!isObjectRecord(parsed) || !isObjectRecord(parsed.payload) || parsed.type !== "response_item") {
+    if (!isObjectRecord(parsed)) {
       return line;
+    }
+    if (parsed.type === "compacted" || parsed.type === "turn_context" || parsed.type === "session_meta") {
+      return null;
+    }
+    if (!isObjectRecord(parsed.payload) || parsed.type !== "response_item") {
+      return line;
+    }
+    const payloadType = typeof parsed.payload.type === "string" ? parsed.payload.type : "";
+    if (payloadType === "message" || payloadType === "reasoning") {
+      return null;
     }
     return JSON.stringify({
       ...parsed,
@@ -3796,9 +3806,14 @@ async function getAgentSessionRawRows(args: {
     let lineNumber = startLineIndex + 1;
     for (const line of lines) {
       if (line.trim()) {
+        const sanitized = sanitizeSessionRpcRawLine(line);
+        if (!sanitized) {
+          lineNumber += 1;
+          continue;
+        }
         rawRows.push({
           id: lineNumber,
-          raw: sanitizeSessionRpcRawLine(line),
+          raw: sanitized,
         });
       }
       lineNumber += 1;
