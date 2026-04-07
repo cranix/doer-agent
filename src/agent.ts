@@ -1,27 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, statSync, watch, type FSWatcher } from "node:fs";
 import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
-
-const require = createRequire(import.meta.url);
-type ParcelWatcherEvent = {
-  path: string;
-  type: "create" | "update" | "delete";
-};
-
-type ParcelWatcherSubscription = {
-  unsubscribe(): Promise<void>;
-};
-
-const parcelWatcher = require("@parcel/watcher") as {
-  subscribe(
-    dir: string,
-    fn: (error: Error | null, events: ParcelWatcherEvent[]) => unknown,
-  ): Promise<ParcelWatcherSubscription>;
-};
 
 interface PollResponse {
   task: {
@@ -4120,9 +4102,7 @@ async function startSessionWatch(args: {
   const resolvedFile = resolveSessionFilePath(args.filePath);
   const canonicalFile = await realpath(resolvedFile).catch(() => resolvedFile);
   const watchId = `watch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-  const watchDir = path.dirname(canonicalFile);
-  const candidatePaths = new Set([path.normalize(resolvedFile), path.normalize(canonicalFile)]);
-  let watcher: ParcelWatcherSubscription | null = null;
+  let watcher: FSWatcher | null = null;
   let active = true;
 
   const emitEvent = (event: Record<string, unknown>) => {
@@ -4148,12 +4128,8 @@ async function startSessionWatch(args: {
     }
     active = false;
     activeSessionWatchers.delete(watchId);
-    const currentWatcher = watcher;
+    watcher?.close();
     watcher = null;
-    void currentWatcher?.unsubscribe().catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      writeAgentError(`session watcher unsubscribe failed watchId=${watchId}: ${message}`);
-    });
   };
 
   const notifyFromContent = () => {
@@ -4163,25 +4139,12 @@ async function startSessionWatch(args: {
     });
   };
 
-  watcher = await parcelWatcher.subscribe(watchDir, (error: Error | null, events: ParcelWatcherEvent[]) => {
+  watcher = watch(canonicalFile, { persistent: false }, (eventType) => {
     if (!active) {
       return;
     }
-    if (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      writeAgentError(`session watcher event failed watchId=${watchId}: ${message}`);
-      return;
-    }
-    if (!Array.isArray(events) || events.length === 0) {
-      return;
-    }
-    for (const event of events) {
-      const changedPath = path.normalize(path.resolve(event.path));
-      if (!candidatePaths.has(changedPath)) {
-        continue;
-      }
+    if (eventType === "change" || eventType === "rename") {
       notifyFromContent();
-      break;
     }
   });
   activeSessionWatchers.set(watchId, cleanup);
