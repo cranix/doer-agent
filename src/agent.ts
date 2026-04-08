@@ -3362,12 +3362,13 @@ async function executeFsRpc(args: {
     if (!uploadUrl || !agentId) {
       throw new Error("missing upload parameters");
     }
+    const resolvedUploadUrl = new URL(uploadUrl, `${args.serverBaseUrl}/`).toString();
     const data = await readFile(abs);
     const fileName = path.basename(abs) || "file";
     const form = new FormData();
     form.append("file", new File([data], fileName));
     form.append("agentId", agentId);
-    const response = await fetch(uploadUrl, {
+    const response = await fetch(resolvedUploadUrl, {
       method: "POST",
       headers: { Authorization: `Bearer ${args.agentToken}` },
       body: form,
