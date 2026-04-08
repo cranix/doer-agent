@@ -3,6 +3,7 @@ import { existsSync, statSync, watch, type FSWatcher } from "node:fs";
 import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { AckPolicy, connect, DeliverPolicy, JSONCodec, RetentionPolicy, StorageType, StringCodec, type JetStreamClient, type JetStreamManager, type Msg, type NatsConnection } from "nats";
 
 interface PollResponse {
@@ -67,7 +68,7 @@ interface AgentJetStreamContext {
   servers: string[];
 }
 
-type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file" | "write_file" | "download_file" | "delete_path";
+type AgentFsRpcAction = "list" | "stat" | "fetch_file" | "read_text" | "read_file" | "write_file" | "download_file" | "delete_path" | "archive_dir" | "extract_archive";
 
 interface AgentFsRpcRequest {
   requestId?: unknown;
@@ -82,6 +83,8 @@ interface AgentFsRpcRequest {
   encoding?: unknown;
   uploadUrl?: unknown;
   agentId?: unknown;
+  archivePath?: unknown;
+  destinationPath?: unknown;
 }
 
 interface AgentSkillRpcRequest {
@@ -3164,7 +3167,9 @@ function parseFsRpcAction(value: unknown): AgentFsRpcAction {
     value === "read_file" ||
     value === "write_file" ||
     value === "download_file" ||
-    value === "delete_path"
+    value === "delete_path" ||
+    value === "archive_dir" ||
+    value === "extract_archive"
   ) {
     return value;
   }
@@ -3226,6 +3231,42 @@ function inferMimeType(filePath: string): string {
   return "application/octet-stream";
 }
 
+interface ArchivedFileEntry {
+  relPath: string;
+  contentBase64: string;
+  sizeBytes: number;
+}
+
+function normalizeArchiveRelativePath(value: string): string {
+  const normalized = value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (!normalized || normalized.includes("..")) {
+    throw new Error("invalid archive entry path");
+  }
+  return normalized;
+}
+
+async function collectDirectoryFiles(absDir: string, rootDir = absDir): Promise<ArchivedFileEntry[]> {
+  const rows = await readdir(absDir, { withFileTypes: true });
+  const files: ArchivedFileEntry[] = [];
+  for (const row of rows.sort((a, b) => a.name.localeCompare(b.name))) {
+    const child = path.join(absDir, row.name);
+    if (row.isDirectory()) {
+      files.push(...await collectDirectoryFiles(child, rootDir));
+      continue;
+    }
+    if (!row.isFile()) {
+      continue;
+    }
+    const bytes = await readFile(child);
+    files.push({
+      relPath: normalizeArchiveRelativePath(path.relative(rootDir, child)),
+      contentBase64: Buffer.from(bytes).toString("base64"),
+      sizeBytes: bytes.byteLength,
+    });
+  }
+  return files;
+}
+
 async function executeFsRpc(args: {
   request: AgentFsRpcRequest;
   serverBaseUrl: string;
@@ -3274,6 +3315,40 @@ async function executeFsRpc(args: {
       items: items.slice(0, limit),
       truncated: items.length > limit,
       total: items.length,
+    };
+  }
+
+  if (action === "archive_dir") {
+    const entry = await stat(abs);
+    if (!entry.isDirectory()) {
+      throw new Error("path is not a directory");
+    }
+    const rawArchivePath = typeof args.request.archivePath === "string" ? args.request.archivePath : "";
+    if (!rawArchivePath) {
+      throw new Error("archivePath is required");
+    }
+    const archiveTarget = normalizeFsRpcPath(rawArchivePath);
+    const files = await collectDirectoryFiles(abs);
+    if (!files.some((file) => file.relPath === "SKILL.md")) {
+      throw new Error("Selected skill directory must contain SKILL.md");
+    }
+    const payload = gzipSync(
+      Buffer.from(
+        JSON.stringify({
+          files,
+        }),
+        "utf8",
+      ),
+    );
+    await mkdir(path.dirname(archiveTarget.abs), { recursive: true });
+    await writeFile(archiveTarget.abs, payload);
+    const archiveStat = await stat(archiveTarget.abs);
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      archivePath: archiveTarget.formatPath(archiveTarget.abs),
+      size: archiveStat.size,
     };
   }
 
@@ -3377,6 +3452,40 @@ async function executeFsRpc(args: {
       size: entry.size,
       mimeType: inferMimeType(abs),
       mtimeMs: entry.mtimeMs,
+    };
+  }
+
+  if (action === "extract_archive") {
+    const archiveEntry = await stat(abs);
+    if (!archiveEntry.isFile()) {
+      throw new Error("path is not a file");
+    }
+    const rawDestinationPath = typeof args.request.destinationPath === "string" ? args.request.destinationPath : "";
+    if (!rawDestinationPath) {
+      throw new Error("destinationPath is required");
+    }
+    const destinationTarget = normalizeFsRpcPath(rawDestinationPath);
+    const archiveBytes = await readFile(abs);
+    const decoded = JSON.parse(gunzipSync(archiveBytes).toString("utf8")) as {
+      files?: Array<{ relPath?: unknown; contentBase64?: unknown }>;
+    };
+    const files = Array.isArray(decoded.files) ? decoded.files : [];
+    await mkdir(destinationTarget.abs, { recursive: true });
+    for (const file of files) {
+      const relPath = typeof file.relPath === "string" ? normalizeArchiveRelativePath(file.relPath) : "";
+      const contentBase64 = typeof file.contentBase64 === "string" ? file.contentBase64 : "";
+      if (!relPath || !contentBase64) {
+        throw new Error("archive contains an invalid file entry");
+      }
+      const targetPath = path.join(destinationTarget.abs, relPath);
+      await mkdir(path.dirname(targetPath), { recursive: true });
+      await writeFile(targetPath, Buffer.from(contentBase64, "base64"));
+    }
+    return {
+      ok: true,
+      action,
+      path: formatPath(abs),
+      absolutePath: destinationTarget.formatPath(destinationTarget.abs),
     };
   }
 
