@@ -166,6 +166,7 @@ interface AgentCodexAuthRpcRequest {
   responseSubject?: unknown;
   agentId?: unknown;
   action?: unknown;
+  apiKey?: unknown;
 }
 
 interface AgentCodexAuthRpcResponse {
@@ -187,7 +188,6 @@ interface AgentSettingsConfig {
   codex: {
     model: string;
     authMode: "api_key" | "oauth";
-    apiKey: string | null;
   };
   realtime: {
     model: string;
@@ -1090,7 +1090,6 @@ function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
     codex: {
       model: "gpt-5.4",
       authMode: "api_key",
-      apiKey: null,
     },
     realtime: {
       model: process.env.OPENAI_REALTIME_MODEL?.trim() || "gpt-realtime",
@@ -1170,7 +1169,6 @@ function normalizeAgentSettingsConfig(value: unknown, fallback?: AgentSettingsCo
     codex: {
       model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
       authMode: codex.authMode === "oauth" ? "oauth" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
-      apiKey: codex.apiKey === null ? null : normalizeNullableString(codex.apiKey) ?? base.codex.apiKey,
     },
     realtime: {
       model: typeof realtime.model === "string" && realtime.model.trim() ? realtime.model.trim() : base.realtime.model,
@@ -1255,7 +1253,6 @@ function toMaskedSecret(value: string | null): { has: boolean; masked: string | 
 }
 
 function toAgentSettingsPublic(config: AgentSettingsConfig): AgentSettingsPublic {
-  const codexKey = toMaskedSecret(config.codex.apiKey);
   const realtimeKey = toMaskedSecret(config.realtime.apiKey);
   const gitOauth = toMaskedSecret(config.git.oauthToken);
   const awsSecret = toMaskedSecret(config.aws.secretAccessKey);
@@ -1271,9 +1268,9 @@ function toAgentSettingsPublic(config: AgentSettingsConfig): AgentSettingsPublic
     codex: {
       model: config.codex.model,
       authMode: config.codex.authMode,
-      hasApiKey: codexKey.has,
-      apiKeyMasked: codexKey.masked,
-      apiKeyLength: codexKey.length,
+      hasApiKey: false,
+      apiKeyMasked: null,
+      apiKeyLength: null,
     },
     realtime: {
       model: config.realtime.model,
@@ -1367,7 +1364,6 @@ function normalizeAgentSettingsPatch(value: unknown): Record<string, unknown> {
 
   move("codexModel", "codex", "model");
   move("codexAuthMode", "codex", "authMode");
-  move("codexApiKey", "codex", "apiKey");
 
   move("realtimeModel", "realtime", "model");
   move("realtimeVoice", "realtime", "voice");
@@ -1421,9 +1417,6 @@ async function resolveAgentSettingsConfig(args: {
 
 function buildAgentSettingsEnvPatch(config: AgentSettingsConfig): Record<string, string> {
   const envPatch: Record<string, string> = {};
-  if (config.codex.authMode === "api_key" && config.codex.apiKey) {
-    envPatch.OPENAI_API_KEY = config.codex.apiKey;
-  }
   if (config.git.enabled) {
     if (config.git.name) envPatch.GIT_AUTHOR_NAME = config.git.name;
     if (config.git.name) envPatch.GIT_COMMITTER_NAME = config.git.name;
@@ -1620,6 +1613,7 @@ async function startManagedRun(args: {
     userId: args.userId,
     taskId: args.runId,
     codexAuthBundle: args.codexAuthBundle,
+    runtimeEnvPatch: args.runtimeEnvPatch,
   });
   const child = spawnManagedCodexCommand({
     codexArgs: args.codexArgs,
@@ -1826,6 +1820,80 @@ async function runLocalCodexCli(args: string[], timeoutMs: number, envPatch?: Re
     child.stderr!.on("data", (chunk: string) => {
       stderr += chunk;
     });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      sendSignalToTaskProcess(child, "SIGTERM");
+      setTimeout(() => sendSignalToTaskProcess(child, "SIGKILL"), 1000);
+    }, Math.max(500, timeoutMs));
+
+    child.once("error", (error) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    child.once("exit", (code) => {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr, timedOut });
+    });
+  });
+}
+
+async function runLocalCodexCliWithInput(
+  args: string[],
+  input: string,
+  timeoutMs: number,
+  envPatch?: Record<string, string>,
+): Promise<{
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}> {
+  const command = buildLocalCodexCliCommand(args);
+  const workspaceRoot = workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...(envPatch ?? {}),
+    WORKSPACE: workspaceRoot,
+    CODEX_HOME: resolveCodexHomePath(),
+  };
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      cwd: workspaceRoot,
+      shell: resolveShellPath(),
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    let timedOut = false;
+
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr!.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    child.stdin?.write(input);
+    if (!input.endsWith("\n")) {
+      child.stdin?.write("\n");
+    }
+    child.stdin?.end();
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -2289,6 +2357,26 @@ async function startLocalCodexLogin(): Promise<{
   throw new Error(normalized || `Codex login failed with code ${result.code ?? "null"}`);
 }
 
+async function loginLocalCodexWithApiKey(apiKey: string): Promise<{
+  loggedIn: boolean;
+  output: string;
+  verificationUri: null;
+  userCode: null;
+}> {
+  const result = await runLocalCodexCliWithInput(["login", "--with-api-key"], apiKey, 15000);
+  const normalized = stripAnsi([result.stdout, result.stderr].filter(Boolean).join("\n")).trim();
+  if ((result.code ?? 1) !== 0) {
+    throw new Error(normalized || `Codex API key login failed with code ${result.code ?? "null"}`);
+  }
+  const status = await getLocalCodexLoginStatus().catch(() => null);
+  return {
+    loggedIn: status?.loggedIn === true,
+    output: status?.output || normalized || "Logged in",
+    verificationUri: null,
+    userCode: null,
+  };
+}
+
 async function logoutLocalCodexAuth(): Promise<{ loggedIn: false; output: string }> {
   if (pendingCodexDeviceAuth && pendingCodexDeviceAuth.child.exitCode === null) {
     sendSignalToTaskProcess(pendingCodexDeviceAuth.child, "SIGTERM");
@@ -2322,17 +2410,23 @@ function normalizeCodexAuthRpcRequest(args: {
 }): {
   requestId: string;
   responseSubject: string;
-  action: "start" | "status" | "logout";
+  action: "start" | "status" | "logout" | "login_api_key";
+  apiKey: string | null;
 } {
   const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
   const responseSubject = typeof args.request.responseSubject === "string" ? args.request.responseSubject.trim() : "";
   const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
   const actionRaw = typeof args.request.action === "string" ? args.request.action.trim() : "";
-  const action = actionRaw === "start" || actionRaw === "logout" ? actionRaw : "status";
+  const action: "start" | "status" | "logout" | "login_api_key" =
+    actionRaw === "start" || actionRaw === "logout" || actionRaw === "login_api_key" ? actionRaw : "status";
+  const apiKey = typeof args.request.apiKey === "string" && args.request.apiKey.trim() ? args.request.apiKey.trim() : null;
   if (!requestId || !responseSubject || !requestAgentId || requestAgentId !== args.agentId) {
     throw new Error("invalid codex auth rpc request");
   }
-  return { requestId, responseSubject, action };
+  if (action === "login_api_key" && !apiKey) {
+    throw new Error("api key is required");
+  }
+  return { requestId, responseSubject, action, apiKey };
 }
 
 function publishCodexAuthRpcResponse(args: {
@@ -2360,7 +2454,9 @@ async function handleCodexAuthRpcMessage(args: {
       | { loggedIn: boolean; output: string; verificationUri?: string | null; userCode?: string | null }
       | null = null;
 
-    if (request.action === "start") {
+    if (request.action === "login_api_key") {
+      result = await loginLocalCodexWithApiKey(request.apiKey ?? "");
+    } else if (request.action === "start") {
       const status = await getLocalCodexLoginStatus();
       if (status.loggedIn) {
         result = { loggedIn: true, output: status.output };
@@ -4438,16 +4534,18 @@ function normalizeShellRpcCodexAuthBundle(value: unknown): CodexAuthBundleRespon
   }
   const row = value as Record<string, unknown>;
   const authJson = typeof row.authJson === "string" ? row.authJson : null;
-  if (!authJson) {
+  const authMode = row.authMode === "oauth" ? "oauth" : row.authMode === "api_key" ? "api_key" : undefined;
+  const apiKey = typeof row.apiKey === "string" || row.apiKey === null ? row.apiKey : undefined;
+  if (!authJson && authMode !== "api_key" && apiKey === undefined) {
     return null;
   }
   return {
     taskId: typeof row.taskId === "string" ? row.taskId : undefined,
-    authMode: row.authMode === "oauth" ? "oauth" : row.authMode === "api_key" ? "api_key" : undefined,
+    authMode,
     issuedAt: typeof row.issuedAt === "string" ? row.issuedAt : undefined,
     expiresAt: typeof row.expiresAt === "string" ? row.expiresAt : undefined,
-    authJson,
-    apiKey: typeof row.apiKey === "string" || row.apiKey === null ? row.apiKey : undefined,
+    authJson: authJson ?? undefined,
+    apiKey,
   };
 }
 
@@ -4667,6 +4765,42 @@ async function checkCancelRequested(args: {
   return Boolean(response.task?.cancelRequested);
 }
 
+async function syncCodexAuthState(args: {
+  source: "agent_local" | "server_bundle";
+  authMode?: "api_key" | "oauth";
+  apiKey?: string | null;
+  authJson?: string | null;
+  issuedAt?: string | null;
+  expiresAt?: string | null;
+}): Promise<{
+  envPatch: Record<string, string>;
+  cleanup: () => Promise<void>;
+  meta: Record<string, unknown>;
+}> {
+  const envPatch: Record<string, string> = {};
+  const synced = false;
+
+  if (args.authMode === "api_key") {
+    if (args.apiKey) {
+      envPatch.OPENAI_API_KEY = args.apiKey;
+    }
+  }
+
+  return {
+    envPatch,
+    cleanup: async () => {},
+    meta: {
+      codexAuthSource: args.source,
+      codexAuthMode: args.authMode ?? null,
+      codexAuthHasApiKey: Boolean(args.apiKey),
+      codexAuthHasAuthJson: Boolean(args.authJson),
+      codexAuthIssuedAt: args.issuedAt ?? null,
+      codexAuthExpiresAt: args.expiresAt ?? null,
+      codexAuthSynced: synced,
+    },
+  };
+}
+
 async function prepareTaskCodexAuth(args: {
   serverBaseUrl: string;
   taskId: string;
@@ -4678,14 +4812,12 @@ async function prepareTaskCodexAuth(args: {
   meta: Record<string, unknown>;
 } | null> {
   void args;
-  return {
-    envPatch: {},
-    cleanup: async () => {},
-    meta: {
-      codexAuthSource: "agent_local",
-      codexAuthSynced: false,
-    },
-  };
+  return await syncCodexAuthState({
+    source: "agent_local",
+    authJson: null,
+    issuedAt: null,
+    expiresAt: null,
+  });
 }
 
 async function prepareCodexAuthBundle(bundle: CodexAuthBundleResponse | null): Promise<{
@@ -4693,15 +4825,17 @@ async function prepareCodexAuthBundle(bundle: CodexAuthBundleResponse | null): P
   cleanup: () => Promise<void>;
   meta: Record<string, unknown>;
 } | null> {
-  void bundle;
-  return {
-    envPatch: {},
-    cleanup: async () => {},
-    meta: {
-      codexAuthSource: "agent_local",
-      codexAuthSynced: false,
-    },
-  };
+  if (!bundle) {
+    return null;
+  }
+  return await syncCodexAuthState({
+    source: "server_bundle",
+    authMode: bundle.authMode,
+    apiKey: bundle.apiKey,
+    authJson: bundle.authJson ?? null,
+    issuedAt: bundle.issuedAt ?? null,
+    expiresAt: bundle.expiresAt ?? null,
+  });
 }
 
 async function prepareCommandExecution(args: {
@@ -4709,6 +4843,7 @@ async function prepareCommandExecution(args: {
   userId: string;
   taskId: string;
   codexAuthBundle: CodexAuthBundleResponse | null;
+  runtimeEnvPatch: Record<string, string>;
 }): Promise<{
   shellPath: string;
   taskWorkspace: string;
@@ -4729,6 +4864,7 @@ async function prepareCommandExecution(args: {
     DOER_USER_ID: args.userId,
     DOER_AGENT_TASK_ID: args.taskId,
     ...buildAgentSettingsEnvPatch(localAgentSettings),
+    ...args.runtimeEnvPatch,
     ...(codexAuth?.envPatch ?? {}),
     WORKSPACE: taskWorkspace,
   };
