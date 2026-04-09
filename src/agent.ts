@@ -1008,7 +1008,7 @@ async function resolveRunStartLockPath(args: { runId: string; sessionId?: string
   if (typeof args.sessionId === "string" && args.sessionId.trim()) {
     return path.join(dir, `session__${sanitizeRunLockSegment(args.sessionId)}.lock`);
   }
-  return path.join(dir, `run__${sanitizeRunLockSegment(args.runId)}.lock`);
+  return path.join(dir, "pending_new_session.lock");
 }
 
 async function claimRunStartSlot(args: { runId: string; sessionId?: string | null }): Promise<void> {
@@ -1509,35 +1509,131 @@ function publishImmediateRunChangedEvent(args: {
   );
 }
 
-function extractCodexSessionMetadata(value: string): { sessionId: string | null; sessionFilePath: string | null } {
-  try {
-    const parsed = JSON.parse(value) as { type?: unknown; payload?: unknown };
-    const lineType = typeof parsed.type === "string" ? parsed.type : "";
-    if (!parsed.payload || typeof parsed.payload !== "object" || Array.isArray(parsed.payload)) {
-      return { sessionId: null, sessionFilePath: null };
-    }
-    const payload = parsed.payload as Record<string, unknown>;
-    const sessionIdCandidate =
-      typeof payload.sessionId === "string" && payload.sessionId.trim()
-        ? payload.sessionId.trim()
-        : typeof payload.session_id === "string" && payload.session_id.trim()
-          ? payload.session_id.trim()
-          : typeof payload.id === "string" && payload.id.trim() && (lineType === "session_meta" || lineType === "session.started")
-            ? payload.id.trim()
-            : null;
-    const filePathCandidate =
-      typeof payload.rollout_path === "string" && payload.rollout_path.trim()
-        ? payload.rollout_path.trim()
-        : typeof payload.filePath === "string" && payload.filePath.trim()
-          ? payload.filePath.trim()
-          : null;
-    return {
-      sessionId: sessionIdCandidate,
-      sessionFilePath: filePathCandidate,
-    };
-  } catch {
-    return { sessionId: null, sessionFilePath: null };
+async function findSessionFilePathBySessionId(sessionId: string): Promise<string | null> {
+  const targetSessionId = sessionId.trim();
+  if (!targetSessionId) {
+    return null;
   }
+
+  let sessionsRootStat;
+  try {
+    sessionsRootStat = await stat(getSessionsRootPath());
+  } catch {
+    return null;
+  }
+  if (!sessionsRootStat.isDirectory()) {
+    return null;
+  }
+
+  const files = await collectSessionJsonlFiles(getSessionsRootPath());
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath));
+
+  for (const file of files) {
+    let fileHandle: Awaited<ReturnType<typeof open>> | null = null;
+    try {
+      fileHandle = await open(file.filePath, "r");
+      const entryStat = await fileHandle.stat();
+      const firstLine = await readFirstLine(fileHandle, entryStat.size);
+      if (!firstLine) {
+        continue;
+      }
+      const parsed = JSON.parse(firstLine) as Record<string, unknown>;
+      const candidateMeta =
+        parsed && parsed.type === "session_meta" && isObjectRecord(parsed.payload)
+          ? parsed.payload
+          : isObjectRecord(parsed.session_meta)
+            ? parsed.session_meta
+            : isObjectRecord(parsed.sessionMeta)
+              ? parsed.sessionMeta
+              : isObjectRecord(parsed.meta)
+                ? parsed.meta
+                : isObjectRecord(parsed.payload)
+                  ? parsed.payload
+                  : parsed;
+      const candidateId = pickSessionString(
+        candidateMeta.sessionId,
+        candidateMeta.session_id,
+        candidateMeta.id,
+      );
+      if (candidateId === targetSessionId) {
+        return file.filePath;
+      }
+    } catch {
+      // ignore malformed session files
+    } finally {
+      await fileHandle?.close().catch(() => undefined);
+    }
+  }
+
+  return null;
+}
+
+async function readSessionIdFromSessionFile(filePath: string): Promise<string | null> {
+  let fileHandle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    fileHandle = await open(filePath, "r");
+    const entryStat = await fileHandle.stat();
+    const firstLine = await readFirstLine(fileHandle, entryStat.size);
+    if (!firstLine) {
+      return null;
+    }
+    const parsed = JSON.parse(firstLine) as Record<string, unknown>;
+    const candidateMeta =
+      parsed && parsed.type === "session_meta" && isObjectRecord(parsed.payload)
+        ? parsed.payload
+        : isObjectRecord(parsed.session_meta)
+          ? parsed.session_meta
+          : isObjectRecord(parsed.sessionMeta)
+            ? parsed.sessionMeta
+            : isObjectRecord(parsed.meta)
+              ? parsed.meta
+              : isObjectRecord(parsed.payload)
+                ? parsed.payload
+                : parsed;
+    return pickSessionString(
+      candidateMeta.sessionId,
+      candidateMeta.session_id,
+      candidateMeta.id,
+    );
+  } catch {
+    return null;
+  } finally {
+    await fileHandle?.close().catch(() => undefined);
+  }
+}
+
+async function detectPendingRunSession(knownFilePaths: Set<string>): Promise<{
+  sessionId: string;
+  sessionFilePath: string;
+} | null> {
+  const sessionsRoot = getSessionsRootPath();
+  let sessionsRootStat;
+  try {
+    sessionsRootStat = await stat(sessionsRoot);
+  } catch {
+    return null;
+  }
+  if (!sessionsRootStat.isDirectory()) {
+    return null;
+  }
+
+  const files = await collectSessionJsonlFiles(sessionsRoot);
+  files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.filePath.localeCompare(b.filePath));
+  for (const file of files) {
+    if (knownFilePaths.has(file.filePath)) {
+      continue;
+    }
+    const sessionId = await readSessionIdFromSessionFile(file.filePath);
+    if (!sessionId) {
+      continue;
+    }
+    knownFilePaths.add(file.filePath);
+    return {
+      sessionId,
+      sessionFilePath: file.filePath,
+    };
+  }
+  return null;
 }
 
 async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
@@ -1554,6 +1650,13 @@ async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
   if (!task.sessionFilePath && typeof metadata.sessionFilePath === "string" && metadata.sessionFilePath.trim()) {
     task.sessionFilePath = metadata.sessionFilePath.trim();
     changed = true;
+  }
+  if (!task.sessionFilePath && task.sessionId) {
+    const resolvedSessionFilePath = await findSessionFilePathBySessionId(task.sessionId).catch(() => null);
+    if (resolvedSessionFilePath) {
+      task.sessionFilePath = resolvedSessionFilePath;
+      changed = true;
+    }
   }
   if (!changed) {
     return;
@@ -1698,30 +1801,49 @@ async function startManagedRun(args: {
     finishedAt: null,
   };
 
-  let stdoutBuffer = "";
-  const recordChunk = (stream: "stdout" | "stderr", chunk: string) => {
-    writeRunStream(task.id, stream, chunk);
-    if (stream !== "stdout" || (task.sessionId && task.sessionFilePath)) {
+  let pendingSessionPollClosed = false;
+  let pendingSessionPollTimer: ReturnType<typeof setInterval> | null = null;
+  const knownPendingSessionFiles = new Set<string>();
+  const stopPendingSessionPoll = () => {
+    pendingSessionPollClosed = true;
+    if (pendingSessionPollTimer) {
+      clearInterval(pendingSessionPollTimer);
+      pendingSessionPollTimer = null;
+    }
+  };
+  const pollPendingSession = async () => {
+    if (pendingSessionPollClosed || task.sessionId) {
+      stopPendingSessionPoll();
       return;
     }
-    stdoutBuffer += chunk;
-    const lines = stdoutBuffer.split(/\r?\n/);
-    stdoutBuffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        continue;
-      }
-      const metadata = extractCodexSessionMetadata(trimmed);
-      if (metadata.sessionId || metadata.sessionFilePath) {
-        void updateRunSessionMetadata(task, { ...metadata, nc: args.nc });
-      }
+    const detected = await detectPendingRunSession(knownPendingSessionFiles).catch(() => null);
+    if (!detected) {
+      return;
+    }
+    await updateRunSessionMetadata(task, {
+      sessionId: detected.sessionId,
+      sessionFilePath: detected.sessionFilePath,
+      nc: args.nc,
+    }).catch(() => undefined);
+    if (task.sessionId) {
+      stopPendingSessionPoll();
     }
   };
 
-  child.stdout!.on("data", (chunk: string) => recordChunk("stdout", chunk));
-  child.stderr!.on("data", (chunk: string) => recordChunk("stderr", chunk));
+  if (!task.sessionId) {
+    const existingFiles = await collectSessionJsonlFiles(getSessionsRootPath()).catch(() => []);
+    for (const file of existingFiles) {
+      knownPendingSessionFiles.add(file.filePath);
+    }
+    pendingSessionPollTimer = setInterval(() => {
+      void pollPendingSession();
+    }, 1000);
+  }
+
+  child.stdout!.on("data", (chunk: string) => writeRunStream(task.id, "stdout", chunk));
+  child.stderr!.on("data", (chunk: string) => writeRunStream(task.id, "stderr", chunk));
   child.once("error", (error) => {
+    stopPendingSessionPoll();
     const message = error instanceof Error ? error.message : String(error);
     task.status = "failed";
     task.error = message;
@@ -1734,12 +1856,7 @@ async function startManagedRun(args: {
     writeRunStatus(task.id, `failed error=${message}`);
   });
   child.once("close", async (code, signal) => {
-    if (stdoutBuffer.trim() && (!task.sessionId || !task.sessionFilePath)) {
-      const metadata = extractCodexSessionMetadata(stdoutBuffer.trim());
-      if (metadata.sessionId || metadata.sessionFilePath) {
-        void updateRunSessionMetadata(task, { ...metadata, nc: args.nc });
-      }
-    }
+    stopPendingSessionPoll();
     const latest = await getStoredRun(task.id).catch(() => null);
     if (latest?.cancelRequested) {
       task.cancelRequested = true;
@@ -1761,6 +1878,9 @@ async function startManagedRun(args: {
   void persistRunTask(task).catch(() => undefined);
   publishImmediateRunChangedEvent({ nc: args.nc, userId: task.userId, task });
   writeRunStatus(task.id, `started requestId=${args.requestId} cwd=${prepared.taskWorkspace}`);
+  if (!task.sessionId) {
+    void pollPendingSession();
+  }
   return cloneRunTask(task);
 }
 
@@ -1791,8 +1911,8 @@ function buildManagedCodexArgs(args: {
     "--model",
     args.model,
     ...(args.sessionId
-    ? ["exec", "resume", "--json", ...imageArgs, args.sessionId, ...promptArgs]
-    : ["exec", "--json", ...imageArgs, ...promptArgs]),
+      ? ["exec", "resume", "--json", ...imageArgs, args.sessionId, ...promptArgs]
+      : ["exec", "--json", ...imageArgs, ...promptArgs]),
   ];
 }
 
