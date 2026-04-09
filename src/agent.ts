@@ -394,6 +394,21 @@ interface PublicRunTask {
   finishedAt: string | null;
 }
 
+interface ImmediateRunChangedEvent {
+  type: "run.changed";
+  agentId: string;
+  sessionId: string | null;
+  filePath: string | null;
+  runId: string;
+  updatedAt: string;
+  status: PublicRunTask["status"];
+  cancelRequested: boolean;
+  resultExitCode: number | null;
+  resultSignal: string | null;
+  error: string | null;
+  finishedAt: string | null;
+}
+
 interface ActiveTaskLogContext {
   jetstream: AgentJetStreamContext;
   serverBaseUrl: string;
@@ -410,6 +425,7 @@ const codexAuthRpcCodec = StringCodec();
 const settingsRpcCodec = StringCodec();
 const gitRpcCodec = StringCodec();
 const skillRpcCodec = StringCodec();
+const runEventsCodec = StringCodec();
 const retainedRuns = new Map<string, PublicRunTask>();
 const activeSessionWatchers = new Map<string, () => void>();
 const sessionLineIndexCache = new Map<string, SessionLineIndexCacheEntry>();
@@ -429,6 +445,10 @@ function sanitizeUserId(userId: string): string {
 
 function buildAgentRunRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.run.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+function buildAgentRunEventsSubject(userId: string, agentId: string): string {
+  return `doer.agent.run.events.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 function buildAgentSessionRpcSubject(userId: string, agentId: string): string {
@@ -1461,6 +1481,34 @@ function cloneRunTask(task: PublicRunTask, _sinceSeq?: number | null): PublicRun
   };
 }
 
+function buildImmediateRunChangedEvent(task: PublicRunTask): ImmediateRunChangedEvent {
+  return {
+    type: "run.changed",
+    agentId: task.agentId,
+    sessionId: task.sessionId,
+    filePath: task.sessionFilePath,
+    runId: task.id,
+    updatedAt: task.updatedAt,
+    status: task.status,
+    cancelRequested: task.cancelRequested,
+    resultExitCode: task.resultExitCode,
+    resultSignal: task.resultSignal,
+    error: task.error,
+    finishedAt: task.finishedAt,
+  };
+}
+
+function publishImmediateRunChangedEvent(args: {
+  nc: NatsConnection;
+  userId: string;
+  task: PublicRunTask;
+}): void {
+  args.nc.publish(
+    buildAgentRunEventsSubject(args.userId, args.task.agentId),
+    runEventsCodec.encode(JSON.stringify(buildImmediateRunChangedEvent(args.task))),
+  );
+}
+
 function extractCodexSessionMetadata(value: string): { sessionId: string | null; sessionFilePath: string | null } {
   try {
     const parsed = JSON.parse(value) as { type?: unknown; payload?: unknown };
@@ -1495,6 +1543,7 @@ function extractCodexSessionMetadata(value: string): { sessionId: string | null;
 async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
   sessionId?: string | null;
   sessionFilePath?: string | null;
+  nc?: NatsConnection | null;
 }): Promise<void> {
   let changed = false;
   const previousSessionId = task.sessionId;
@@ -1511,6 +1560,13 @@ async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
   }
   task.updatedAt = formatLocalTimestamp();
   await persistRunTask(task).catch(() => undefined);
+  if (metadata.nc) {
+    publishImmediateRunChangedEvent({
+      nc: metadata.nc,
+      userId: task.userId,
+      task,
+    });
+  }
   if (!previousSessionId && task.sessionId) {
     await updateRunStartSlotSession({
       runId: task.id,
@@ -1601,6 +1657,7 @@ async function startManagedRun(args: {
   serverBaseUrl: string;
   userId: string;
   agentId: string;
+  nc: NatsConnection;
   sessionId?: string | null;
   codexArgs: string[];
   cwd: string | null;
@@ -1657,7 +1714,7 @@ async function startManagedRun(args: {
       }
       const metadata = extractCodexSessionMetadata(trimmed);
       if (metadata.sessionId || metadata.sessionFilePath) {
-        void updateRunSessionMetadata(task, metadata);
+        void updateRunSessionMetadata(task, { ...metadata, nc: args.nc });
       }
     }
   };
@@ -1670,6 +1727,7 @@ async function startManagedRun(args: {
     task.error = message;
     task.finishedAt = formatLocalTimestamp();
     persistRetainedRun(task);
+    publishImmediateRunChangedEvent({ nc: args.nc, userId: task.userId, task });
     void removeRunTask(task.id).catch(() => undefined);
     void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
@@ -1679,7 +1737,7 @@ async function startManagedRun(args: {
     if (stdoutBuffer.trim() && (!task.sessionId || !task.sessionFilePath)) {
       const metadata = extractCodexSessionMetadata(stdoutBuffer.trim());
       if (metadata.sessionId || metadata.sessionFilePath) {
-        void updateRunSessionMetadata(task, metadata);
+        void updateRunSessionMetadata(task, { ...metadata, nc: args.nc });
       }
     }
     const latest = await getStoredRun(task.id).catch(() => null);
@@ -1692,6 +1750,7 @@ async function startManagedRun(args: {
     task.status = task.cancelRequested ? "canceled" : (task.resultExitCode ?? 1) === 0 ? "completed" : "failed";
     task.error = task.status === "failed" ? `Command exited with code ${task.resultExitCode ?? "null"}` : null;
     persistRetainedRun(task);
+    publishImmediateRunChangedEvent({ nc: args.nc, userId: task.userId, task });
     void removeRunTask(task.id).catch(() => undefined);
     void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
@@ -1700,6 +1759,7 @@ async function startManagedRun(args: {
 
   persistRetainedRun(task);
   void persistRunTask(task).catch(() => undefined);
+  publishImmediateRunChangedEvent({ nc: args.nc, userId: task.userId, task });
   writeRunStatus(task.id, `started requestId=${args.requestId} cwd=${prepared.taskWorkspace}`);
   return cloneRunTask(task);
 }
@@ -2934,6 +2994,7 @@ async function handleRunRpcMessage(args: {
           serverBaseUrl: args.serverBaseUrl,
           userId: args.userId,
           agentId: args.agentId,
+          nc: args.jetstream.nc,
           sessionId: request.sessionId,
           codexArgs: buildManagedCodexArgs({
             prompt: request.prompt ?? "",
@@ -2985,6 +3046,7 @@ async function handleRunRpcMessage(args: {
       target.cancelRequested = true;
       target.updatedAt = formatLocalTimestamp();
       await persistRunTask(target);
+      publishImmediateRunChangedEvent({ nc: args.jetstream.nc, userId: target.userId, task: target });
       writeRunStatus(target.id, `cancel requested pid=${target.processPid}`);
       sendSignalToPid(target.processPid, "SIGINT");
       const task = cloneRunTask(target);
