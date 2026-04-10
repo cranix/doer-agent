@@ -1954,8 +1954,8 @@ function buildManagedCodexArgs(args: {
     "--model",
     args.model,
     ...(args.sessionId
-      ? ["exec", "resume", "--json", ...imageArgs, args.sessionId, ...promptArgs]
-      : ["exec", "--json", ...imageArgs, ...promptArgs]),
+      ? ["exec", "resume", ...imageArgs, args.sessionId, ...promptArgs]
+      : ["exec", ...imageArgs, ...promptArgs]),
   ];
 }
 
