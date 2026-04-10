@@ -180,10 +180,11 @@ interface AgentCodexAuthRpcResponse {
 }
 
 type AgentSettingsRpcAction = "get" | "update";
+type CodexPersonality = "friendly" | "pragmatic";
 
 interface AgentSettingsConfig {
   general: {
-    firstTurnPrompt: string | null;
+    personality: CodexPersonality;
   };
   codex: {
     model: string;
@@ -238,7 +239,8 @@ interface AgentSettingsConfig {
 
 interface AgentSettingsPublic {
   general: {
-    firstTurnPrompt: string | null;
+    personality: CodexPersonality;
+    customInstructions: string | null;
   };
   codex: {
     model: string;
@@ -1102,10 +1104,14 @@ function resolveAgentSettingsFilePath(): string {
   return path.join(resolveAgentSettingsDir(), "config.json");
 }
 
+function resolveAgentModelInstructionsFilePath(): string {
+  return path.join(resolveAgentSettingsDir(), "model-instructions.md");
+}
+
 function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
   return {
     general: {
-      firstTurnPrompt: null,
+      personality: "pragmatic",
     },
     codex: {
       model: "gpt-5.4",
@@ -1170,6 +1176,10 @@ function normalizeNullableString(value: unknown): string | null {
   return trimmed ? trimmed : null;
 }
 
+function normalizeCodexPersonality(value: unknown, fallback: CodexPersonality): CodexPersonality {
+  return value === "friendly" || value === "pragmatic" ? value : fallback;
+}
+
 function normalizeAgentSettingsConfig(value: unknown, fallback?: AgentSettingsConfig | null): AgentSettingsConfig {
   const base = fallback ?? createDefaultAgentSettingsConfig();
   const raw = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -1184,7 +1194,7 @@ function normalizeAgentSettingsConfig(value: unknown, fallback?: AgentSettingsCo
   const figma = raw.figma && typeof raw.figma === "object" ? (raw.figma as Record<string, unknown>) : {};
   return {
     general: {
-      firstTurnPrompt: normalizeNullableString(general.firstTurnPrompt) ?? base.general.firstTurnPrompt,
+      personality: normalizeCodexPersonality(general.personality, base.general.personality),
     },
     codex: {
       model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
@@ -1258,6 +1268,22 @@ async function writeAgentSettingsConfig(config: AgentSettingsConfig): Promise<vo
   await writeFile(resolveAgentSettingsFilePath(), `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
+async function readAgentModelInstructions(): Promise<string | null> {
+  const raw = await readFile(resolveAgentModelInstructionsFilePath(), "utf8").catch(() => "");
+  return raw.trim() ? raw : null;
+}
+
+async function writeAgentModelInstructions(value: string | null): Promise<void> {
+  const filePath = resolveAgentModelInstructionsFilePath();
+  const nextValue = typeof value === "string" ? value.trim() : "";
+  if (!nextValue) {
+    await unlink(filePath).catch(() => undefined);
+    return;
+  }
+  await mkdir(resolveAgentSettingsDir(), { recursive: true });
+  await writeFile(filePath, value ?? "", "utf8");
+}
+
 function maskSecretPreview(secret: string): string {
   if (secret.length <= 6) {
     return `${secret.slice(0, 1)}***${secret.slice(-1)}`;
@@ -1272,7 +1298,7 @@ function toMaskedSecret(value: string | null): { has: boolean; masked: string | 
   return { has: true, masked: maskSecretPreview(value), length: value.length };
 }
 
-function toAgentSettingsPublic(config: AgentSettingsConfig): AgentSettingsPublic {
+async function toAgentSettingsPublic(config: AgentSettingsConfig): Promise<AgentSettingsPublic> {
   const realtimeKey = toMaskedSecret(config.realtime.apiKey);
   const gitOauth = toMaskedSecret(config.git.oauthToken);
   const awsSecret = toMaskedSecret(config.aws.secretAccessKey);
@@ -1281,9 +1307,11 @@ function toAgentSettingsPublic(config: AgentSettingsConfig): AgentSettingsPublic
   const notionToken = toMaskedSecret(config.notion.apiToken);
   const slackToken = toMaskedSecret(config.slack.botToken);
   const figmaToken = toMaskedSecret(config.figma.apiToken);
+  const customInstructions = await readAgentModelInstructions();
   return {
     general: {
-      firstTurnPrompt: config.general.firstTurnPrompt,
+      personality: config.general.personality,
+      customInstructions,
     },
     codex: {
       model: config.codex.model,
@@ -1380,7 +1408,7 @@ function normalizeAgentSettingsPatch(value: unknown): Record<string, unknown> {
     delete patch[flatKey];
   };
 
-  move("firstTurnPrompt", "general", "firstTurnPrompt");
+  move("personality", "general", "personality");
 
   move("codexModel", "codex", "model");
   move("codexAuthMode", "codex", "authMode");
@@ -1897,17 +1925,30 @@ function normalizeCodexModel(value: unknown): string {
   return normalized || "gpt-5.4";
 }
 
+function toTomlStringLiteral(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 function buildManagedCodexArgs(args: {
   prompt: string;
   imagePaths: string[];
   sessionId: string | null;
   model: string;
+  personality?: CodexPersonality | null;
+  modelInstructionsFile?: string | null;
 }): string[] {
   const promptArgs = ["--", args.prompt];
   const fixedArgs = ["--dangerously-bypass-approvals-and-sandbox"];
+  const configArgs = [
+    ...(args.personality ? ["--config", `personality=${toTomlStringLiteral(args.personality)}`] : []),
+    ...(args.modelInstructionsFile
+      ? ["--config", `model_instructions_file=${toTomlStringLiteral(args.modelInstructionsFile)}`]
+      : []),
+  ];
   const imageArgs = args.imagePaths.flatMap((imagePath) => ["--image", imagePath]);
   return [
     ...fixedArgs,
+    ...configArgs,
     "--model",
     args.model,
     ...(args.sessionId
@@ -2375,6 +2416,15 @@ async function handleSettingsRpcMessage(args: {
     const next = request.action === "update" ? normalizeAgentSettingsConfig(request.patch, existing) : existing;
     if (request.action === "update") {
       await writeAgentSettingsConfig(next);
+      const customInstructions =
+        typeof request.patch.customInstructions === "string"
+          ? request.patch.customInstructions
+          : request.patch.customInstructions === null
+            ? null
+            : undefined;
+      if (customInstructions !== undefined) {
+        await writeAgentModelInstructions(customInstructions);
+      }
     } else if (request.defaults) {
       const filePath = resolveAgentSettingsFilePath();
       const raw = await readFile(filePath, "utf8").catch(() => "");
@@ -2388,7 +2438,7 @@ async function handleSettingsRpcMessage(args: {
       payload: {
         requestId,
         ok: true,
-        settings: toAgentSettingsPublic(next),
+        settings: await toAgentSettingsPublic(next),
       },
     });
   } catch (error) {
@@ -3108,6 +3158,8 @@ async function handleRunRpcMessage(args: {
       const runId = request.runId ?? requestId;
       await claimRunStartSlot({ runId, sessionId: request.sessionId });
       try {
+        const localAgentSettings = await readAgentSettingsConfig(null);
+        const customInstructions = await readAgentModelInstructions();
         const task = await startManagedRun({
           requestId,
           runId,
@@ -3121,6 +3173,8 @@ async function handleRunRpcMessage(args: {
             imagePaths: request.imagePaths,
             sessionId: request.sessionId,
             model: request.model,
+            personality: localAgentSettings.general.personality,
+            modelInstructionsFile: customInstructions ? resolveAgentModelInstructionsFilePath() : null,
           }),
           cwd: request.cwd,
           runtimeEnvPatch: request.runtimeEnvPatch,
