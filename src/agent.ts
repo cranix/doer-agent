@@ -45,6 +45,8 @@ const DEFAULT_SERVER_BASE_URL = "https://doer.cranix.net";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 const AGENT_PACKAGE_JSON_PATH = path.join(AGENT_PROJECT_DIR, "package.json");
+const HEARTBEAT_INTERVAL_MS = 5_000;
+const HEARTBEAT_FAILURE_THRESHOLD = 3;
 
 type AgentEventType = "stdout" | "stderr" | "status" | "meta";
 
@@ -4915,11 +4917,13 @@ function persistEventOrFatal(args: {
   })();
 }
 
-async function heartbeatAgent(args: {
+async function heartbeatAgentSession(args: {
+  nc: NatsConnection;
   serverBaseUrl: string;
   userId: string;
   agentToken: string;
 }): Promise<void> {
+  await args.nc.flush();
   await postJson<{ ok?: boolean }>(`${args.serverBaseUrl}/api/agent/heartbeat`, {
     userId: args.userId,
     agentToken: args.agentToken,
@@ -5474,23 +5478,47 @@ async function main() {
       );
     }
 
-    let heartbeatHealthy: boolean | null = null;
+    let heartbeatFailures = 0;
+    let heartbeatInFlight = false;
+    let sessionInvalidated = false;
+    const invalidateAgentSession = (reason: string) => {
+      if (sessionInvalidated) {
+        return;
+      }
+      sessionInvalidated = true;
+      writeAgentInfraError(`closing nats session: ${reason}`);
+      void jetstream.nc.close().catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentInfraError(`failed to close nats session: ${message}`);
+      });
+    };
     const heartbeatTimer = setInterval(() => {
-      void heartbeatAgent({ serverBaseUrl, userId, agentToken })
+      if (heartbeatInFlight || sessionInvalidated) {
+        return;
+      }
+      heartbeatInFlight = true;
+      void heartbeatAgentSession({ nc: jetstream.nc, serverBaseUrl, userId, agentToken })
         .then(() => {
-          if (heartbeatHealthy === false) {
+          heartbeatInFlight = false;
+          if (heartbeatFailures > 0) {
             writeAgentInfraError(`heartbeat reconnected at=${formatLocalTimestamp()}`);
           }
-          heartbeatHealthy = true;
+          heartbeatFailures = 0;
         })
         .catch((error) => {
+          heartbeatInFlight = false;
           const message = error instanceof Error ? error.message : String(error);
-          if (heartbeatHealthy !== false) {
-            writeAgentInfraError(`heartbeat failed: ${message}`);
+          heartbeatFailures += 1;
+          if (heartbeatFailures > 1) {
+            writeAgentInfraError(
+              `heartbeat failed: ${message} (count=${heartbeatFailures}/${HEARTBEAT_FAILURE_THRESHOLD})`,
+            );
           }
-          heartbeatHealthy = false;
+          if (heartbeatFailures >= HEARTBEAT_FAILURE_THRESHOLD) {
+            invalidateAgentSession(`heartbeat failure threshold reached at=${formatLocalTimestamp()}`);
+          }
         });
-    }, 10_000);
+    }, HEARTBEAT_INTERVAL_MS);
 
     subscribeToFsRpc({
       jetstream,
