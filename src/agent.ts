@@ -398,8 +398,8 @@ interface PublicRunTask {
   finishedAt: string | null;
 }
 
-interface ImmediateRunChangedEvent {
-  type: "run.changed";
+interface ImmediateRunEvent {
+  type: "run.changed" | "run.finished";
   agentId: string;
   sessionId: string | null;
   filePath: string | null;
@@ -430,7 +430,6 @@ const settingsRpcCodec = StringCodec();
 const gitRpcCodec = StringCodec();
 const skillRpcCodec = StringCodec();
 const runEventsCodec = StringCodec();
-const retainedRuns = new Map<string, PublicRunTask>();
 const activeSessionWatchers = new Map<string, () => void>();
 const sessionLineIndexCache = new Map<string, SessionLineIndexCacheEntry>();
 const ANSI_RE = /\u001b\[[0-9;]*m/g;
@@ -1511,9 +1510,9 @@ function cloneRunTask(task: PublicRunTask, _sinceSeq?: number | null): PublicRun
   };
 }
 
-function buildImmediateRunChangedEvent(task: PublicRunTask): ImmediateRunChangedEvent {
+function buildImmediateRunEvent(task: PublicRunTask, type: ImmediateRunEvent["type"]): ImmediateRunEvent {
   return {
-    type: "run.changed",
+    type,
     agentId: task.agentId,
     sessionId: task.sessionId,
     filePath: task.sessionFilePath,
@@ -1528,14 +1527,15 @@ function buildImmediateRunChangedEvent(task: PublicRunTask): ImmediateRunChanged
   };
 }
 
-function publishImmediateRunChangedEvent(args: {
+function publishImmediateRunEvent(args: {
   nc: NatsConnection;
   userId: string;
   task: PublicRunTask;
+  type?: ImmediateRunEvent["type"];
 }): void {
   args.nc.publish(
     buildAgentRunEventsSubject(args.userId, args.task.agentId),
-    runEventsCodec.encode(JSON.stringify(buildImmediateRunChangedEvent(args.task))),
+    runEventsCodec.encode(JSON.stringify(buildImmediateRunEvent(args.task, args.type ?? "run.changed"))),
   );
 }
 
@@ -1694,7 +1694,7 @@ async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
   task.updatedAt = formatLocalTimestamp();
   await persistRunTask(task).catch(() => undefined);
   if (metadata.nc) {
-    publishImmediateRunChangedEvent({
+    publishImmediateRunEvent({
       nc: metadata.nc,
       userId: task.userId,
       task,
@@ -1707,10 +1707,6 @@ async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
       sessionId: task.sessionId,
     }).catch(() => undefined);
   }
-}
-
-function persistRetainedRun(task: PublicRunTask): void {
-  retainedRuns.set(task.id, cloneRunTask(task));
 }
 
 function normalizePersistedRunTask(value: unknown): PublicRunTask | null {
@@ -1778,10 +1774,10 @@ async function getStoredRun(runId: string): Promise<PublicRunTask | null> {
         return parsed;
       }
     } catch {
-      // Ignore malformed persisted state and fall back to retained memory.
+      // Ignore malformed persisted state.
     }
   }
-  return retainedRuns.get(runId) ?? null;
+  return null;
 }
 
 async function startManagedRun(args: {
@@ -1878,8 +1874,8 @@ async function startManagedRun(args: {
     task.status = "failed";
     task.error = message;
     task.finishedAt = formatLocalTimestamp();
-    persistRetainedRun(task);
-    publishImmediateRunChangedEvent({ nc: args.nc, userId: task.userId, task });
+    publishImmediateRunEvent({ nc: args.nc, userId: task.userId, task });
+    publishImmediateRunEvent({ nc: args.nc, userId: task.userId, task, type: "run.finished" });
     void removeRunTask(task.id).catch(() => undefined);
     void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
@@ -1896,17 +1892,16 @@ async function startManagedRun(args: {
     task.finishedAt = formatLocalTimestamp();
     task.status = task.cancelRequested ? "canceled" : (task.resultExitCode ?? 1) === 0 ? "completed" : "failed";
     task.error = task.status === "failed" ? `Command exited with code ${task.resultExitCode ?? "null"}` : null;
-    persistRetainedRun(task);
-    publishImmediateRunChangedEvent({ nc: args.nc, userId: task.userId, task });
+    publishImmediateRunEvent({ nc: args.nc, userId: task.userId, task });
+    publishImmediateRunEvent({ nc: args.nc, userId: task.userId, task, type: "run.finished" });
     void removeRunTask(task.id).catch(() => undefined);
     void releaseRunStartSlot({ runId: task.id, sessionId: task.sessionId }).catch(() => undefined);
     void prepared.codexAuthCleanup().catch(() => undefined);
     writeRunStatus(task.id, `completed status=${task.status} exitCode=${task.resultExitCode ?? "null"} signal=${task.resultSignal ?? "null"}`);
   });
 
-  persistRetainedRun(task);
   void persistRunTask(task).catch(() => undefined);
-  publishImmediateRunChangedEvent({ nc: args.nc, userId: task.userId, task });
+  publishImmediateRunEvent({ nc: args.nc, userId: task.userId, task });
   writeRunStatus(task.id, `started requestId=${args.requestId} cwd=${prepared.taskWorkspace}`);
   if (!task.sessionId) {
     void pollPendingSession();
@@ -3192,17 +3187,8 @@ async function handleRunRpcMessage(args: {
     }
 
     if (request.action === "list") {
-      const persisted = await listPersistedRunTasks();
-      const mergedById = new Map<string, PublicRunTask>();
-      for (const task of persisted) {
-        mergedById.set(task.id, cloneRunTask(task));
-      }
-      for (const task of retainedRuns.values()) {
-        if (!mergedById.has(task.id)) {
-          mergedById.set(task.id, cloneRunTask(task));
-        }
-      }
-      const merged = [...mergedById.values()]
+      const merged = (await listPersistedRunTasks())
+        .map((task) => cloneRunTask(task))
         .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
         .slice(0, request.limit);
       publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, tasks: merged } });
@@ -3222,7 +3208,7 @@ async function handleRunRpcMessage(args: {
       target.cancelRequested = true;
       target.updatedAt = formatLocalTimestamp();
       await persistRunTask(target);
-      publishImmediateRunChangedEvent({ nc: args.jetstream.nc, userId: target.userId, task: target });
+      publishImmediateRunEvent({ nc: args.jetstream.nc, userId: target.userId, task: target });
       writeRunStatus(target.id, `cancel requested pid=${target.processPid}`);
       sendSignalToPid(target.processPid, "SIGINT");
       const task = cloneRunTask(target);
