@@ -318,11 +318,14 @@ async function executeFsRpc(args: {
       throw new Error("downloadPath is required");
     }
     const downloadUrl = new URL(downloadPath, `${args.serverBaseUrl}/`).toString();
+    const serverOrigin = new URL(args.serverBaseUrl).origin;
+    const headers: Record<string, string> = {};
+    if (new URL(downloadUrl).origin === serverOrigin) {
+      headers.Authorization = `Bearer ${args.agentToken}`;
+    }
     const response = await fetch(downloadUrl, {
       method: "GET",
-      headers: {
-        Authorization: `Bearer ${args.agentToken}`,
-      },
+      headers,
     });
     if (!response.ok) {
       const text = await response.text().catch(() => "");
