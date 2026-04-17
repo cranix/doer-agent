@@ -1,6 +1,6 @@
 {
   "name": "doer-agent",
-  "version": "0.4.4",
+  "version": "0.4.6",
   "description": "Reverse-polling agent runtime for doer",
   "type": "module",
   "main": "dist/agent.js",
@@ -26,7 +26,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@openai/codex-sdk": "^0.115.0",
-    "nats": "^2.29.3"
+    "nats": "^2.29.3",
+    "tar": "^7.5.13"
   },
   "devDependencies": {
     "@types/node": "^20",

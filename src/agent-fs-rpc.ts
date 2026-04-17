@@ -1,7 +1,8 @@
 import path from "node:path";
-import { gunzipSync, gzipSync } from "node:zlib";
-import { mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import crypto from "node:crypto";
 import { StringCodec, type Msg } from "nats";
+import { create as createTar, extract as extractTar } from "tar";
 
 const fsRpcCodec = StringCodec();
 
@@ -10,8 +11,7 @@ export type AgentFsRpcAction =
   | "stat"
   | "upload_file"
   | "read_text"
-  | "read_file"
-  | "write_file"
+  | "write_text"
   | "download_file"
   | "delete_path"
   | "archive_dir"
@@ -21,12 +21,11 @@ export interface AgentFsRpcRequest {
   requestId?: unknown;
   action?: unknown;
   path?: unknown;
-  contentBase64?: unknown;
+  text?: unknown;
   downloadPath?: unknown;
   offset?: unknown;
   length?: unknown;
   limit?: unknown;
-  maxBytes?: unknown;
   encoding?: unknown;
   uploadUrl?: unknown;
   uploadMode?: unknown;
@@ -37,12 +36,6 @@ export interface AgentFsRpcRequest {
   agentId?: unknown;
   archivePath?: unknown;
   destinationPath?: unknown;
-}
-
-interface ArchivedFileEntry {
-  relPath: string;
-  contentBase64: string;
-  sizeBytes: number;
 }
 
 function normalizeFsRpcPath(workspaceRoot: string, rawPath: unknown): { abs: string; formatPath: (target: string) => string } {
@@ -69,8 +62,7 @@ function parseFsRpcAction(value: unknown): AgentFsRpcAction {
     value === "stat" ||
     value === "upload_file" ||
     value === "read_text" ||
-    value === "read_file" ||
-    value === "write_file" ||
+    value === "write_text" ||
     value === "download_file" ||
     value === "delete_path" ||
     value === "archive_dir" ||
@@ -136,34 +128,21 @@ function inferMimeType(filePath: string): string {
   return "application/octet-stream";
 }
 
-function normalizeArchiveRelativePath(value: string): string {
-  const normalized = value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-  if (!normalized || normalized.includes("..")) {
-    throw new Error("invalid archive entry path");
-  }
-  return normalized;
+function sha256Hex(bytes: Uint8Array): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
-async function collectDirectoryFiles(absDir: string, rootDir = absDir): Promise<ArchivedFileEntry[]> {
-  const rows = await readdir(absDir, { withFileTypes: true });
-  const files: ArchivedFileEntry[] = [];
-  for (const row of rows.sort((a, b) => a.name.localeCompare(b.name))) {
-    const child = path.join(absDir, row.name);
-    if (row.isDirectory()) {
-      files.push(...await collectDirectoryFiles(child, rootDir));
-      continue;
-    }
-    if (!row.isFile()) {
-      continue;
-    }
-    const bytes = await readFile(child);
-    files.push({
-      relPath: normalizeArchiveRelativePath(path.relative(rootDir, child)),
-      contentBase64: Buffer.from(bytes).toString("base64"),
-      sizeBytes: bytes.byteLength,
-    });
+async function createTarGzipBuffer(cwd: string, entries: string[]): Promise<Buffer> {
+  const stream = createTar({
+    cwd,
+    gzip: true,
+    portable: true,
+  }, entries);
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
-  return files;
+  return Buffer.concat(chunks);
 }
 
 async function executeFsRpc(args: {
@@ -228,13 +207,17 @@ async function executeFsRpc(args: {
       throw new Error("archivePath is required");
     }
     const archiveTarget = normalizeFsRpcPath(args.workspaceRoot, rawArchivePath);
-    const files = await collectDirectoryFiles(abs);
-    if (!files.some((file) => file.relPath === "SKILL.md")) {
+    try {
+      const manifestEntry = await stat(path.join(abs, "SKILL.md"));
+      if (!manifestEntry.isFile()) {
+        throw new Error("Selected skill directory must contain SKILL.md");
+      }
+    } catch {
       throw new Error("Selected skill directory must contain SKILL.md");
     }
-    const payload = gzipSync(Buffer.from(JSON.stringify({ files }), "utf8"));
     await mkdir(path.dirname(archiveTarget.abs), { recursive: true });
-    await writeFile(archiveTarget.abs, payload);
+    const archiveBytes = await createTarGzipBuffer(abs, ["."]);
+    await writeFile(archiveTarget.abs, archiveBytes);
     const archiveStat = await stat(archiveTarget.abs);
     return {
       ok: true,
@@ -320,15 +303,12 @@ async function executeFsRpc(args: {
     };
   }
 
-  if (action === "write_file") {
-    const contentBase64 = typeof args.request.contentBase64 === "string" ? args.request.contentBase64 : "";
-    if (!contentBase64) {
-      throw new Error("contentBase64 is required");
-    }
+  if (action === "write_text") {
+    const text = typeof args.request.text === "string" ? args.request.text : "";
+    const encoding = typeof args.request.encoding === "string" && args.request.encoding ? args.request.encoding : "utf8";
     const parentDir = path.dirname(abs);
     await mkdir(parentDir, { recursive: true });
-    const bytes = Buffer.from(contentBase64, "base64");
-    await writeFile(abs, bytes);
+    await writeFile(abs, text, { encoding: encoding as BufferEncoding });
     const entry = await stat(abs);
     return {
       ok: true,
@@ -338,6 +318,7 @@ async function executeFsRpc(args: {
       size: entry.size,
       mimeType: inferMimeType(abs),
       mtimeMs: entry.mtimeMs,
+      encoding,
     };
   }
 
@@ -374,6 +355,11 @@ async function executeFsRpc(args: {
     const parentDir = path.dirname(abs);
     await mkdir(parentDir, { recursive: true });
     await writeFile(abs, bytes);
+    if (abs.endsWith(".skillpkg")) {
+      console.log(
+        `[doer-agent] skillpkg downloaded path=${formatPath(abs)} size=${bytes.byteLength} sha256=${sha256Hex(bytes)}`,
+      );
+    }
     const entry = await stat(abs);
     return {
       ok: true,
@@ -397,20 +383,42 @@ async function executeFsRpc(args: {
     }
     const destinationTarget = normalizeFsRpcPath(args.workspaceRoot, rawDestinationPath);
     const archiveBytes = await readFile(abs);
-    const decoded = JSON.parse(gunzipSync(archiveBytes).toString("utf8")) as {
-      files?: Array<{ relPath?: unknown; contentBase64?: unknown }>;
-    };
-    const files = Array.isArray(decoded.files) ? decoded.files : [];
-    await mkdir(destinationTarget.abs, { recursive: true });
-    for (const file of files) {
-      const relPath = typeof file.relPath === "string" ? normalizeArchiveRelativePath(file.relPath) : "";
-      const contentBase64 = typeof file.contentBase64 === "string" ? file.contentBase64 : "";
-      if (!relPath || !contentBase64) {
-        throw new Error("archive contains an invalid file entry");
+    const magic = archiveBytes.subarray(0, 8).toString("hex");
+    const digest = sha256Hex(archiveBytes);
+    const destinationParent = path.dirname(destinationTarget.abs);
+    const tempDestinationAbs = path.join(
+      destinationParent,
+      `.tmp-extract-${path.basename(destinationTarget.abs)}-${crypto.randomBytes(6).toString("hex")}`,
+    );
+    await mkdir(destinationParent, { recursive: true });
+    try {
+      const existing = await stat(destinationTarget.abs);
+      if (existing.isDirectory()) {
+        const entries = await readdir(destinationTarget.abs);
+        if (entries.length > 0) {
+          throw new Error("destinationPath already exists");
+        }
+      } else {
+        throw new Error("destinationPath already exists");
       }
-      const targetPath = path.join(destinationTarget.abs, relPath);
-      await mkdir(path.dirname(targetPath), { recursive: true });
-      await writeFile(targetPath, Buffer.from(contentBase64, "base64"));
+      await rm(destinationTarget.abs, { recursive: true, force: true });
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes("ENOENT")) {
+        throw error;
+      }
+    }
+    await mkdir(tempDestinationAbs, { recursive: true });
+    try {
+      await extractTar({
+        cwd: tempDestinationAbs,
+        file: abs,
+        gzip: true,
+      });
+      await rename(tempDestinationAbs, destinationTarget.abs);
+    } catch (error) {
+      await rm(tempDestinationAbs, { recursive: true, force: true }).catch(() => undefined);
+      const message = error instanceof Error ? error.message : "extract failed";
+      throw new Error(`${message} (magic=${magic} size=${archiveBytes.byteLength} sha256=${digest})`);
     }
     return {
       ok: true,
@@ -423,21 +431,6 @@ async function executeFsRpc(args: {
   const entry = await stat(abs);
   if (!entry.isFile()) {
     throw new Error("path is not a file");
-  }
-  if (action === "read_file") {
-    const maxBytes = Math.max(1, Math.min(normalizeFsRpcNumber(args.request.maxBytes, 2_000_000), 5_000_000));
-    const data = await readFile(abs);
-    const truncated = data.byteLength > maxBytes;
-    const bytes = truncated ? data.subarray(0, maxBytes) : data;
-    return {
-      ok: true,
-      action,
-      path: formatPath(abs),
-      mimeType: inferMimeType(abs),
-      size: entry.size,
-      truncated,
-      contentBase64: bytes.toString("base64"),
-    };
   }
   const offset = Math.max(0, normalizeFsRpcNumber(args.request.offset, 0));
   const length = Math.max(1, Math.min(normalizeFsRpcNumber(args.request.length, 65536), 262144));
