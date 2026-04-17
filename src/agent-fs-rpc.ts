@@ -8,7 +8,7 @@ const fsRpcCodec = StringCodec();
 export type AgentFsRpcAction =
   | "list"
   | "stat"
-  | "fetch_file"
+  | "upload_file"
   | "read_text"
   | "read_file"
   | "write_file"
@@ -29,6 +29,11 @@ export interface AgentFsRpcRequest {
   maxBytes?: unknown;
   encoding?: unknown;
   uploadUrl?: unknown;
+  uploadMode?: unknown;
+  uploadMethod?: unknown;
+  uploadContentType?: unknown;
+  uploadFieldName?: unknown;
+  formFields?: unknown;
   agentId?: unknown;
   archivePath?: unknown;
   destinationPath?: unknown;
@@ -62,7 +67,7 @@ function parseFsRpcAction(value: unknown): AgentFsRpcAction {
   if (
     value === "list" ||
     value === "stat" ||
-    value === "fetch_file" ||
+    value === "upload_file" ||
     value === "read_text" ||
     value === "read_file" ||
     value === "write_file" ||
@@ -240,27 +245,61 @@ async function executeFsRpc(args: {
     };
   }
 
-  if (action === "fetch_file") {
+  if (action === "upload_file") {
     const entry = await stat(abs);
     if (!entry.isFile()) {
       throw new Error("path is not a file");
     }
     const uploadUrl = typeof args.request.uploadUrl === "string" ? args.request.uploadUrl : "";
-    const agentId = typeof args.request.agentId === "string" ? args.request.agentId : "";
-    if (!uploadUrl || !agentId) {
-      throw new Error("missing upload parameters");
+    const uploadMode = args.request.uploadMode === "multipart" ? "multipart" : "raw";
+    const uploadMethod = args.request.uploadMethod === "POST" ? "POST" : "PUT";
+    const uploadContentType =
+      typeof args.request.uploadContentType === "string" && args.request.uploadContentType.trim()
+        ? args.request.uploadContentType.trim()
+        : inferMimeType(abs);
+    const uploadFieldName =
+      typeof args.request.uploadFieldName === "string" && args.request.uploadFieldName.trim()
+        ? args.request.uploadFieldName.trim()
+        : "file";
+    if (!uploadUrl) {
+      throw new Error("uploadUrl is required");
     }
     const resolvedUploadUrl = new URL(uploadUrl, `${args.serverBaseUrl}/`).toString();
     const data = await readFile(abs);
     const fileName = path.basename(abs) || "file";
-    const form = new FormData();
-    form.append("file", new File([data], fileName));
-    form.append("agentId", agentId);
-    const response = await fetch(resolvedUploadUrl, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${args.agentToken}` },
-      body: form,
-    });
+    const serverOrigin = new URL(args.serverBaseUrl).origin;
+    const targetOrigin = new URL(resolvedUploadUrl).origin;
+    const headers: Record<string, string> = {};
+    if (targetOrigin === serverOrigin) {
+      headers.Authorization = `Bearer ${args.agentToken}`;
+    }
+
+    let response: Response;
+    if (uploadMode === "multipart") {
+      const form = new FormData();
+      const formFields =
+        args.request.formFields && typeof args.request.formFields === "object" && !Array.isArray(args.request.formFields)
+          ? args.request.formFields as Record<string, unknown>
+          : {};
+      for (const [key, value] of Object.entries(formFields)) {
+        if (typeof value === "string") {
+          form.append(key, value);
+        }
+      }
+      form.append(uploadFieldName, new File([data], fileName, { type: uploadContentType }));
+      response = await fetch(resolvedUploadUrl, {
+        method: uploadMethod,
+        headers,
+        body: form,
+      });
+    } else {
+      headers["Content-Type"] = uploadContentType;
+      response = await fetch(resolvedUploadUrl, {
+        method: uploadMethod,
+        headers,
+        body: data,
+      });
+    }
     const text = await response.text();
     let upload: Record<string, unknown> = {};
     try {
