@@ -118,18 +118,6 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export function writeTaskStream(taskId: string, stream: "stdout" | "stderr", chunk: string): void {
-  const target = stream === "stdout" ? process.stdout : process.stderr;
-  const lines = chunk.replace(/\r/g, "\n").split("\n");
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    if (line.length === 0 && i === lines.length - 1) {
-      continue;
-    }
-    target.write(`[doer-agent][task=${taskId}][${stream}] ${line}\n`);
-  }
-}
-
 export function writeTaskUpload(taskId: string, message: string): void {
   process.stdout.write(`[doer-agent][task=${taskId}][upload] ${message}\n`);
 }
@@ -144,10 +132,6 @@ export function writeRpcStream(requestId: string, stream: "stdout" | "stderr", c
     }
     target.write(`[doer-agent][rpc=${requestId}][${stream}] ${line}\n`);
   }
-}
-
-export function writeRpcStatus(requestId: string, message: string): void {
-  process.stdout.write(`[doer-agent][rpc=${requestId}][status] ${message}\n`);
 }
 
 export function writeRunStatus(runId: string, message: string): void {

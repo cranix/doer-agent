@@ -72,10 +72,8 @@ import {
   resolveContainerReachableServerBaseUrl,
   sanitizeUserId,
   sleep,
-  writeRpcStatus,
   writeRunStatus,
   writeRunStream,
-  writeTaskStream,
 } from "./agent-runtime-utils.js";
 import { createRuntimeEnvHelpers } from "./agent-runtime-env.js";
 import {
@@ -88,14 +86,6 @@ import {
 import { handleSettingsRpcMessage } from "./agent-settings-rpc.js";
 
 type CodexAuthBundleResponse = ShellRpcCodexAuthBundle;
-
-interface RuntimeConfigBundleResponse {
-  taskId?: string;
-  issuedAt?: string;
-  expiresAt?: string;
-  envPatch?: Record<string, string> | null;
-  meta?: Record<string, unknown> | null;
-}
 
 interface AgentNatsBootstrapResponse {
   servers?: unknown;
@@ -153,44 +143,6 @@ function resolveWorkspaceRoot(): string {
   return workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
 }
 const runRpcCodec = StringCodec();
-
-async function prepareTaskRuntimeConfig(args: {
-  serverBaseUrl: string;
-  taskId: string;
-  userId: string;
-  agentToken: string;
-}): Promise<{
-  envPatch: Record<string, string>;
-  meta: Record<string, unknown>;
-} | null> {
-  const bundle = await postJson<RuntimeConfigBundleResponse>(
-    `${args.serverBaseUrl}/api/agent/tasks/${encodeURIComponent(args.taskId)}/runtime-config`,
-    {
-      userId: args.userId,
-      agentToken: args.agentToken,
-    },
-  ).catch((error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    writeAgentError(`task=${args.taskId} runtime config sync skipped: ${message}`);
-    return null;
-  });
-
-  if (!bundle) {
-    return null;
-  }
-
-  const envPatch = normalizeEnvPatch(bundle.envPatch);
-  return {
-    envPatch,
-    meta: {
-      runtimeConfigIssuedAt: bundle.issuedAt ?? null,
-      runtimeConfigExpiresAt: bundle.expiresAt ?? null,
-      runtimeConfigVarCount: Object.keys(envPatch).length,
-      runtimeConfigSynced: true,
-      ...(bundle.meta && typeof bundle.meta === "object" && !Array.isArray(bundle.meta) ? bundle.meta : {}),
-    },
-  };
-}
 
 function writeAgentInfo(message: string): void {
   process.stdout.write(`[doer-agent] ${message}\n`);
