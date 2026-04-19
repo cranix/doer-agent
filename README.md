@@ -142,6 +142,6 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/secret' \
 
 ## 참고
 
-- `runtime/`에는 실행 보조 스크립트가 들어 있습니다.
+- `runtime/`에는 Git 인증 등 실행 보조 스크립트가 들어 있습니다.
 - Playwright MCP 프록시는 에이전트 상태 디렉터리(`~/.doer-agent`) 아래 소켓을 사용합니다.
 - 이 저장소에는 예전 README에 있던 `scripts/build.sh`, `scripts/publish.sh`, `docker-compose.dev.yml`이 없습니다. 현재 문서는 실제 파일 구조 기준으로 정리되어 있습니다.
