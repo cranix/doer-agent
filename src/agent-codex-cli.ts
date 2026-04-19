@@ -1,4 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import type { CodexPersonality } from "./agent-settings.js";
 
 const ANSI_RE = /\u001b\[[0-9;]*m/g;
@@ -18,6 +20,10 @@ function shellSingleQuote(value: string): string {
 
 function toTomlStringLiteral(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function toTomlStringArray(values: string[]): string {
+  return `[${values.map((value) => toTomlStringLiteral(value)).join(", ")}]`;
 }
 
 function hasDirectCodexBinary(): boolean {
@@ -43,6 +49,7 @@ export function buildManagedCodexArgs(args: {
   model: string;
   personality?: CodexPersonality | null;
   modelInstructionsFile?: string | null;
+  configOverrides?: string[];
 }): string[] {
   const promptArgs = ["--", args.prompt];
   const fixedArgs = ["--dangerously-bypass-approvals-and-sandbox"];
@@ -51,6 +58,7 @@ export function buildManagedCodexArgs(args: {
     ...(args.modelInstructionsFile
       ? ["--config", `model_instructions_file=${toTomlStringLiteral(args.modelInstructionsFile)}`]
       : []),
+    ...(args.configOverrides ?? []),
   ];
   const imageArgs = args.imagePaths.flatMap((imagePath) => ["--image", imagePath]);
   return [
@@ -61,6 +69,31 @@ export function buildManagedCodexArgs(args: {
     ...(args.sessionId
       ? ["exec", "resume", ...imageArgs, args.sessionId, ...promptArgs]
       : ["exec", ...imageArgs, ...promptArgs]),
+  ];
+}
+
+export function buildDaemonMcpConfigArgs(args: {
+  agentProjectDir: string;
+  workspaceRoot: string;
+  serverName?: string;
+}): string[] {
+  const serverName = args.serverName?.trim() || "doer_daemon";
+  const distEntry = path.join(args.agentProjectDir, "dist", "daemon-mcp-server.js");
+  const srcEntry = path.join(args.agentProjectDir, "src", "daemon-mcp-server.ts");
+  const tsxLoaderPath = path.join(args.agentProjectDir, "node_modules", "tsx", "dist", "loader.mjs");
+  const command = process.execPath;
+  const commandArgs = existsSync(distEntry)
+    ? [distEntry, "--workspace-root", args.workspaceRoot]
+    : ["--import", tsxLoaderPath, srcEntry, "--workspace-root", args.workspaceRoot];
+  return [
+    "--config",
+    `mcp_servers.${serverName}.command=${toTomlStringLiteral(command)}`,
+    "--config",
+    `mcp_servers.${serverName}.args=${toTomlStringArray(commandArgs)}`,
+    "--config",
+    `mcp_servers.${serverName}.env.DOER_DAEMON_WORKSPACE_ROOT=${toTomlStringLiteral(args.workspaceRoot)}`,
+    "--config",
+    `mcp_servers.${serverName}.enabled=true`,
   ];
 }
 

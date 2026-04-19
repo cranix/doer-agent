@@ -11,7 +11,9 @@ import {
 import { handleFsRpcMessage } from "./agent-fs-rpc.js";
 import { handleGitRpcMessage } from "./agent-git-rpc.js";
 import { subscribeToCodexAuthRpc } from "./agent-codex-auth-rpc.js";
+import { subscribeToDaemonRpc } from "./agent-daemon-rpc.js";
 import {
+  buildDaemonMcpConfigArgs,
   buildManagedCodexArgs,
   createLocalCodexCliTools,
   normalizeCodexModel,
@@ -56,6 +58,7 @@ import {
 } from "./agent-run-rpc.js";
 import {
   buildAgentCodexAuthRpcSubject,
+  buildAgentDaemonRpcSubject,
   buildAgentFsRpcSubject,
   buildAgentGitRpcSubject,
   buildAgentRunEventsSubject,
@@ -430,6 +433,10 @@ async function handleRunRpcMessage(args: {
             model: request.model,
             personality: localAgentSettings.general.personality,
             modelInstructionsFile: customInstructions ? resolveAgentModelInstructionsFilePath(workspaceRoot) : null,
+            configOverrides: buildDaemonMcpConfigArgs({
+              agentProjectDir: AGENT_PROJECT_DIR,
+              workspaceRoot,
+            }),
           }),
           cwd: request.cwd,
           runtimeEnvPatch: request.runtimeEnvPatch,
@@ -661,6 +668,17 @@ async function main() {
           userId,
           agentId: initialAgentId,
           agentToken,
+        });
+        subscribeToDaemonRpc({
+          nc: jetstream.nc,
+          subject: buildAgentDaemonRpcSubject(userId, initialAgentId),
+          workspaceRoot: resolveWorkspaceRoot(),
+          agentProjectDir: AGENT_PROJECT_DIR,
+          resolveShellPath: runtimeEnvHelpers.resolveShellPath,
+          resolveTaskWorkspace: runtimeEnvHelpers.resolveTaskWorkspace,
+          readAgentSettingsConfig,
+          onInfo: writeAgentInfo,
+          onError: writeAgentError,
         });
         subscribeToSessionRpc({
           nc: jetstream.nc,

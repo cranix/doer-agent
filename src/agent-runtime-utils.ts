@@ -38,6 +38,10 @@ export function buildAgentFsRpcSubject(userId: string, agentId: string): string 
   return `doer.agent.fs.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
+export function buildAgentDaemonRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.daemon.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
 export function parseBootstrapTaskConfig(value: unknown): { stream: string; subject: string; durable: string } | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
