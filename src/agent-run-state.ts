@@ -100,10 +100,67 @@ function buildImmediateRunEvent(task: RunTaskLike, type: ImmediateRunEventLike["
   };
 }
 
-export async function resetRunsDir(workspaceRoot: string): Promise<void> {
+function isPidAlive(pid: number | null): boolean {
+  if (!Number.isInteger(pid) || (pid ?? 0) <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid as number, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return code === "EPERM";
+  }
+}
+
+async function removePathIfStale(pathToRemove: string, pid: number | null): Promise<void> {
+  if (isPidAlive(pid)) {
+    return;
+  }
+  await rm(pathToRemove, { recursive: true, force: true }).catch(() => undefined);
+}
+
+export async function pruneStaleRunsDir(workspaceRoot: string): Promise<void> {
   const dir = await resolveRunsDir(workspaceRoot);
-  await rm(dir, { recursive: true, force: true }).catch(() => undefined);
-  await mkdir(dir, { recursive: true });
+  const names = await readdir(dir).catch(() => [] as string[]);
+  for (const name of names) {
+    const entryPath = path.join(dir, name);
+    if (name === "locks") {
+      const lockNames = await readdir(entryPath).catch(() => [] as string[]);
+      for (const lockName of lockNames) {
+        const lockPath = path.join(entryPath, lockName);
+        const contents = await readFile(lockPath, "utf8").catch(() => null);
+        if (!contents) {
+          await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+          continue;
+        }
+        let pid: number | null = null;
+        try {
+          const parsed = JSON.parse(contents) as { pid?: unknown };
+          pid = typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0 ? parsed.pid : null;
+        } catch {
+          pid = null;
+        }
+        await removePathIfStale(lockPath, pid);
+      }
+      continue;
+    }
+    if (!name.endsWith(".json")) {
+      continue;
+    }
+    const contents = await readFile(entryPath, "utf8").catch(() => null);
+    if (!contents) {
+      await rm(entryPath, { recursive: true, force: true }).catch(() => undefined);
+      continue;
+    }
+    let task: RunTaskLike | null = null;
+    try {
+      task = normalizePersistedRunTask(JSON.parse(contents));
+    } catch {
+      task = null;
+    }
+    await removePathIfStale(entryPath, task?.processPid ?? null);
+  }
 }
 
 export async function persistRunTask(workspaceRoot: string, task: RunTaskLike): Promise<void> {

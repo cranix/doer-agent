@@ -29,8 +29,8 @@ import {
   listPersistedRunTasks,
   persistRunTask,
   publishImmediateRunEvent,
+  pruneStaleRunsDir,
   releaseRunStartSlot,
-  resetRunsDir,
   removeRunTask,
   updateRunStartSlotSession,
 } from "./agent-run-state.js";
@@ -588,7 +588,8 @@ async function main() {
   process.env.WORKSPACE = startupWorkspaceRoot;
   process.env.CODEX_HOME = path.join(startupWorkspaceRoot, ".codex");
   await mkdir(process.env.CODEX_HOME, { recursive: true }).catch(() => undefined);
-  await resetRunsDir(resolveWorkspaceRoot());
+  // Preserve run state for processes that are still alive after an agent restart.
+  await pruneStaleRunsDir(resolveWorkspaceRoot());
 
   const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], DEFAULT_SERVER_BASE_URL);
   const requestedServerBaseUrl = serverBaseUrlRaw.replace(/\/$/, "");
