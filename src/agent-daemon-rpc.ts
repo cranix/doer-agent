@@ -13,7 +13,7 @@ const DAEMON_ID_PATTERN = /^[A-Za-z0-9_-]{6,32}$/;
 
 type AgentDaemonRpcAction = "list" | "inspect" | "start" | "stop" | "restart" | "delete" | "logs";
 type AgentDaemonStatus = "running" | "stopped" | "failed";
-type AgentDaemonLogEventType = "start" | "stdout" | "stderr" | "heartbeat" | "exit" | "signal" | "error";
+type AgentDaemonLogEventType = "start" | "stdout" | "stderr" | "exit" | "signal" | "error";
 
 interface AgentDaemonStateRecord {
   id: string;
@@ -162,13 +162,7 @@ function normalizeLogEvent(value: unknown): AgentDaemonLogEvent | null {
   const row = value as Record<string, unknown>;
   const ts = typeof row.ts === "string" ? row.ts.trim() : "";
   const type =
-    row.type === "start" ||
-    row.type === "stdout" ||
-    row.type === "stderr" ||
-    row.type === "heartbeat" ||
-    row.type === "exit" ||
-    row.type === "signal" ||
-    row.type === "error"
+    row.type === "start" || row.type === "stdout" || row.type === "stderr" || row.type === "exit" || row.type === "signal" || row.type === "error"
       ? row.type
       : null;
   if (!ts || !type) {
