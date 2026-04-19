@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 export function sanitizeUserId(userId: string): string {
   const normalized = userId.trim().replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -105,6 +106,103 @@ export function normalizeRunImagePaths(value: unknown): string[] {
     out.push(normalized);
   }
   return out;
+}
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const crc32Table = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let crc = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc & 1) !== 0 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+    }
+    table[index] = crc >>> 0;
+  }
+  return table;
+})();
+
+function crc32(parts: Buffer[]): number {
+  let crc = 0xffffffff;
+  for (const part of parts) {
+    for (let index = 0; index < part.length; index += 1) {
+      crc = crc32Table[(crc ^ part[index]) & 0xff] ^ (crc >>> 8);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function validatePngBytes(bytes: Buffer): string | null {
+  if (bytes.length < PNG_SIGNATURE.length || !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+    return "missing PNG signature";
+  }
+
+  let offset = PNG_SIGNATURE.length;
+  let sawIend = false;
+  while (offset < bytes.length) {
+    if (offset + 12 > bytes.length) {
+      return "truncated PNG chunk";
+    }
+    const chunkLength = bytes.readUInt32BE(offset);
+    const typeStart = offset + 4;
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + chunkLength;
+    const crcOffset = dataEnd;
+    const nextOffset = crcOffset + 4;
+    if (dataEnd > bytes.length || nextOffset > bytes.length) {
+      return "truncated PNG chunk payload";
+    }
+    const type = bytes.subarray(typeStart, dataStart);
+    const expectedCrc = bytes.readUInt32BE(crcOffset);
+    const actualCrc = crc32([type, bytes.subarray(dataStart, dataEnd)]);
+    if (expectedCrc !== actualCrc) {
+      const chunkName = type.toString("ascii");
+      return `PNG CRC mismatch in ${chunkName} chunk`;
+    }
+    if (type.equals(Buffer.from("IEND"))) {
+      sawIend = true;
+      if (nextOffset !== bytes.length) {
+        return "unexpected trailing bytes after PNG IEND";
+      }
+      break;
+    }
+    offset = nextOffset;
+  }
+
+  return sawIend ? null : "missing PNG IEND chunk";
+}
+
+export function validateImageBytes(filePath: string, bytes: Buffer): string | null {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".png") {
+    return validatePngBytes(bytes);
+  }
+  return null;
+}
+
+export async function filterValidRunImagePaths(args: {
+  workspaceRoot: string;
+  imagePaths: string[];
+  onInvalidImage?: (imagePath: string, reason: string) => void;
+}): Promise<string[]> {
+  const valid: string[] = [];
+  for (const imagePath of args.imagePaths) {
+    const absPath = path.isAbsolute(imagePath) ? imagePath : path.resolve(args.workspaceRoot, imagePath);
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(absPath);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "failed to read image";
+      args.onInvalidImage?.(imagePath, reason);
+      continue;
+    }
+    const validationError = validateImageBytes(absPath, bytes);
+    if (validationError) {
+      args.onInvalidImage?.(imagePath, validationError);
+      continue;
+    }
+    valid.push(imagePath);
+  }
+  return valid;
 }
 
 export function fatalExit(message: string, error: unknown, writeAgentError: (message: string) => void): never {

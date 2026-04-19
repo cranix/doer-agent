@@ -65,6 +65,7 @@ import {
   buildAgentSkillRpcSubject,
   formatLocalTimestamp,
   normalizeEnvPatch,
+  filterValidRunImagePaths,
   normalizeRunImagePaths,
   parseArgs,
   resolveAgentVersion,
@@ -407,6 +408,13 @@ async function handleRunRpcMessage(args: {
         const workspaceRoot = resolveWorkspaceRoot();
         const localAgentSettings = await readAgentSettingsConfig({ workspaceRoot });
         const customInstructions = await readAgentModelInstructions(workspaceRoot);
+        const validImagePaths = await filterValidRunImagePaths({
+          workspaceRoot,
+          imagePaths: request.imagePaths,
+          onInvalidImage: (imagePath, reason) => {
+            writeRunStatus(runId, `skipping invalid image path=${imagePath} reason=${reason}`);
+          },
+        });
         const task = await startManagedRun({
           requestId,
           runId,
@@ -417,7 +425,7 @@ async function handleRunRpcMessage(args: {
           sessionId: request.sessionId,
           codexArgs: buildManagedCodexArgs({
             prompt: request.prompt ?? "",
-            imagePaths: request.imagePaths,
+            imagePaths: validImagePaths,
             sessionId: request.sessionId,
             model: request.model,
             personality: localAgentSettings.general.personality,

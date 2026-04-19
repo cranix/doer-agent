@@ -3,6 +3,7 @@ import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "nod
 import crypto from "node:crypto";
 import { StringCodec, type Msg } from "nats";
 import { create as createTar, extract as extractTar } from "tar";
+import { validateImageBytes } from "./agent-runtime-utils.js";
 
 const fsRpcCodec = StringCodec();
 
@@ -352,6 +353,10 @@ async function executeFsRpc(args: {
       throw new Error(text || `download failed: ${response.status}`);
     }
     const bytes = Buffer.from(await response.arrayBuffer());
+    const validationError = validateImageBytes(abs, bytes);
+    if (validationError) {
+      throw new Error(validationError);
+    }
     const parentDir = path.dirname(abs);
     await mkdir(parentDir, { recursive: true });
     await writeFile(abs, bytes);
