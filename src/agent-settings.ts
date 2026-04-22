@@ -65,28 +65,6 @@ export interface AgentSettingsConfig {
     oauthLogin: string | null;
     oauthScope: string | null;
   };
-  jira: {
-    baseUrl: string | null;
-    email: string | null;
-    enabled: boolean;
-    apiToken: string | null;
-  };
-  notion: {
-    baseUrl: string | null;
-    version: string | null;
-    enabled: boolean;
-    apiToken: string | null;
-  };
-  slack: {
-    baseUrl: string | null;
-    enabled: boolean;
-    botToken: string | null;
-  };
-  figma: {
-    baseUrl: string | null;
-    enabled: boolean;
-    apiToken: string | null;
-  };
   env: {
     variables: AgentEnvironmentVariableConfig[];
   };
@@ -124,36 +102,6 @@ export interface AgentSettingsPublic {
     oauthTokenLength: number | null;
     oauthLogin: string | null;
     oauthScope: string | null;
-  };
-  jira: {
-    baseUrl: string | null;
-    email: string | null;
-    enabled: boolean;
-    hasApiToken: boolean;
-    apiTokenMasked: string | null;
-    apiTokenLength: number | null;
-  };
-  notion: {
-    baseUrl: string | null;
-    version: string | null;
-    enabled: boolean;
-    hasApiToken: boolean;
-    apiTokenMasked: string | null;
-    apiTokenLength: number | null;
-  };
-  slack: {
-    baseUrl: string | null;
-    enabled: boolean;
-    hasBotToken: boolean;
-    botTokenMasked: string | null;
-    botTokenLength: number | null;
-  };
-  figma: {
-    baseUrl: string | null;
-    enabled: boolean;
-    hasApiToken: boolean;
-    apiTokenMasked: string | null;
-    apiTokenLength: number | null;
   };
   env: {
     variables: AgentEnvironmentVariableConfig[];
@@ -197,28 +145,6 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
       oauthToken: null,
       oauthLogin: null,
       oauthScope: null,
-    },
-    jira: {
-      baseUrl: null,
-      email: null,
-      enabled: false,
-      apiToken: null,
-    },
-    notion: {
-      baseUrl: "https://api.notion.com",
-      version: "2022-06-28",
-      enabled: false,
-      apiToken: null,
-    },
-    slack: {
-      baseUrl: "https://slack.com/api",
-      enabled: false,
-      botToken: null,
-    },
-    figma: {
-      baseUrl: "https://api.figma.com",
-      enabled: false,
-      apiToken: null,
     },
     env: {
       variables: [],
@@ -409,10 +335,6 @@ export function normalizeAgentSettingsConfig(
   const codex = raw.codex && typeof raw.codex === "object" ? (raw.codex as Record<string, unknown>) : {};
   const realtime = raw.realtime && typeof raw.realtime === "object" ? (raw.realtime as Record<string, unknown>) : {};
   const git = raw.git && typeof raw.git === "object" ? (raw.git as Record<string, unknown>) : {};
-  const jira = raw.jira && typeof raw.jira === "object" ? (raw.jira as Record<string, unknown>) : {};
-  const notion = raw.notion && typeof raw.notion === "object" ? (raw.notion as Record<string, unknown>) : {};
-  const slack = raw.slack && typeof raw.slack === "object" ? (raw.slack as Record<string, unknown>) : {};
-  const figma = raw.figma && typeof raw.figma === "object" ? (raw.figma as Record<string, unknown>) : {};
   const env = raw.env && typeof raw.env === "object" ? raw.env : null;
   const databases = raw.databases && typeof raw.databases === "object" ? raw.databases : null;
   return {
@@ -438,28 +360,6 @@ export function normalizeAgentSettingsConfig(
       oauthToken: git.oauthToken === null ? null : normalizeNullableString(git.oauthToken) ?? base.git.oauthToken,
       oauthLogin: git.oauthLogin === null ? null : normalizeNullableString(git.oauthLogin) ?? base.git.oauthLogin,
       oauthScope: git.oauthScope === null ? null : normalizeNullableString(git.oauthScope) ?? base.git.oauthScope,
-    },
-    jira: {
-      baseUrl: jira.baseUrl === null ? null : normalizeNullableString(jira.baseUrl) ?? base.jira.baseUrl,
-      email: jira.email === null ? null : normalizeNullableString(jira.email) ?? base.jira.email,
-      enabled: typeof jira.enabled === "boolean" ? jira.enabled : base.jira.enabled,
-      apiToken: jira.apiToken === null ? null : normalizeNullableString(jira.apiToken) ?? base.jira.apiToken,
-    },
-    notion: {
-      baseUrl: notion.baseUrl === null ? null : normalizeNullableString(notion.baseUrl) ?? base.notion.baseUrl,
-      version: notion.version === null ? null : normalizeNullableString(notion.version) ?? base.notion.version,
-      enabled: typeof notion.enabled === "boolean" ? notion.enabled : base.notion.enabled,
-      apiToken: notion.apiToken === null ? null : normalizeNullableString(notion.apiToken) ?? base.notion.apiToken,
-    },
-    slack: {
-      baseUrl: slack.baseUrl === null ? null : normalizeNullableString(slack.baseUrl) ?? base.slack.baseUrl,
-      enabled: typeof slack.enabled === "boolean" ? slack.enabled : base.slack.enabled,
-      botToken: slack.botToken === null ? null : normalizeNullableString(slack.botToken) ?? base.slack.botToken,
-    },
-    figma: {
-      baseUrl: figma.baseUrl === null ? null : normalizeNullableString(figma.baseUrl) ?? base.figma.baseUrl,
-      enabled: typeof figma.enabled === "boolean" ? figma.enabled : base.figma.enabled,
-      apiToken: figma.apiToken === null ? null : normalizeNullableString(figma.apiToken) ?? base.figma.apiToken,
     },
     env: normalizeAgentEnvironmentSettings(env, base.env),
     databases: normalizeAgentDatabaseSettings(databases, base.databases),
@@ -531,10 +431,6 @@ export async function toAgentSettingsPublic(args: {
 }): Promise<AgentSettingsPublic> {
   const realtimeKey = toMaskedSecret(args.config.realtime.apiKey);
   const gitOauth = toMaskedSecret(args.config.git.oauthToken);
-  const jiraToken = toMaskedSecret(args.config.jira.apiToken);
-  const notionToken = toMaskedSecret(args.config.notion.apiToken);
-  const slackToken = toMaskedSecret(args.config.slack.botToken);
-  const figmaToken = toMaskedSecret(args.config.figma.apiToken);
   const customInstructions = await readAgentModelInstructions(args.workspaceRoot);
   return {
     general: {
@@ -567,36 +463,6 @@ export async function toAgentSettingsPublic(args: {
       oauthTokenLength: gitOauth.length,
       oauthLogin: args.config.git.oauthLogin,
       oauthScope: args.config.git.oauthScope,
-    },
-    jira: {
-      baseUrl: args.config.jira.baseUrl,
-      email: args.config.jira.email,
-      enabled: args.config.jira.enabled,
-      hasApiToken: jiraToken.has,
-      apiTokenMasked: jiraToken.masked,
-      apiTokenLength: jiraToken.length,
-    },
-    notion: {
-      baseUrl: args.config.notion.baseUrl,
-      version: args.config.notion.version,
-      enabled: args.config.notion.enabled,
-      hasApiToken: notionToken.has,
-      apiTokenMasked: notionToken.masked,
-      apiTokenLength: notionToken.length,
-    },
-    slack: {
-      baseUrl: args.config.slack.baseUrl,
-      enabled: args.config.slack.enabled,
-      hasBotToken: slackToken.has,
-      botTokenMasked: slackToken.masked,
-      botTokenLength: slackToken.length,
-    },
-    figma: {
-      baseUrl: args.config.figma.baseUrl,
-      enabled: args.config.figma.enabled,
-      hasApiToken: figmaToken.has,
-      apiTokenMasked: figmaToken.masked,
-      apiTokenLength: figmaToken.length,
     },
     env: {
       variables: args.config.env.variables.map((variable) => ({
@@ -669,24 +535,6 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
   move("gitOauthToken", "git", "oauthToken");
   move("gitOauthLogin", "git", "oauthLogin");
   move("gitOauthScope", "git", "oauthScope");
-
-  move("jiraBaseUrl", "jira", "baseUrl");
-  move("jiraEmail", "jira", "email");
-  move("jiraEnabled", "jira", "enabled");
-  move("jiraApiToken", "jira", "apiToken");
-
-  move("notionBaseUrl", "notion", "baseUrl");
-  move("notionVersion", "notion", "version");
-  move("notionEnabled", "notion", "enabled");
-  move("notionApiToken", "notion", "apiToken");
-
-  move("slackBaseUrl", "slack", "baseUrl");
-  move("slackEnabled", "slack", "enabled");
-  move("slackBotToken", "slack", "botToken");
-
-  move("figmaBaseUrl", "figma", "baseUrl");
-  move("figmaEnabled", "figma", "enabled");
-  move("figmaApiToken", "figma", "apiToken");
   move("environmentVariables", "env", "variables");
 
   return patch;
@@ -703,24 +551,6 @@ export function buildAgentSettingsEnvPatch(config: AgentSettingsConfig): Record<
     if (config.git.oauthToken) envPatch.GH_TOKEN = config.git.oauthToken;
     if (config.git.oauthLogin) envPatch.DOER_GIT_OAUTH_LOGIN = config.git.oauthLogin;
     if (config.git.oauthScope) envPatch.DOER_GIT_OAUTH_SCOPE = config.git.oauthScope;
-  }
-  if (config.jira.enabled) {
-    if (config.jira.baseUrl) envPatch.JIRA_BASE_URL = config.jira.baseUrl;
-    if (config.jira.email) envPatch.JIRA_EMAIL = config.jira.email;
-    if (config.jira.apiToken) envPatch.JIRA_API_TOKEN = config.jira.apiToken;
-  }
-  if (config.notion.enabled) {
-    if (config.notion.baseUrl) envPatch.NOTION_BASE_URL = config.notion.baseUrl;
-    if (config.notion.version) envPatch.NOTION_VERSION = config.notion.version;
-    if (config.notion.apiToken) envPatch.NOTION_API_TOKEN = config.notion.apiToken;
-  }
-  if (config.slack.enabled) {
-    if (config.slack.baseUrl) envPatch.SLACK_BASE_URL = config.slack.baseUrl;
-    if (config.slack.botToken) envPatch.SLACK_BOT_TOKEN = config.slack.botToken;
-  }
-  if (config.figma.enabled) {
-    if (config.figma.baseUrl) envPatch.FIGMA_BASE_URL = config.figma.baseUrl;
-    if (config.figma.apiToken) envPatch.FIGMA_API_TOKEN = config.figma.apiToken;
   }
   for (const variable of config.env.variables) {
     envPatch[variable.key] = variable.value;
