@@ -77,9 +77,42 @@ export function buildDaemonMcpConfigArgs(args: {
   workspaceRoot: string;
   serverName?: string;
 }): string[] {
-  const serverName = args.serverName?.trim() || "doer_daemon";
-  const distEntry = path.join(args.agentProjectDir, "dist", "daemon-mcp-server.js");
-  const srcEntry = path.join(args.agentProjectDir, "src", "daemon-mcp-server.ts");
+  return buildWorkspaceMcpConfigArgs({
+    agentProjectDir: args.agentProjectDir,
+    workspaceRoot: args.workspaceRoot,
+    serverName: args.serverName?.trim() || "doer_daemon",
+    distEntryRelativePath: path.join("dist", "daemon-mcp-server.js"),
+    srcEntryRelativePath: path.join("src", "daemon-mcp-server.ts"),
+    workspaceRootEnvName: "DOER_DAEMON_WORKSPACE_ROOT",
+  });
+}
+
+export function buildDatabaseMcpConfigArgs(args: {
+  agentProjectDir: string;
+  workspaceRoot: string;
+  serverName?: string;
+}): string[] {
+  return buildWorkspaceMcpConfigArgs({
+    agentProjectDir: args.agentProjectDir,
+    workspaceRoot: args.workspaceRoot,
+    serverName: args.serverName?.trim() || "doer_database",
+    distEntryRelativePath: path.join("dist", "db-mcp-server.js"),
+    srcEntryRelativePath: path.join("src", "db-mcp-server.ts"),
+    workspaceRootEnvName: "DOER_DB_WORKSPACE_ROOT",
+  });
+}
+
+function buildWorkspaceMcpConfigArgs(args: {
+  agentProjectDir: string;
+  workspaceRoot: string;
+  serverName: string;
+  distEntryRelativePath: string;
+  srcEntryRelativePath: string;
+  workspaceRootEnvName: string;
+}): string[] {
+  const serverName = args.serverName.trim();
+  const distEntry = path.join(args.agentProjectDir, args.distEntryRelativePath);
+  const srcEntry = path.join(args.agentProjectDir, args.srcEntryRelativePath);
   const tsxLoaderPath = path.join(args.agentProjectDir, "node_modules", "tsx", "dist", "loader.mjs");
   const command = process.execPath;
   const commandArgs = existsSync(distEntry)
@@ -91,7 +124,7 @@ export function buildDaemonMcpConfigArgs(args: {
     "--config",
     `mcp_servers.${serverName}.args=${toTomlStringArray(commandArgs)}`,
     "--config",
-    `mcp_servers.${serverName}.env.DOER_DAEMON_WORKSPACE_ROOT=${toTomlStringLiteral(args.workspaceRoot)}`,
+    `mcp_servers.${serverName}.env.${args.workspaceRootEnvName}=${toTomlStringLiteral(args.workspaceRoot)}`,
     "--config",
     `mcp_servers.${serverName}.enabled=true`,
   ];

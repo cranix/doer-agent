@@ -3,6 +3,39 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 
 export type CodexPersonality = "friendly" | "pragmatic";
 
+export type AgentDatabaseProvider = "postgres" | "mysql";
+
+export type AgentDatabaseConnectionSecret =
+  | {
+      mode: "url";
+      url: string;
+    }
+  | {
+      mode: "env";
+      urlEnv: string;
+    };
+
+export interface AgentDatabaseConnectionConfig {
+  id: string;
+  description: string | null;
+  provider: AgentDatabaseProvider;
+  enabled: boolean;
+  readOnly: boolean;
+  connection: AgentDatabaseConnectionSecret;
+}
+
+export interface AgentDatabaseSettingsConfig {
+  defaultConnectionId: string | null;
+  connections: AgentDatabaseConnectionConfig[];
+}
+
+export type AgentDatabaseConnectionPublic = AgentDatabaseConnectionConfig;
+
+export interface AgentDatabaseSettingsPublic {
+  defaultConnectionId: string | null;
+  connections: AgentDatabaseConnectionPublic[];
+}
+
 export interface AgentSettingsConfig {
   general: {
     personality: CodexPersonality;
@@ -56,6 +89,7 @@ export interface AgentSettingsConfig {
     enabled: boolean;
     apiToken: string | null;
   };
+  databases: AgentDatabaseSettingsConfig;
 }
 
 export interface AgentSettingsPublic {
@@ -131,6 +165,7 @@ export interface AgentSettingsPublic {
     apiTokenMasked: string | null;
     apiTokenLength: number | null;
   };
+  databases: AgentDatabaseSettingsPublic;
 }
 
 function resolveAgentSettingsDir(workspaceRoot: string): string {
@@ -199,6 +234,10 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
       enabled: false,
       apiToken: null,
     },
+    databases: {
+      defaultConnectionId: null,
+      connections: [],
+    },
   };
 }
 
@@ -217,6 +256,123 @@ function normalizeCodexPersonality(value: unknown, fallback: CodexPersonality): 
   return value === "friendly" || value === "pragmatic" ? value : fallback;
 }
 
+function normalizeDatabaseConnectionId(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function normalizeEnvVarName(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || !/^[A-Z_][A-Z0-9_]*$/.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function normalizeAgentDatabaseProvider(value: unknown): AgentDatabaseProvider {
+  return value === "mysql" ? "mysql" : "postgres";
+}
+
+function normalizeAgentDatabaseConnectionSecret(value: unknown): AgentDatabaseConnectionSecret | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const mode = raw.mode === "env" ? "env" : raw.mode === "url" ? "url" : null;
+  if (mode === "env") {
+    const urlEnv = normalizeEnvVarName(raw.urlEnv);
+    return urlEnv ? { mode, urlEnv } : null;
+  }
+  if (mode === "url") {
+    const url = normalizeNullableString(raw.url);
+    return url ? { mode, url } : null;
+  }
+  return null;
+}
+
+export function normalizeAgentDatabaseConnection(value: unknown): AgentDatabaseConnectionConfig | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const id = normalizeDatabaseConnectionId(raw.id);
+  const connection = normalizeAgentDatabaseConnectionSecret(raw.connection);
+  if (!id || !connection) {
+    return null;
+  }
+  return {
+    id,
+    description:
+      raw.description === null ? null : normalizeNullableString(raw.description),
+    provider: normalizeAgentDatabaseProvider(raw.provider),
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
+    readOnly: typeof raw.readOnly === "boolean" ? raw.readOnly : true,
+    connection,
+  };
+}
+
+function normalizeAgentDatabaseSettings(
+  value: unknown,
+  fallback: AgentDatabaseSettingsConfig,
+): AgentDatabaseSettingsConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallback;
+  }
+  const raw = value as Record<string, unknown>;
+  const connectionsRaw = Array.isArray(raw.connections) ? raw.connections : [];
+  const connections: AgentDatabaseConnectionConfig[] = [];
+  const seenIds = new Set<string>();
+  for (const item of connectionsRaw) {
+    const normalized = normalizeAgentDatabaseConnection(item);
+    if (!normalized || seenIds.has(normalized.id)) {
+      continue;
+    }
+    seenIds.add(normalized.id);
+    connections.push(normalized);
+  }
+
+  const requestedDefault = raw.defaultConnectionId === null ? null : normalizeDatabaseConnectionId(raw.defaultConnectionId);
+  const defaultConnectionId =
+    requestedDefault && connections.some((connection) => connection.id === requestedDefault)
+      ? requestedDefault
+      : connections.some((connection) => connection.id === fallback.defaultConnectionId)
+        ? fallback.defaultConnectionId
+        : connections[0]?.id ?? null;
+
+  return {
+    defaultConnectionId,
+    connections,
+  };
+}
+
+export function getAgentDatabaseConnectionById(
+  config: AgentSettingsConfig,
+  connectionId: string,
+): AgentDatabaseConnectionConfig | null {
+  const normalizedId = normalizeDatabaseConnectionId(connectionId);
+  if (!normalizedId) {
+    return null;
+  }
+  return config.databases.connections.find((connection) => connection.id === normalizedId) ?? null;
+}
+
+export function resolveAgentDatabaseConnectionUrl(connection: AgentDatabaseConnectionConfig): string | null {
+  if (connection.connection.mode === "url") {
+    return connection.connection.url.trim() || null;
+  }
+  const envValue = process.env[connection.connection.urlEnv]?.trim();
+  return envValue || null;
+}
+
 export function normalizeAgentSettingsConfig(
   value: unknown,
   fallback?: AgentSettingsConfig | null,
@@ -232,6 +388,7 @@ export function normalizeAgentSettingsConfig(
   const notion = raw.notion && typeof raw.notion === "object" ? (raw.notion as Record<string, unknown>) : {};
   const slack = raw.slack && typeof raw.slack === "object" ? (raw.slack as Record<string, unknown>) : {};
   const figma = raw.figma && typeof raw.figma === "object" ? (raw.figma as Record<string, unknown>) : {};
+  const databases = raw.databases && typeof raw.databases === "object" ? raw.databases : null;
   return {
     general: {
       personality: normalizeCodexPersonality(general.personality, base.general.personality),
@@ -288,6 +445,7 @@ export function normalizeAgentSettingsConfig(
       enabled: typeof figma.enabled === "boolean" ? figma.enabled : base.figma.enabled,
       apiToken: figma.apiToken === null ? null : normalizeNullableString(figma.apiToken) ?? base.figma.apiToken,
     },
+    databases: normalizeAgentDatabaseSettings(databases, base.databases),
   };
 }
 
@@ -435,6 +593,26 @@ export async function toAgentSettingsPublic(args: {
       hasApiToken: figmaToken.has,
       apiTokenMasked: figmaToken.masked,
       apiTokenLength: figmaToken.length,
+    },
+    databases: {
+      defaultConnectionId: args.config.databases.defaultConnectionId,
+      connections: args.config.databases.connections.map((connection) => ({
+        id: connection.id,
+        description: connection.description,
+        provider: connection.provider,
+        enabled: connection.enabled,
+        readOnly: connection.readOnly,
+        connection:
+          connection.connection.mode === "url"
+            ? {
+                mode: "url" as const,
+                url: connection.connection.url,
+              }
+            : {
+                mode: "env" as const,
+                urlEnv: connection.connection.urlEnv,
+              },
+      })),
     },
   };
 }

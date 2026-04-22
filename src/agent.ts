@@ -14,6 +14,7 @@ import { subscribeToCodexAuthRpc } from "./agent-codex-auth-rpc.js";
 import { subscribeToDaemonRpc } from "./agent-daemon-rpc.js";
 import {
   buildDaemonMcpConfigArgs,
+  buildDatabaseMcpConfigArgs,
   buildManagedCodexArgs,
   createLocalCodexCliTools,
   normalizeCodexModel,
@@ -433,10 +434,16 @@ async function handleRunRpcMessage(args: {
             model: request.model,
             personality: localAgentSettings.general.personality,
             modelInstructionsFile: customInstructions ? resolveAgentModelInstructionsFilePath(workspaceRoot) : null,
-            configOverrides: buildDaemonMcpConfigArgs({
-              agentProjectDir: AGENT_PROJECT_DIR,
-              workspaceRoot,
-            }),
+            configOverrides: [
+              ...buildDaemonMcpConfigArgs({
+                agentProjectDir: AGENT_PROJECT_DIR,
+                workspaceRoot,
+              }),
+              ...buildDatabaseMcpConfigArgs({
+                agentProjectDir: AGENT_PROJECT_DIR,
+                workspaceRoot,
+              }),
+            ],
           }),
           cwd: request.cwd,
           runtimeEnvPatch: request.runtimeEnvPatch,
