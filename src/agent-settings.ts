@@ -36,6 +36,11 @@ export interface AgentDatabaseSettingsPublic {
   connections: AgentDatabaseConnectionPublic[];
 }
 
+export interface AgentEnvironmentVariableConfig {
+  key: string;
+  value: string;
+}
+
 export interface AgentSettingsConfig {
   general: {
     personality: CodexPersonality;
@@ -60,13 +65,6 @@ export interface AgentSettingsConfig {
     oauthLogin: string | null;
     oauthScope: string | null;
   };
-  aws: {
-    enabled: boolean;
-    accessKeyId: string | null;
-    defaultRegion: string | null;
-    secretAccessKey: string | null;
-    sessionToken: string | null;
-  };
   jira: {
     baseUrl: string | null;
     email: string | null;
@@ -88,6 +86,9 @@ export interface AgentSettingsConfig {
     baseUrl: string | null;
     enabled: boolean;
     apiToken: string | null;
+  };
+  env: {
+    variables: AgentEnvironmentVariableConfig[];
   };
   databases: AgentDatabaseSettingsConfig;
 }
@@ -124,17 +125,6 @@ export interface AgentSettingsPublic {
     oauthLogin: string | null;
     oauthScope: string | null;
   };
-  aws: {
-    enabled: boolean;
-    accessKeyId: string | null;
-    defaultRegion: string | null;
-    hasSecretAccessKey: boolean;
-    secretAccessKeyMasked: string | null;
-    secretAccessKeyLength: number | null;
-    hasSessionToken: boolean;
-    sessionTokenMasked: string | null;
-    sessionTokenLength: number | null;
-  };
   jira: {
     baseUrl: string | null;
     email: string | null;
@@ -164,6 +154,9 @@ export interface AgentSettingsPublic {
     hasApiToken: boolean;
     apiTokenMasked: string | null;
     apiTokenLength: number | null;
+  };
+  env: {
+    variables: AgentEnvironmentVariableConfig[];
   };
   databases: AgentDatabaseSettingsPublic;
 }
@@ -205,13 +198,6 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
       oauthLogin: null,
       oauthScope: null,
     },
-    aws: {
-      enabled: true,
-      accessKeyId: null,
-      defaultRegion: null,
-      secretAccessKey: null,
-      sessionToken: null,
-    },
     jira: {
       baseUrl: null,
       email: null,
@@ -233,6 +219,9 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
       baseUrl: "https://api.figma.com",
       enabled: false,
       apiToken: null,
+    },
+    env: {
+      variables: [],
     },
     databases: {
       defaultConnectionId: null,
@@ -354,6 +343,43 @@ function normalizeAgentDatabaseSettings(
   };
 }
 
+function normalizeAgentEnvironmentVariable(value: unknown): AgentEnvironmentVariableConfig | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const key = normalizeEnvVarName(raw.key);
+  if (!key || typeof raw.value !== "string") {
+    return null;
+  }
+  return {
+    key,
+    value: raw.value.replace(/\r/g, ""),
+  };
+}
+
+function normalizeAgentEnvironmentSettings(
+  value: unknown,
+  fallback: AgentSettingsConfig["env"],
+): AgentSettingsConfig["env"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallback;
+  }
+  const raw = value as Record<string, unknown>;
+  const variablesRaw = Array.isArray(raw.variables) ? raw.variables : [];
+  const variables: AgentEnvironmentVariableConfig[] = [];
+  const seenKeys = new Set<string>();
+  for (const item of variablesRaw) {
+    const normalized = normalizeAgentEnvironmentVariable(item);
+    if (!normalized || seenKeys.has(normalized.key)) {
+      continue;
+    }
+    seenKeys.add(normalized.key);
+    variables.push(normalized);
+  }
+  return { variables };
+}
+
 export function getAgentDatabaseConnectionById(
   config: AgentSettingsConfig,
   connectionId: string,
@@ -383,11 +409,11 @@ export function normalizeAgentSettingsConfig(
   const codex = raw.codex && typeof raw.codex === "object" ? (raw.codex as Record<string, unknown>) : {};
   const realtime = raw.realtime && typeof raw.realtime === "object" ? (raw.realtime as Record<string, unknown>) : {};
   const git = raw.git && typeof raw.git === "object" ? (raw.git as Record<string, unknown>) : {};
-  const aws = raw.aws && typeof raw.aws === "object" ? (raw.aws as Record<string, unknown>) : {};
   const jira = raw.jira && typeof raw.jira === "object" ? (raw.jira as Record<string, unknown>) : {};
   const notion = raw.notion && typeof raw.notion === "object" ? (raw.notion as Record<string, unknown>) : {};
   const slack = raw.slack && typeof raw.slack === "object" ? (raw.slack as Record<string, unknown>) : {};
   const figma = raw.figma && typeof raw.figma === "object" ? (raw.figma as Record<string, unknown>) : {};
+  const env = raw.env && typeof raw.env === "object" ? raw.env : null;
   const databases = raw.databases && typeof raw.databases === "object" ? raw.databases : null;
   return {
     general: {
@@ -413,16 +439,6 @@ export function normalizeAgentSettingsConfig(
       oauthLogin: git.oauthLogin === null ? null : normalizeNullableString(git.oauthLogin) ?? base.git.oauthLogin,
       oauthScope: git.oauthScope === null ? null : normalizeNullableString(git.oauthScope) ?? base.git.oauthScope,
     },
-    aws: {
-      enabled: typeof aws.enabled === "boolean" ? aws.enabled : base.aws.enabled,
-      accessKeyId: aws.accessKeyId === null ? null : normalizeNullableString(aws.accessKeyId) ?? base.aws.accessKeyId,
-      defaultRegion: aws.defaultRegion === null ? null : normalizeNullableString(aws.defaultRegion) ?? base.aws.defaultRegion,
-      secretAccessKey:
-        aws.secretAccessKey === null
-          ? null
-          : normalizeNullableString(aws.secretAccessKey) ?? base.aws.secretAccessKey,
-      sessionToken: aws.sessionToken === null ? null : normalizeNullableString(aws.sessionToken) ?? base.aws.sessionToken,
-    },
     jira: {
       baseUrl: jira.baseUrl === null ? null : normalizeNullableString(jira.baseUrl) ?? base.jira.baseUrl,
       email: jira.email === null ? null : normalizeNullableString(jira.email) ?? base.jira.email,
@@ -445,6 +461,7 @@ export function normalizeAgentSettingsConfig(
       enabled: typeof figma.enabled === "boolean" ? figma.enabled : base.figma.enabled,
       apiToken: figma.apiToken === null ? null : normalizeNullableString(figma.apiToken) ?? base.figma.apiToken,
     },
+    env: normalizeAgentEnvironmentSettings(env, base.env),
     databases: normalizeAgentDatabaseSettings(databases, base.databases),
   };
 }
@@ -514,8 +531,6 @@ export async function toAgentSettingsPublic(args: {
 }): Promise<AgentSettingsPublic> {
   const realtimeKey = toMaskedSecret(args.config.realtime.apiKey);
   const gitOauth = toMaskedSecret(args.config.git.oauthToken);
-  const awsSecret = toMaskedSecret(args.config.aws.secretAccessKey);
-  const awsSession = toMaskedSecret(args.config.aws.sessionToken);
   const jiraToken = toMaskedSecret(args.config.jira.apiToken);
   const notionToken = toMaskedSecret(args.config.notion.apiToken);
   const slackToken = toMaskedSecret(args.config.slack.botToken);
@@ -553,17 +568,6 @@ export async function toAgentSettingsPublic(args: {
       oauthLogin: args.config.git.oauthLogin,
       oauthScope: args.config.git.oauthScope,
     },
-    aws: {
-      enabled: args.config.aws.enabled,
-      accessKeyId: args.config.aws.accessKeyId,
-      defaultRegion: args.config.aws.defaultRegion,
-      hasSecretAccessKey: awsSecret.has,
-      secretAccessKeyMasked: awsSecret.masked,
-      secretAccessKeyLength: awsSecret.length,
-      hasSessionToken: awsSession.has,
-      sessionTokenMasked: awsSession.masked,
-      sessionTokenLength: awsSession.length,
-    },
     jira: {
       baseUrl: args.config.jira.baseUrl,
       email: args.config.jira.email,
@@ -593,6 +597,12 @@ export async function toAgentSettingsPublic(args: {
       hasApiToken: figmaToken.has,
       apiTokenMasked: figmaToken.masked,
       apiTokenLength: figmaToken.length,
+    },
+    env: {
+      variables: args.config.env.variables.map((variable) => ({
+        key: variable.key,
+        value: variable.value,
+      })),
     },
     databases: {
       defaultConnectionId: args.config.databases.defaultConnectionId,
@@ -660,12 +670,6 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
   move("gitOauthLogin", "git", "oauthLogin");
   move("gitOauthScope", "git", "oauthScope");
 
-  move("awsEnabled", "aws", "enabled");
-  move("awsAccessKeyId", "aws", "accessKeyId");
-  move("awsDefaultRegion", "aws", "defaultRegion");
-  move("awsSecretAccessKey", "aws", "secretAccessKey");
-  move("awsSessionToken", "aws", "sessionToken");
-
   move("jiraBaseUrl", "jira", "baseUrl");
   move("jiraEmail", "jira", "email");
   move("jiraEnabled", "jira", "enabled");
@@ -683,6 +687,7 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
   move("figmaBaseUrl", "figma", "baseUrl");
   move("figmaEnabled", "figma", "enabled");
   move("figmaApiToken", "figma", "apiToken");
+  move("environmentVariables", "env", "variables");
 
   return patch;
 }
@@ -698,13 +703,6 @@ export function buildAgentSettingsEnvPatch(config: AgentSettingsConfig): Record<
     if (config.git.oauthToken) envPatch.GH_TOKEN = config.git.oauthToken;
     if (config.git.oauthLogin) envPatch.DOER_GIT_OAUTH_LOGIN = config.git.oauthLogin;
     if (config.git.oauthScope) envPatch.DOER_GIT_OAUTH_SCOPE = config.git.oauthScope;
-  }
-  if (config.aws.enabled) {
-    if (config.aws.accessKeyId) envPatch.AWS_ACCESS_KEY_ID = config.aws.accessKeyId;
-    if (config.aws.defaultRegion) envPatch.AWS_DEFAULT_REGION = config.aws.defaultRegion;
-    if (config.aws.defaultRegion) envPatch.AWS_REGION = config.aws.defaultRegion;
-    if (config.aws.secretAccessKey) envPatch.AWS_SECRET_ACCESS_KEY = config.aws.secretAccessKey;
-    if (config.aws.sessionToken) envPatch.AWS_SESSION_TOKEN = config.aws.sessionToken;
   }
   if (config.jira.enabled) {
     if (config.jira.baseUrl) envPatch.JIRA_BASE_URL = config.jira.baseUrl;
@@ -723,6 +721,9 @@ export function buildAgentSettingsEnvPatch(config: AgentSettingsConfig): Record<
   if (config.figma.enabled) {
     if (config.figma.baseUrl) envPatch.FIGMA_BASE_URL = config.figma.baseUrl;
     if (config.figma.apiToken) envPatch.FIGMA_API_TOKEN = config.figma.apiToken;
+  }
+  for (const variable of config.env.variables) {
+    envPatch[variable.key] = variable.value;
   }
   return envPatch;
 }
