@@ -107,7 +107,7 @@ async function generateSkillViaCodex(args: {
   const envPatch = args.buildAgentSettingsEnvPatch(localAgentSettings);
   const prompt = buildSkillGeneratorPrompt(args.userPrompt);
   const result = await args.runLocalCodexCli(
-    buildSkillGeneratorCodexArgs(prompt, localAgentSettings.codex.model || "gpt-5.4"),
+    buildSkillGeneratorCodexArgs(prompt, localAgentSettings.codex.model || "gpt-5.5"),
     120_000,
     envPatch,
   );

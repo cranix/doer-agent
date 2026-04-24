@@ -39,7 +39,7 @@ export function stripAnsi(value: string): string {
 
 export function normalizeCodexModel(value: unknown): string {
   const normalized = typeof value === "string" ? value.trim() : "";
-  return normalized || "gpt-5.4";
+  return normalized || "gpt-5.5";
 }
 
 export function buildManagedCodexArgs(args: {

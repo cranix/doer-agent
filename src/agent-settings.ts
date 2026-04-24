@@ -127,7 +127,7 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
       personality: "pragmatic",
     },
     codex: {
-      model: "gpt-5.4",
+      model: "gpt-5.5",
       authMode: "api_key",
     },
     realtime: {
