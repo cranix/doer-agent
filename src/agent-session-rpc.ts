@@ -14,8 +14,6 @@ const SESSION_RPC_BLOB_KEYS = new Set([
   "bytes",
   "data",
 ]);
-const SESSION_RPC_MAX_STRING_CHARS = 512;
-
 type AgentSessionRpcAction = "list" | "messages" | "delete" | "watch" | "stop_watch";
 
 interface AgentSessionRpcRequest {
@@ -165,20 +163,28 @@ function buildInlineBlobMarker(value: string): string {
   return "[inline blob omitted]";
 }
 
-function truncateSessionRpcString(value: string): string {
-  if (value.length <= SESSION_RPC_MAX_STRING_CHARS) {
-    return value;
+function getSessionRpcPayloadByteLength(value: unknown): number | null {
+  try {
+    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    return typeof serialized === "string" ? Buffer.byteLength(serialized, "utf8") : null;
+  } catch {
+    return null;
   }
-  const omittedChars = value.length - SESSION_RPC_MAX_STRING_CHARS;
-  return `${value.slice(0, SESSION_RPC_MAX_STRING_CHARS)}\n[truncated ${omittedChars} chars for session RPC]`;
 }
 
-function sanitizeSessionRpcPayload(value: unknown, options: { truncateStrings?: boolean } = {}): unknown {
+function buildSessionRpcTruncatedMarker(label: string, value: unknown): string {
+  const byteLength = getSessionRpcPayloadByteLength(value);
+  return byteLength === null
+    ? `[${label} truncated for session RPC pagination]`
+    : `[${label} truncated for session RPC pagination: ${byteLength} bytes omitted]`;
+}
+
+function sanitizeSessionRpcPayload(value: unknown): unknown {
   if (typeof value === "string") {
-    return options.truncateStrings ? truncateSessionRpcString(value) : value;
+    return value;
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeSessionRpcPayload(entry, options));
+    return value.map((entry) => sanitizeSessionRpcPayload(entry));
   }
   if (!isObjectRecord(value)) {
     return value;
@@ -190,7 +196,7 @@ function sanitizeSessionRpcPayload(value: unknown, options: { truncateStrings?: 
       sanitized[key] = buildInlineBlobMarker(entry);
       continue;
     }
-    sanitized[key] = sanitizeSessionRpcPayload(entry, options);
+    sanitized[key] = sanitizeSessionRpcPayload(entry);
   }
   return sanitized;
 }
@@ -209,7 +215,7 @@ function sanitizeSessionRpcRawLine(line: string): string {
     if (parsed.type === "compacted" || parsed.type === "turn_context" || parsed.type === "session_meta") {
       return JSON.stringify({
         ...parsed,
-        payload: sanitizeSessionRpcPayload(parsed.payload, { truncateStrings: true }),
+        payload: buildSessionRpcTruncatedMarker("payload", parsed.payload),
       });
     }
     if (!isObjectRecord(parsed.payload)) {
@@ -225,7 +231,7 @@ function sanitizeSessionRpcRawLine(line: string): string {
         payload: {
           type: payloadType,
           status: typeof parsed.payload.status === "string" ? parsed.payload.status : "completed",
-          message: `[${payloadType} payload omitted for session RPC pagination]`,
+          message: buildSessionRpcTruncatedMarker(`${payloadType} payload`, parsed.payload),
         },
       });
     }
