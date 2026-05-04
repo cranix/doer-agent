@@ -1,5 +1,6 @@
 import { watch, type FSWatcher } from "node:fs";
-import { open, readdir, realpath, rm, rmdir, stat, unlink } from "node:fs/promises";
+import { open, mkdir, readdir, realpath, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import crypto from "node:crypto";
 import path from "node:path";
 import { StringCodec, type Msg, type NatsConnection } from "nats";
 
@@ -163,6 +164,91 @@ function buildInlineBlobMarker(value: string): string {
   return "[inline blob omitted]";
 }
 
+function extensionForImageMimeType(mimeType: string): string {
+  const normalized = mimeType.trim().toLowerCase();
+  if (normalized === "image/jpeg" || normalized === "image/jpg") return ".jpg";
+  if (normalized === "image/webp") return ".webp";
+  if (normalized === "image/gif") return ".gif";
+  if (normalized === "image/svg+xml") return ".svg";
+  if (normalized === "image/bmp") return ".bmp";
+  if (normalized === "image/avif") return ".avif";
+  return ".png";
+}
+
+function decodeInlineImageDataUrl(value: string): { bytes: Buffer; mimeType: string } | null {
+  const trimmed = value.trim();
+  const match = /^data:([^;,]+)(?:;[^,]*)?;base64,([\s\S]+)$/i.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  const mimeType = match[1]?.trim().toLowerCase() || "";
+  if (!mimeType.startsWith("image/")) {
+    return null;
+  }
+  const base64 = match[2]?.replace(/\s/g, "") || "";
+  if (!base64) {
+    return null;
+  }
+  try {
+    return {
+      bytes: Buffer.from(base64, "base64"),
+      mimeType,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeSessionPathSegment(value: string, fallback: string): string {
+  return value.trim().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160) || fallback;
+}
+
+function inferSessionIdFromSessionFilePath(filePath: string): string | null {
+  const base = path.basename(filePath, path.extname(filePath));
+  const match = /^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)$/.exec(base);
+  const inferred = match?.[1]?.trim() || "";
+  return inferred || null;
+}
+
+async function materializeInlineSessionImage(args: {
+  workspaceRoot: string;
+  filePath: string;
+  lineNumber: number;
+  sessionId: string | null;
+  value: string;
+}): Promise<{ relPath: string; name: string; size: number; mimeType: string } | null> {
+  const decoded = decodeInlineImageDataUrl(args.value);
+  if (!decoded || decoded.bytes.byteLength === 0) {
+    return null;
+  }
+
+  const inferredSessionId = inferSessionIdFromSessionFilePath(args.filePath);
+  const sessionBase =
+    (args.sessionId ? sanitizeSessionPathSegment(args.sessionId, "") : "")
+    || (inferredSessionId ? sanitizeSessionPathSegment(inferredSessionId, "") : "")
+    || sanitizeSessionPathSegment(path.basename(args.filePath, path.extname(args.filePath)), "session");
+  const hash = crypto.createHash("sha256").update(decoded.bytes).digest("hex").slice(0, 16);
+  const ext = extensionForImageMimeType(decoded.mimeType);
+  const name = `line-${args.lineNumber}-${hash}${ext}`;
+  const relPath = path.posix.join(".doer-agent", "sessions", sessionBase, "outputs", name);
+  const absPath = path.resolve(args.workspaceRoot, relPath);
+  if (!(absPath === args.workspaceRoot || absPath.startsWith(args.workspaceRoot + path.sep))) {
+    return null;
+  }
+
+  await mkdir(path.dirname(absPath), { recursive: true });
+  const existing = await stat(absPath).catch(() => null);
+  if (!existing || !existing.isFile() || existing.size !== decoded.bytes.byteLength) {
+    await writeFile(absPath, decoded.bytes);
+  }
+  return {
+    relPath,
+    name,
+    size: decoded.bytes.byteLength,
+    mimeType: decoded.mimeType,
+  };
+}
+
 function getSessionRpcPayloadByteLength(value: unknown): number | null {
   try {
     const serialized = typeof value === "string" ? value : JSON.stringify(value);
@@ -179,12 +265,17 @@ function buildSessionRpcTruncatedMarker(label: string, value: unknown): string {
     : `[${label} truncated for session RPC pagination: ${byteLength} bytes omitted]`;
 }
 
-function sanitizeSessionRpcPayload(value: unknown): unknown {
+async function sanitizeSessionRpcPayload(value: unknown, args: {
+  workspaceRoot: string;
+  filePath: string;
+  lineNumber: number;
+  sessionId: string | null;
+}): Promise<unknown> {
   if (typeof value === "string") {
     return value;
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeSessionRpcPayload(entry));
+    return Promise.all(value.map((entry) => sanitizeSessionRpcPayload(entry, args)));
   }
   if (!isObjectRecord(value)) {
     return value;
@@ -193,15 +284,31 @@ function sanitizeSessionRpcPayload(value: unknown): unknown {
   const sanitized: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
     if (SESSION_RPC_BLOB_KEYS.has(key) && typeof entry === "string" && isInlineBlobString(entry)) {
+      if (key === "image_url") {
+        const materialized = await materializeInlineSessionImage({ ...args, value: entry });
+        if (materialized) {
+          sanitized[key] = materialized.relPath;
+          sanitized.name = typeof value.name === "string" && value.name.trim() ? value.name : materialized.name;
+          sanitized.size = typeof value.size === "number" && Number.isFinite(value.size) ? value.size : materialized.size;
+          sanitized.mimeType =
+            typeof value.mimeType === "string" && value.mimeType.trim() ? value.mimeType : materialized.mimeType;
+          continue;
+        }
+      }
       sanitized[key] = buildInlineBlobMarker(entry);
       continue;
     }
-    sanitized[key] = sanitizeSessionRpcPayload(entry);
+    sanitized[key] = await sanitizeSessionRpcPayload(entry, args);
   }
   return sanitized;
 }
 
-function sanitizeSessionRpcRawLine(line: string): string {
+async function sanitizeSessionRpcRawLine(line: string, args: {
+  workspaceRoot: string;
+  filePath: string;
+  lineNumber: number;
+  sessionId: string | null;
+}): Promise<string> {
   const trimmed = line.trim();
   if (!trimmed.startsWith("{")) {
     return line;
@@ -237,7 +344,7 @@ function sanitizeSessionRpcRawLine(line: string): string {
     }
     return JSON.stringify({
       ...parsed,
-      payload: sanitizeSessionRpcPayload(parsed.payload),
+      payload: await sanitizeSessionRpcPayload(parsed.payload, args),
     });
   } catch {
     return line;
@@ -595,6 +702,7 @@ async function readSessionLineIndex(workspaceRoot: string, filePath: string): Pr
 async function getAgentSessionRawRows(args: {
   workspaceRoot: string;
   filePath: string;
+  sessionId: string | null;
   sinceLine: number;
   beforeRowId: number | null;
   pageSize: number;
@@ -603,6 +711,7 @@ async function getAgentSessionRawRows(args: {
   nextCursor: number;
 }> {
   const resolvedFile = resolveSessionFilePath(args.workspaceRoot, args.filePath);
+  const effectiveSessionId = args.sessionId || await readSessionIdFromSessionFile(resolvedFile).catch(() => null);
   const index = await readSessionLineIndex(args.workspaceRoot, resolvedFile);
   const totalLines = index.lineStartOffsets.length;
   const sinceLine = Math.max(0, Math.floor(args.sinceLine));
@@ -721,7 +830,12 @@ async function getAgentSessionRawRows(args: {
     let lineNumber = startLineIndex + 1;
     for (const line of lines) {
       if (line.trim()) {
-        const sanitized = sanitizeSessionRpcRawLine(line);
+        const sanitized = await sanitizeSessionRpcRawLine(line, {
+          workspaceRoot: args.workspaceRoot,
+          filePath: resolvedFile,
+          lineNumber,
+          sessionId: effectiveSessionId,
+        });
         rawRows.push({
           id: lineNumber,
           raw: sanitized,
@@ -739,7 +853,7 @@ async function getAgentSessionRawRows(args: {
 }
 
 function resolveSessionUploadsDir(workspaceRoot: string, sessionId: string): string {
-  const safeSessionId = sessionId.trim().replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160) || "session";
+  const safeSessionId = sanitizeSessionPathSegment(sessionId, "session");
   return path.join(workspaceRoot, ".doer-agent", "sessions", safeSessionId);
 }
 
@@ -889,6 +1003,7 @@ async function handleSessionRpcMessage(args: {
       const result = await getAgentSessionRawRows({
         workspaceRoot: args.workspaceRoot,
         filePath: request.filePath ?? "",
+        sessionId: request.sessionId,
         sinceLine: request.sinceLine,
         beforeRowId: request.beforeRowId,
         pageSize: request.pageSize,
