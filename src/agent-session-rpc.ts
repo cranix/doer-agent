@@ -256,6 +256,11 @@ function pickSessionString(...values: unknown[]): string | null {
   return null;
 }
 
+function toSortableTimestampMs(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 export async function collectSessionJsonlFiles(workspaceRoot: string): Promise<Array<{ filePath: string; mtimeMs: number }>> {
   const out: Array<{ filePath: string; mtimeMs: number }> = [];
   const stack = [getSessionsRootPath(workspaceRoot)];
@@ -316,8 +321,15 @@ async function readFirstLine(fileHandle: Awaited<ReturnType<typeof open>>, fileS
   return raw.trim();
 }
 
-function extractLastAgentMessage(candidateLines: string[]): { message: string; updatedAt: string | null } | null {
-  let fallback: { message: string; updatedAt: string | null } | null = null;
+function normalizeSessionSummaryMessage(value: unknown): string | null {
+  const message = toTrimmedStringOrNull(value);
+  if (!message || message.toLowerCase() === "empty") {
+    return null;
+  }
+  return message;
+}
+
+function extractLastSessionMessage(candidateLines: string[]): { message: string; updatedAt: string | null } | null {
   for (const line of candidateLines) {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -328,20 +340,13 @@ function extractLastAgentMessage(candidateLines: string[]): { message: string; u
       if (parsed.type !== "event_msg" || !isObjectRecord(parsed.payload)) {
         continue;
       }
-      if (parsed.payload.type === "agent_message" && typeof parsed.payload.message === "string" && parsed.payload.message.trim()) {
-        return {
-          message: parsed.payload.message.trim(),
-          updatedAt: toTrimmedStringOrNull(parsed.timestamp),
-        };
+      if (parsed.payload.type !== "agent_message" && parsed.payload.type !== "user_message") {
+        continue;
       }
-      if (
-        !fallback &&
-        parsed.payload.type === "task_complete" &&
-        typeof parsed.payload.last_agent_message === "string" &&
-        parsed.payload.last_agent_message.trim()
-      ) {
-        fallback = {
-          message: parsed.payload.last_agent_message.trim(),
+      const message = normalizeSessionSummaryMessage(parsed.payload.message);
+      if (message) {
+        return {
+          message,
           updatedAt: toTrimmedStringOrNull(parsed.timestamp),
         };
       }
@@ -349,10 +354,10 @@ function extractLastAgentMessage(candidateLines: string[]): { message: string; u
       // ignore malformed lines
     }
   }
-  return fallback;
+  return null;
 }
 
-async function readLastAgentMessage(
+async function readLastSessionMessage(
   fileHandle: Awaited<ReturnType<typeof open>>,
   fileSize: number,
 ): Promise<{ message: string; updatedAt: string | null } | null> {
@@ -376,12 +381,12 @@ async function readLastAgentMessage(
     const merged = buffer.toString("utf8", 0, bytesRead) + carry;
     const lines = merged.split(/\r?\n/);
     carry = lines.shift() || "";
-    const found = extractLastAgentMessage(lines.reverse());
+    const found = extractLastSessionMessage(lines.reverse());
     if (found) {
       return found;
     }
   }
-  return extractLastAgentMessage([carry]);
+  return extractLastSessionMessage([carry]);
 }
 
 function normalizeSessionMeta(rawMeta: unknown, filePath: string, mtimeMs: number): AgentSessionSummaryRecord {
@@ -405,7 +410,7 @@ async function readSessionSummary(filePath: string, mtimeMs: number): Promise<Ag
     fileHandle = await open(filePath, "r");
     const entryStat = await fileHandle.stat();
     const firstLine = await readFirstLine(fileHandle, entryStat.size);
-    const tailSummary = await readLastAgentMessage(fileHandle, entryStat.size);
+    const tailSummary = await readLastSessionMessage(fileHandle, entryStat.size);
     let normalized = normalizeSessionMeta({}, filePath, mtimeMs);
 
     if (firstLine) {
@@ -455,7 +460,7 @@ async function listAgentSessions(workspaceRoot: string): Promise<AgentSessionSum
   const files = await collectSessionJsonlFiles(workspaceRoot);
   files.sort((a, b) => b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath));
   const sessions = await Promise.all(files.slice(0, 10).map((file) => readSessionSummary(file.filePath, file.mtimeMs)));
-  return sessions.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt) || b.filePath.localeCompare(a.filePath));
+  return sessions.sort((a, b) => toSortableTimestampMs(b.updatedAt) - toSortableTimestampMs(a.updatedAt) || b.filePath.localeCompare(a.filePath));
 }
 
 async function readSessionLineIndex(workspaceRoot: string, filePath: string): Promise<SessionLineIndexCacheEntry> {
