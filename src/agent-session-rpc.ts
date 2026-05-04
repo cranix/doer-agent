@@ -14,6 +14,7 @@ const SESSION_RPC_BLOB_KEYS = new Set([
   "bytes",
   "data",
 ]);
+const SESSION_RPC_MAX_STRING_CHARS = 512;
 
 type AgentSessionRpcAction = "list" | "messages" | "delete" | "watch" | "stop_watch";
 
@@ -164,9 +165,17 @@ function buildInlineBlobMarker(value: string): string {
   return "[inline blob omitted]";
 }
 
+function truncateSessionRpcString(value: string): string {
+  if (value.length <= SESSION_RPC_MAX_STRING_CHARS) {
+    return value;
+  }
+  const omittedChars = value.length - SESSION_RPC_MAX_STRING_CHARS;
+  return `${value.slice(0, SESSION_RPC_MAX_STRING_CHARS)}\n[truncated ${omittedChars} chars for session RPC]`;
+}
+
 function sanitizeSessionRpcPayload(value: unknown): unknown {
   if (typeof value === "string") {
-    return value;
+    return truncateSessionRpcString(value);
   }
   if (Array.isArray(value)) {
     return value.map((entry) => sanitizeSessionRpcPayload(entry));
@@ -186,33 +195,52 @@ function sanitizeSessionRpcPayload(value: unknown): unknown {
   return sanitized;
 }
 
-function sanitizeSessionRpcRawLine(line: string): string | null {
+function sanitizeSessionRpcRawLine(line: string): string {
   const trimmed = line.trim();
   if (!trimmed.startsWith("{")) {
-    return line;
+    return truncateSessionRpcString(line);
   }
 
   try {
     const parsed = JSON.parse(line) as { type?: unknown; payload?: unknown };
     if (!isObjectRecord(parsed)) {
-      return line;
+      return truncateSessionRpcString(line);
     }
     if (parsed.type === "compacted" || parsed.type === "turn_context" || parsed.type === "session_meta") {
-      return null;
+      return JSON.stringify({
+        ...parsed,
+        payload: sanitizeSessionRpcPayload(parsed.payload),
+      });
     }
-    if (!isObjectRecord(parsed.payload) || parsed.type !== "response_item") {
-      return line;
+    if (!isObjectRecord(parsed.payload)) {
+      return JSON.stringify({
+        ...parsed,
+        payload: sanitizeSessionRpcPayload(parsed.payload),
+      });
+    }
+    if (parsed.type !== "response_item") {
+      return JSON.stringify({
+        ...parsed,
+        payload: sanitizeSessionRpcPayload(parsed.payload),
+      });
     }
     const payloadType = typeof parsed.payload.type === "string" ? parsed.payload.type : "";
     if (payloadType === "message" || payloadType === "reasoning") {
-      return null;
+      return JSON.stringify({
+        ...parsed,
+        payload: {
+          type: payloadType,
+          status: typeof parsed.payload.status === "string" ? parsed.payload.status : "completed",
+          message: `[${payloadType} payload omitted for session RPC pagination]`,
+        },
+      });
     }
     return JSON.stringify({
       ...parsed,
       payload: sanitizeSessionRpcPayload(parsed.payload),
     });
   } catch {
-    return line;
+    return truncateSessionRpcString(line);
   }
 }
 
@@ -631,10 +659,6 @@ async function getAgentSessionRawRows(args: {
     for (const line of lines) {
       if (line.trim()) {
         const sanitized = sanitizeSessionRpcRawLine(line);
-        if (!sanitized) {
-          lineNumber += 1;
-          continue;
-        }
         rawRows.push({
           id: lineNumber,
           raw: sanitized,
