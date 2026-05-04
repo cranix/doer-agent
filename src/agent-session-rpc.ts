@@ -363,36 +363,75 @@ function extractLastSessionMessage(candidateLines: string[]): { message: string;
   return null;
 }
 
-async function readLastSessionMessage(
+function linePrefixContainsSessionMessageCandidate(prefix: string): boolean {
+  return (
+    /"type"\s*:\s*"event_msg"/.test(prefix) &&
+    /"type"\s*:\s*"(agent_message|user_message)"/.test(prefix)
+  );
+}
+
+async function readLineSpan(
   fileHandle: Awaited<ReturnType<typeof open>>,
-  fileSize: number,
-): Promise<{ message: string; updatedAt: string | null } | null> {
-  const chunkBytes = 16_384;
-  const maxScanBytes = 131_072;
-  if (fileSize <= 0) {
-    return null;
+  start: number,
+  end: number,
+): Promise<string> {
+  const readSize = Math.max(0, end - start);
+  if (readSize <= 0) {
+    return "";
   }
-  let position = fileSize;
-  let scanned = 0;
-  let carry = "";
-  while (position > 0 && scanned < maxScanBytes) {
-    const readSize = Math.min(chunkBytes, position, maxScanBytes - scanned);
-    position -= readSize;
-    scanned += readSize;
-    const buffer = Buffer.alloc(readSize);
-    const { bytesRead } = await fileHandle.read(buffer, 0, readSize, position);
+  const buffer = Buffer.alloc(readSize);
+  let totalBytesRead = 0;
+  while (totalBytesRead < readSize) {
+    const { bytesRead } = await fileHandle.read(
+      buffer,
+      totalBytesRead,
+      readSize - totalBytesRead,
+      start + totalBytesRead,
+    );
     if (bytesRead <= 0) {
       break;
     }
-    const merged = buffer.toString("utf8", 0, bytesRead) + carry;
-    const lines = merged.split(/\r?\n/);
-    carry = lines.shift() || "";
-    const found = extractLastSessionMessage(lines.reverse());
-    if (found) {
-      return found;
-    }
+    totalBytesRead += bytesRead;
   }
-  return extractLastSessionMessage([carry]);
+  return buffer.toString("utf8", 0, totalBytesRead).trim();
+}
+
+async function readLastSessionMessage(
+  workspaceRoot: string,
+  filePath: string,
+): Promise<{ message: string; updatedAt: string | null } | null> {
+  const index = await readSessionLineIndex(workspaceRoot, filePath);
+  const totalLines = index.lineStartOffsets.length;
+  if (totalLines <= 0 || index.size <= 0) {
+    return null;
+  }
+
+  const resolvedFile = resolveSessionFilePath(workspaceRoot, filePath);
+  const fileHandle = await open(resolvedFile, "r");
+  try {
+    for (let lineIndex = totalLines - 1; lineIndex >= 0; lineIndex -= 1) {
+      const start = index.lineStartOffsets[lineIndex] ?? index.size;
+      const end = lineIndex + 1 < totalLines ? (index.lineStartOffsets[lineIndex + 1] ?? index.size) : index.size;
+      const spanBytes = Math.max(0, end - start);
+      if (spanBytes <= 0) {
+        continue;
+      }
+
+      const prefixBytes = Math.min(spanBytes, 1024);
+      const prefix = await readLineSpan(fileHandle, start, start + prefixBytes);
+      if (!linePrefixContainsSessionMessageCandidate(prefix)) {
+        continue;
+      }
+
+      const found = extractLastSessionMessage([await readLineSpan(fileHandle, start, end)]);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  } finally {
+    await fileHandle.close().catch(() => undefined);
+  }
 }
 
 function normalizeSessionMeta(rawMeta: unknown, filePath: string, mtimeMs: number): AgentSessionSummaryRecord {
@@ -410,13 +449,13 @@ function normalizeSessionMeta(rawMeta: unknown, filePath: string, mtimeMs: numbe
   };
 }
 
-async function readSessionSummary(filePath: string, mtimeMs: number): Promise<AgentSessionSummaryRecord> {
+async function readSessionSummary(workspaceRoot: string, filePath: string, mtimeMs: number): Promise<AgentSessionSummaryRecord> {
   let fileHandle: Awaited<ReturnType<typeof open>> | null = null;
   try {
     fileHandle = await open(filePath, "r");
     const entryStat = await fileHandle.stat();
     const firstLine = await readFirstLine(fileHandle, entryStat.size);
-    const tailSummary = await readLastSessionMessage(fileHandle, entryStat.size);
+    const tailSummary = await readLastSessionMessage(workspaceRoot, filePath);
     let normalized = normalizeSessionMeta({}, filePath, mtimeMs);
 
     if (firstLine) {
@@ -453,6 +492,7 @@ async function readSessionSummary(filePath: string, mtimeMs: number): Promise<Ag
 }
 
 async function listAgentSessions(workspaceRoot: string): Promise<AgentSessionSummaryRecord[]> {
+  const maxSessionSummaries = 10;
   const sessionsRoot = getSessionsRootPath(workspaceRoot);
   let sessionsRootStat;
   try {
@@ -465,8 +505,26 @@ async function listAgentSessions(workspaceRoot: string): Promise<AgentSessionSum
   }
   const files = await collectSessionJsonlFiles(workspaceRoot);
   files.sort((a, b) => b.mtimeMs - a.mtimeMs || a.filePath.localeCompare(b.filePath));
-  const sessions = await Promise.all(files.slice(0, 10).map((file) => readSessionSummary(file.filePath, file.mtimeMs)));
-  return sessions.sort((a, b) => toSortableTimestampMs(b.updatedAt) - toSortableTimestampMs(a.updatedAt) || b.filePath.localeCompare(a.filePath));
+  const sessions: AgentSessionSummaryRecord[] = [];
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    sessions.push(await readSessionSummary(workspaceRoot, file.filePath, file.mtimeMs));
+    sessions.sort((a, b) => toSortableTimestampMs(b.updatedAt) - toSortableTimestampMs(a.updatedAt) || b.filePath.localeCompare(a.filePath));
+    if (sessions.length > maxSessionSummaries) {
+      sessions.length = maxSessionSummaries;
+    }
+
+    const nextFile = files[index + 1] ?? null;
+    const oldestSelectedSession = sessions[maxSessionSummaries - 1] ?? null;
+    if (
+      nextFile &&
+      oldestSelectedSession &&
+      toSortableTimestampMs(oldestSelectedSession.updatedAt) >= nextFile.mtimeMs
+    ) {
+      break;
+    }
+  }
+  return sessions;
 }
 
 async function readSessionLineIndex(workspaceRoot: string, filePath: string): Promise<SessionLineIndexCacheEntry> {
