@@ -48,6 +48,8 @@ export interface AgentSettingsConfig {
   codex: {
     model: string;
     authMode: "api_key" | "oauth";
+    computerUseEnabled: boolean;
+    browserUseEnabled: boolean;
   };
   realtime: {
     model: string;
@@ -79,6 +81,8 @@ export interface AgentSettingsPublic {
   codex: {
     model: string;
     authMode: "api_key" | "oauth";
+    computerUseEnabled: boolean;
+    browserUseEnabled: boolean;
     hasApiKey: boolean;
     apiKeyMasked: string | null;
     apiKeyLength: number | null;
@@ -129,6 +133,8 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
     codex: {
       model: "gpt-5.5",
       authMode: "api_key",
+      computerUseEnabled: false,
+      browserUseEnabled: false,
     },
     realtime: {
       model: process.env.OPENAI_REALTIME_MODEL?.trim() || "gpt-realtime",
@@ -344,6 +350,10 @@ export function normalizeAgentSettingsConfig(
     codex: {
       model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
       authMode: codex.authMode === "oauth" ? "oauth" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
+      computerUseEnabled:
+        typeof codex.computerUseEnabled === "boolean" ? codex.computerUseEnabled : base.codex.computerUseEnabled,
+      browserUseEnabled:
+        typeof codex.browserUseEnabled === "boolean" ? codex.browserUseEnabled : base.codex.browserUseEnabled,
     },
     realtime: {
       model: typeof realtime.model === "string" && realtime.model.trim() ? realtime.model.trim() : base.realtime.model,
@@ -440,6 +450,8 @@ export async function toAgentSettingsPublic(args: {
     codex: {
       model: args.config.codex.model,
       authMode: args.config.codex.authMode,
+      computerUseEnabled: args.config.codex.computerUseEnabled,
+      browserUseEnabled: args.config.codex.browserUseEnabled,
       hasApiKey: false,
       apiKeyMasked: null,
       apiKeyLength: null,
@@ -521,6 +533,8 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
 
   move("codexModel", "codex", "model");
   move("codexAuthMode", "codex", "authMode");
+  move("computerUseEnabled", "codex", "computerUseEnabled");
+  move("browserUseEnabled", "codex", "browserUseEnabled");
 
   move("realtimeModel", "realtime", "model");
   move("realtimeVoice", "realtime", "voice");
