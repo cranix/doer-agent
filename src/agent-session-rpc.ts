@@ -173,12 +173,12 @@ function truncateSessionRpcString(value: string): string {
   return `${value.slice(0, SESSION_RPC_MAX_STRING_CHARS)}\n[truncated ${omittedChars} chars for session RPC]`;
 }
 
-function sanitizeSessionRpcPayload(value: unknown): unknown {
+function sanitizeSessionRpcPayload(value: unknown, options: { truncateStrings?: boolean } = {}): unknown {
   if (typeof value === "string") {
-    return truncateSessionRpcString(value);
+    return options.truncateStrings ? truncateSessionRpcString(value) : value;
   }
   if (Array.isArray(value)) {
-    return value.map((entry) => sanitizeSessionRpcPayload(entry));
+    return value.map((entry) => sanitizeSessionRpcPayload(entry, options));
   }
   if (!isObjectRecord(value)) {
     return value;
@@ -190,7 +190,7 @@ function sanitizeSessionRpcPayload(value: unknown): unknown {
       sanitized[key] = buildInlineBlobMarker(entry);
       continue;
     }
-    sanitized[key] = sanitizeSessionRpcPayload(entry);
+    sanitized[key] = sanitizeSessionRpcPayload(entry, options);
   }
   return sanitized;
 }
@@ -198,31 +198,25 @@ function sanitizeSessionRpcPayload(value: unknown): unknown {
 function sanitizeSessionRpcRawLine(line: string): string {
   const trimmed = line.trim();
   if (!trimmed.startsWith("{")) {
-    return truncateSessionRpcString(line);
+    return line;
   }
 
   try {
     const parsed = JSON.parse(line) as { type?: unknown; payload?: unknown };
     if (!isObjectRecord(parsed)) {
-      return truncateSessionRpcString(line);
+      return line;
     }
     if (parsed.type === "compacted" || parsed.type === "turn_context" || parsed.type === "session_meta") {
       return JSON.stringify({
         ...parsed,
-        payload: sanitizeSessionRpcPayload(parsed.payload),
+        payload: sanitizeSessionRpcPayload(parsed.payload, { truncateStrings: true }),
       });
     }
     if (!isObjectRecord(parsed.payload)) {
-      return JSON.stringify({
-        ...parsed,
-        payload: sanitizeSessionRpcPayload(parsed.payload),
-      });
+      return line;
     }
     if (parsed.type !== "response_item") {
-      return JSON.stringify({
-        ...parsed,
-        payload: sanitizeSessionRpcPayload(parsed.payload),
-      });
+      return line;
     }
     const payloadType = typeof parsed.payload.type === "string" ? parsed.payload.type : "";
     if (payloadType === "message" || payloadType === "reasoning") {
@@ -240,7 +234,7 @@ function sanitizeSessionRpcRawLine(line: string): string {
       payload: sanitizeSessionRpcPayload(parsed.payload),
     });
   } catch {
-    return truncateSessionRpcString(line);
+    return line;
   }
 }
 
