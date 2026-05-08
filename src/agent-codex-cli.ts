@@ -7,7 +7,7 @@ const ANSI_RE = /\u001b\[[0-9;]*m/g;
 
 export interface ShellRpcCodexAuthBundle {
   taskId?: string;
-  authMode?: "api_key" | "oauth";
+  authMode?: "api_key" | "chatgpt";
   issuedAt?: string;
   expiresAt?: string;
   authJson?: string;
@@ -352,7 +352,7 @@ export function normalizeShellRpcCodexAuthBundle(value: unknown): ShellRpcCodexA
   }
   const row = value as Record<string, unknown>;
   const authJson = typeof row.authJson === "string" ? row.authJson : null;
-  const authMode = row.authMode === "oauth" ? "oauth" : row.authMode === "api_key" ? "api_key" : undefined;
+  const authMode = row.authMode === "chatgpt" ? "chatgpt" : row.authMode === "api_key" ? "api_key" : undefined;
   const apiKey = typeof row.apiKey === "string" || row.apiKey === null ? row.apiKey : undefined;
   if (!authJson && authMode !== "api_key" && apiKey === undefined) {
     return null;

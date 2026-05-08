@@ -30,7 +30,7 @@ export function sendSignalToPid(pid: number, signal: NodeJS.Signals): void {
 
 async function syncCodexAuthState(args: {
   source: "server_bundle";
-  authMode?: "api_key" | "oauth";
+  authMode?: "api_key" | "chatgpt";
   apiKey?: string | null;
   authJson?: string | null;
   issuedAt?: string | null;
@@ -62,7 +62,7 @@ async function syncCodexAuthState(args: {
 }
 
 export async function prepareCodexAuthBundle(bundle: {
-  authMode?: "api_key" | "oauth";
+  authMode?: "api_key" | "chatgpt";
   apiKey?: string | null;
   authJson?: string | null;
   issuedAt?: string | null;

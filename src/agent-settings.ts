@@ -47,7 +47,7 @@ export interface AgentSettingsConfig {
   };
   codex: {
     model: string;
-    authMode: "api_key" | "oauth";
+    authMode: "api_key" | "chatgpt";
     computerUseEnabled: boolean;
     browserUseEnabled: boolean;
   };
@@ -80,7 +80,7 @@ export interface AgentSettingsPublic {
   };
   codex: {
     model: string;
-    authMode: "api_key" | "oauth";
+    authMode: "api_key" | "chatgpt";
     computerUseEnabled: boolean;
     browserUseEnabled: boolean;
     hasApiKey: boolean;
@@ -349,7 +349,7 @@ export function normalizeAgentSettingsConfig(
     },
     codex: {
       model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
-      authMode: codex.authMode === "oauth" ? "oauth" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
+      authMode: codex.authMode === "chatgpt" ? "chatgpt" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
       computerUseEnabled:
         typeof codex.computerUseEnabled === "boolean" ? codex.computerUseEnabled : base.codex.computerUseEnabled,
       browserUseEnabled:

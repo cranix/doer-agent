@@ -6,10 +6,6 @@ export function sanitizeUserId(userId: string): string {
   return normalized.length > 0 ? normalized : "anonymous";
 }
 
-export function buildAgentCodexAuthRpcSubject(userId: string, agentId: string): string {
-  return `doer.agent.codex.auth.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
-}
-
 export function buildAgentCodexAppRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.codex.app.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }

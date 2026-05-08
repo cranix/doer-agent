@@ -8,7 +8,6 @@ import {
 } from "./agent-settings.js";
 import { handleFsRpcMessage } from "./agent-fs-rpc.js";
 import { handleGitRpcMessage } from "./agent-git-rpc.js";
-import { subscribeToCodexAuthRpc } from "./agent-codex-auth-rpc.js";
 import { subscribeToCodexAppRpc } from "./agent-codex-app-rpc.js";
 import { createCodexAppServerManager, type CodexAppServerManager } from "./codex-app-server-manager.js";
 import { subscribeToDaemonRpc } from "./agent-daemon-rpc.js";
@@ -18,7 +17,6 @@ import { runConnectedAgentSession } from "./agent-session-loop.js";
 import { subscribeToSkillRpc } from "./agent-skill-rpc.js";
 import { sendSignalToTaskProcess } from "./agent-task-execution.js";
 import {
-  buildAgentCodexAuthRpcSubject,
   buildAgentCodexAppEventsSubject,
   buildAgentCodexAppRpcSubject,
   buildAgentDaemonRpcSubject,
@@ -332,21 +330,6 @@ async function main() {
           resolveShellPath: runtimeEnvHelpers.resolveShellPath,
           resolveTaskWorkspace: runtimeEnvHelpers.resolveTaskWorkspace,
           readAgentSettingsConfig,
-          onInfo: writeAgentInfo,
-          onError: writeAgentError,
-        });
-        subscribeToCodexAuthRpc({
-          nc: jetstream.nc,
-          subject: buildAgentCodexAuthRpcSubject(userId, initialAgentId),
-          agentId: initialAgentId,
-          workspaceRoot: resolveWorkspaceRoot(),
-          buildLocalCodexCliCommand: localCodexCliTools.buildLocalCodexCliCommand,
-          resolveShellPath: runtimeEnvHelpers.resolveShellPath,
-          resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
-          runLocalCodexCli: localCodexCliTools.runLocalCodexCli,
-          runLocalCodexCliWithInput: localCodexCliTools.runLocalCodexCliWithInput,
-          sendSignalToTaskProcess,
-          stripAnsi: localCodexCliTools.stripAnsi,
           onInfo: writeAgentInfo,
           onError: writeAgentError,
         });
