@@ -177,6 +177,21 @@ function subscribeToFsRpc(args: {
   writeAgentInfo(`fs rpc subscribed subject=${subject}`);
 }
 
+function formatCodexAppNotificationParams(params: unknown): string {
+  if (params === undefined) {
+    return "undefined";
+  }
+  try {
+    return JSON.stringify(params);
+  } catch {
+    return String(params);
+  }
+}
+
+function shouldForwardCodexAppNotification(method: string): boolean {
+  return method !== "item/agentMessage/delta";
+}
+
 const runtimeEnvHelpers = createRuntimeEnvHelpers({
   resolveWorkspaceRoot,
   agentProjectDir: AGENT_PROJECT_DIR,
@@ -301,7 +316,10 @@ async function main() {
           readAgentSettingsConfig,
           onLog: writeAgentInfo,
           onNotification: (method, params) => {
-            writeAgentInfo(`codex app-server notification method=${method}`);
+            if (!shouldForwardCodexAppNotification(method)) {
+              return;
+            }
+            writeAgentInfo(`codex app-server notification method=${method} params=${formatCodexAppNotificationParams(params)}`);
             const event = {
               type: "codex.app.notification",
               agentId: initialAgentId,
