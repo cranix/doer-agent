@@ -189,7 +189,11 @@ function formatCodexAppNotificationParams(params: unknown): string {
 }
 
 function shouldForwardCodexAppNotification(method: string): boolean {
-  return method !== "item/agentMessage/delta";
+  return (
+    method !== "item/agentMessage/delta" &&
+    method !== "item/commandExecution/outputDelta" &&
+    method !== "item/plan/delta"
+  );
 }
 
 const runtimeEnvHelpers = createRuntimeEnvHelpers({
