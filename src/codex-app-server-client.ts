@@ -9,6 +9,7 @@ type PendingRequest = {
 
 export interface CodexAppServerClientOptions {
   cwd: string;
+  args: string[];
   env: NodeJS.ProcessEnv;
   requestTimeoutMs?: number;
   onLog?: (message: string) => void;
@@ -63,7 +64,7 @@ export class CodexAppServerClient {
   }
 
   private async startInner(): Promise<void> {
-    this.child = spawn("codex", ["app-server", "--listen", "stdio://"], {
+    this.child = spawn("codex", this.options.args, {
       cwd: this.options.cwd,
       env: this.options.env,
       stdio: ["pipe", "pipe", "pipe"],

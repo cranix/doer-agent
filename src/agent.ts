@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { type NatsConnection } from "nats";
+import { StringCodec, type NatsConnection } from "nats";
 import {
   buildAgentSettingsEnvPatch,
   readAgentSettingsConfig,
@@ -10,6 +10,7 @@ import { handleFsRpcMessage } from "./agent-fs-rpc.js";
 import { handleGitRpcMessage } from "./agent-git-rpc.js";
 import { subscribeToCodexAuthRpc } from "./agent-codex-auth-rpc.js";
 import { subscribeToCodexAppRpc } from "./agent-codex-app-rpc.js";
+import { createCodexAppServerManager, type CodexAppServerManager } from "./codex-app-server-manager.js";
 import { subscribeToDaemonRpc } from "./agent-daemon-rpc.js";
 import { createLocalCodexCliTools } from "./agent-codex-cli.js";
 import { connectBootstrapWithRetry, type AgentJetStreamContext } from "./agent-jetstream.js";
@@ -57,6 +58,7 @@ const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 const AGENT_PACKAGE_JSON_PATH = path.join(AGENT_PROJECT_DIR, "package.json");
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const HEARTBEAT_FAILURE_THRESHOLD = 3;
+const codexAppEventCodec = StringCodec();
 
 interface AgentEventEnvelope {
   serverBaseUrl: string;
@@ -102,6 +104,7 @@ function subscribeToSettingsRpc(args: {
   jetstream: AgentJetStreamContext;
   userId: string;
   agentId: string;
+  codexAppServerManager: CodexAppServerManager;
 }): void {
   const subject = buildAgentSettingsRpcSubject(args.userId, args.agentId);
   args.jetstream.nc.subscribe(subject, {
@@ -116,6 +119,7 @@ function subscribeToSettingsRpc(args: {
         nc: args.jetstream.nc,
         agentId: args.agentId,
         workspaceRoot: resolveWorkspaceRoot(),
+        onSettingsUpdated: () => args.codexAppServerManager.restart("settings updated"),
         onError: writeAgentError,
       });
     },
@@ -293,6 +297,26 @@ async function main() {
       formatTimestamp: formatLocalTimestamp,
       heartbeatAgentSession: heartbeatSession,
       subscribeAll: () => {
+        const codexAppServerManager = createCodexAppServerManager({
+          workspaceRoot: resolveWorkspaceRoot(),
+          resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
+          readAgentSettingsConfig,
+          onLog: writeAgentInfo,
+          onNotification: (method, params) => {
+            writeAgentInfo(`codex app-server notification method=${method}`);
+            const event = {
+              type: "codex.app.notification",
+              agentId: initialAgentId,
+              method,
+              params,
+              emittedAt: new Date().toISOString(),
+            };
+            jetstream.nc.publish(
+              buildAgentCodexAppEventsSubject(userId, initialAgentId),
+              codexAppEventCodec.encode(JSON.stringify(event)),
+            );
+          },
+        });
         subscribeToFsRpc({
           jetstream,
           serverBaseUrl,
@@ -331,9 +355,7 @@ async function main() {
           subject: buildAgentCodexAppRpcSubject(userId, initialAgentId),
           eventsSubject: buildAgentCodexAppEventsSubject(userId, initialAgentId),
           agentId: initialAgentId,
-          workspaceRoot: resolveWorkspaceRoot(),
-          resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
-          readAgentSettingsConfig,
+          manager: codexAppServerManager,
           onInfo: writeAgentInfo,
           onError: writeAgentError,
         });
@@ -341,6 +363,7 @@ async function main() {
           jetstream,
           userId,
           agentId: initialAgentId,
+          codexAppServerManager,
         });
         subscribeToGitRpc({
           jetstream,

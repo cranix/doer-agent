@@ -164,10 +164,12 @@ export async function handleSettingsRpcMessage(args: {
   nc: NatsConnection;
   agentId: string;
   workspaceRoot: string;
+  onSettingsUpdated?: () => Promise<void> | void;
   onError: (message: string) => void;
 }): Promise<void> {
   let requestId = "unknown";
   let responseSubject = "";
+  let didUpdateSettings = false;
   try {
     const payload = JSON.parse(settingsRpcCodec.decode(args.msg.data)) as AgentSettingsRpcRequest;
     const request = normalizeSettingsRpcRequest({ request: payload, agentId: args.agentId });
@@ -198,6 +200,7 @@ export async function handleSettingsRpcMessage(args: {
       if (customInstructions !== undefined) {
         await writeAgentModelInstructions({ workspaceRoot: args.workspaceRoot, value: customInstructions });
       }
+      didUpdateSettings = true;
     } else if (request.defaults) {
       const filePath = resolveAgentSettingsFilePath(args.workspaceRoot);
       const raw = await readFile(filePath, "utf8").catch(() => "");
@@ -214,6 +217,12 @@ export async function handleSettingsRpcMessage(args: {
         settings: await toAgentSettingsPublic({ workspaceRoot: args.workspaceRoot, config: next }),
       },
     });
+    if (didUpdateSettings) {
+      await Promise.resolve(args.onSettingsUpdated?.()).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        args.onError(`settings update hook failed requestId=${requestId} error=${message}`);
+      });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (responseSubject) {
