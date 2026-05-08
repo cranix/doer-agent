@@ -87,21 +87,6 @@ export function buildDaemonMcpConfigArgs(args: {
   });
 }
 
-export function buildDatabaseMcpConfigArgs(args: {
-  agentProjectDir: string;
-  workspaceRoot: string;
-  serverName?: string;
-}): string[] {
-  return buildWorkspaceMcpConfigArgs({
-    agentProjectDir: args.agentProjectDir,
-    workspaceRoot: args.workspaceRoot,
-    serverName: args.serverName?.trim() || "doer_database",
-    distEntryRelativePath: path.join("dist", "db-mcp-server.js"),
-    srcEntryRelativePath: path.join("src", "db-mcp-server.ts"),
-    workspaceRootEnvName: "DOER_DB_WORKSPACE_ROOT",
-  });
-}
-
 function buildWorkspaceMcpConfigArgs(args: {
   agentProjectDir: string;
   workspaceRoot: string;
