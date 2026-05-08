@@ -6,20 +6,16 @@ export function sanitizeUserId(userId: string): string {
   return normalized.length > 0 ? normalized : "anonymous";
 }
 
-export function buildAgentRunRpcSubject(userId: string, agentId: string): string {
-  return `doer.agent.run.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
-}
-
-export function buildAgentRunEventsSubject(userId: string, agentId: string): string {
-  return `doer.agent.run.events.${sanitizeUserId(userId)}.${agentId.trim()}`;
-}
-
-export function buildAgentSessionRpcSubject(userId: string, agentId: string): string {
-  return `doer.agent.session.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
-}
-
 export function buildAgentCodexAuthRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.codex.auth.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+export function buildAgentCodexAppRpcSubject(userId: string, agentId: string): string {
+  return `doer.agent.codex.app.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
+}
+
+export function buildAgentCodexAppEventsSubject(userId: string, agentId: string): string {
+  return `doer.agent.codex.app.events.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
 export function buildAgentSettingsRpcSubject(userId: string, agentId: string): string {
@@ -88,26 +84,6 @@ export function normalizeEnvPatch(value: unknown): Record<string, string> {
       continue;
     }
     out[normalizedKey] = raw;
-  }
-  return out;
-}
-
-export function normalizeRunImagePaths(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of value) {
-    if (typeof item !== "string") {
-      continue;
-    }
-    const normalized = item.trim();
-    if (!normalized || seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    out.push(normalized);
   }
   return out;
 }
@@ -183,32 +159,6 @@ export function validateImageBytes(filePath: string, bytes: Buffer): string | nu
   return null;
 }
 
-export async function filterValidRunImagePaths(args: {
-  workspaceRoot: string;
-  imagePaths: string[];
-  onInvalidImage?: (imagePath: string, reason: string) => void;
-}): Promise<string[]> {
-  const valid: string[] = [];
-  for (const imagePath of args.imagePaths) {
-    const absPath = path.isAbsolute(imagePath) ? imagePath : path.resolve(args.workspaceRoot, imagePath);
-    let bytes: Buffer;
-    try {
-      bytes = await readFile(absPath);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "failed to read image";
-      args.onInvalidImage?.(imagePath, reason);
-      continue;
-    }
-    const validationError = validateImageBytes(absPath, bytes);
-    if (validationError) {
-      args.onInvalidImage?.(imagePath, validationError);
-      continue;
-    }
-    valid.push(imagePath);
-  }
-  return valid;
-}
-
 export function fatalExit(message: string, error: unknown, writeAgentError: (message: string) => void): never {
   const detail = error instanceof Error ? error.message : typeof error === "string" ? error : error ? String(error) : "";
   const full = detail ? `${message}: ${detail}` : message;
@@ -233,22 +183,6 @@ export function writeRpcStream(requestId: string, stream: "stdout" | "stderr", c
       continue;
     }
     target.write(`[doer-agent][rpc=${requestId}][${stream}] ${line}\n`);
-  }
-}
-
-export function writeRunStatus(runId: string, message: string): void {
-  process.stdout.write(`[doer-agent][run=${runId}][status] ${message}\n`);
-}
-
-export function writeRunStream(runId: string, stream: "stdout" | "stderr", chunk: string): void {
-  const target = stream === "stdout" ? process.stdout : process.stderr;
-  const lines = chunk.split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (!line && index === lines.length - 1) {
-      continue;
-    }
-    target.write(`[doer-agent][run=${runId}][${stream}] ${line}\n`);
   }
 }
 

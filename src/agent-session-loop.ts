@@ -23,7 +23,6 @@ export async function runConnectedAgentSession(args: {
     agentToken: string;
   }) => Promise<void>;
   subscribeAll: () => void;
-  stopAllSessionWatchers: () => void;
   onInfraError: (message: string) => void;
   sleep: (ms: number) => Promise<void>;
 }): Promise<void> {
@@ -80,7 +79,6 @@ export async function runConnectedAgentSession(args: {
 
   const closeError = await args.jetstream.nc.closed();
   clearInterval(heartbeatTimer);
-  args.stopAllSessionWatchers();
   const detail = closeError instanceof Error ? closeError.message : "clean close";
   args.onInfraError(`nats session ended: ${detail}; reconnecting`);
   await args.sleep(1000);

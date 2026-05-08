@@ -1,84 +1,37 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { StringCodec, type Msg, type NatsConnection } from "nats";
+import { type NatsConnection } from "nats";
 import {
   buildAgentSettingsEnvPatch,
-  readAgentModelInstructions,
   readAgentSettingsConfig,
-  resolveAgentModelInstructionsFilePath,
 } from "./agent-settings.js";
 import { handleFsRpcMessage } from "./agent-fs-rpc.js";
 import { handleGitRpcMessage } from "./agent-git-rpc.js";
 import { subscribeToCodexAuthRpc } from "./agent-codex-auth-rpc.js";
+import { subscribeToCodexAppRpc } from "./agent-codex-app-rpc.js";
 import { subscribeToDaemonRpc } from "./agent-daemon-rpc.js";
-import {
-  buildDaemonMcpConfigArgs,
-  buildDatabaseMcpConfigArgs,
-  buildManagedCodexArgs,
-  createLocalCodexCliTools,
-  normalizeCodexModel,
-  normalizeShellRpcCodexAuthBundle,
-  spawnManagedCodexCommand,
-  type ShellRpcCodexAuthBundle,
-} from "./agent-codex-cli.js";
+import { createLocalCodexCliTools } from "./agent-codex-cli.js";
 import { connectBootstrapWithRetry, type AgentJetStreamContext } from "./agent-jetstream.js";
-import { prepareCommandExecution } from "./agent-run-execution.js";
-import { attachManagedRunProcessLifecycle, createPendingRunSessionTracker } from "./agent-run-lifecycle.js";
-import {
-  claimRunStartSlot,
-  cloneRunTask,
-  getStoredRun,
-  listPersistedRunTasks,
-  persistRunTask,
-  publishImmediateRunEvent,
-  pruneStaleRunsDir,
-  releaseRunStartSlot,
-  removeRunTask,
-  updateRunStartSlotSession,
-} from "./agent-run-state.js";
 import { runConnectedAgentSession } from "./agent-session-loop.js";
 import { subscribeToSkillRpc } from "./agent-skill-rpc.js";
-import {
-  prepareCodexAuthBundle,
-  sendSignalToPid,
-  sendSignalToTaskProcess,
-} from "./agent-task-execution.js";
-import {
-  collectSessionJsonlFiles,
-  detectPendingRunSession,
-  findSessionFilePathBySessionId,
-  stopAllSessionWatchers,
-  subscribeToSessionRpc,
-} from "./agent-session-rpc.js";
-import {
-  handleNonStartRunRpc,
-  normalizeRunRpcRequest,
-  publishRunRpcResponse,
-  type AgentRunRpcRequest,
-} from "./agent-run-rpc.js";
+import { sendSignalToTaskProcess } from "./agent-task-execution.js";
 import {
   buildAgentCodexAuthRpcSubject,
+  buildAgentCodexAppEventsSubject,
+  buildAgentCodexAppRpcSubject,
   buildAgentDaemonRpcSubject,
   buildAgentFsRpcSubject,
   buildAgentGitRpcSubject,
-  buildAgentRunEventsSubject,
-  buildAgentRunRpcSubject,
-  buildAgentSessionRpcSubject,
   buildAgentSettingsRpcSubject,
   buildAgentSkillRpcSubject,
   formatLocalTimestamp,
-  normalizeEnvPatch,
-  filterValidRunImagePaths,
-  normalizeRunImagePaths,
   parseArgs,
   resolveAgentVersion,
   resolveArgOrEnv,
   resolveContainerReachableServerBaseUrl,
   sanitizeUserId,
   sleep,
-  writeRunStatus,
-  writeRunStream,
 } from "./agent-runtime-utils.js";
 import { createRuntimeEnvHelpers } from "./agent-runtime-env.js";
 import {
@@ -89,8 +42,6 @@ import {
   postJson,
 } from "./agent-runtime-io.js";
 import { handleSettingsRpcMessage } from "./agent-settings-rpc.js";
-
-type CodexAuthBundleResponse = ShellRpcCodexAuthBundle;
 
 interface AgentNatsBootstrapResponse {
   servers?: unknown;
@@ -116,24 +67,6 @@ interface AgentEventEnvelope {
   payload: Record<string, unknown>;
 }
 
-interface PublicRunTask {
-  id: string;
-  userId: string;
-  agentId: string;
-  processPid: number | null;
-  sessionId: string | null;
-  sessionFilePath: string | null;
-  status: "queued" | "running" | "completed" | "failed" | "canceled";
-  cancelRequested: boolean;
-  resultExitCode: number | null;
-  resultSignal: string | null;
-  error: string | null;
-  createdAt: string;
-  updatedAt: string;
-  startedAt: string | null;
-  finishedAt: string | null;
-}
-
 interface ActiveTaskLogContext {
   jetstream: AgentJetStreamContext;
   serverBaseUrl: string;
@@ -147,8 +80,6 @@ let workspaceRootOverride: string | null = null;
 function resolveWorkspaceRoot(): string {
   return workspaceRootOverride ?? (process.env.WORKSPACE?.trim() || process.cwd());
 }
-const runRpcCodec = StringCodec();
-
 function writeAgentInfo(message: string): void {
   process.stdout.write(`[doer-agent] ${message}\n`);
   eventPersistenceHelpers.emitAgentMetaLog("info", message);
@@ -165,167 +96,6 @@ function writeAgentInfraError(message: string): void {
   } catch {
     // Keep heartbeat/connectivity failures non-fatal.
   }
-}
-
-async function updateRunSessionMetadata(task: PublicRunTask, metadata: {
-  sessionId?: string | null;
-  sessionFilePath?: string | null;
-  nc?: NatsConnection | null;
-}): Promise<void> {
-  let changed = false;
-  const previousSessionId = task.sessionId;
-  if (!task.sessionId && typeof metadata.sessionId === "string" && metadata.sessionId.trim()) {
-    task.sessionId = metadata.sessionId.trim();
-    changed = true;
-  }
-  if (!task.sessionFilePath && typeof metadata.sessionFilePath === "string" && metadata.sessionFilePath.trim()) {
-    task.sessionFilePath = metadata.sessionFilePath.trim();
-    changed = true;
-  }
-  if (!task.sessionFilePath && task.sessionId) {
-    const resolvedSessionFilePath = await findSessionFilePathBySessionId(resolveWorkspaceRoot(), task.sessionId).catch(() => null);
-    if (resolvedSessionFilePath) {
-      task.sessionFilePath = resolvedSessionFilePath;
-      changed = true;
-    }
-  }
-  if (!changed) {
-    return;
-  }
-  task.updatedAt = formatLocalTimestamp();
-  await persistRunTask(resolveWorkspaceRoot(), task).catch(() => undefined);
-  if (metadata.nc) {
-    publishImmediateRunEvent({
-      nc: metadata.nc,
-      userId: task.userId,
-      task,
-      buildRunEventsSubject: buildAgentRunEventsSubject,
-    });
-  }
-  if (!previousSessionId && task.sessionId) {
-    await updateRunStartSlotSession({
-      workspaceRoot: resolveWorkspaceRoot(),
-      runId: task.id,
-      previousSessionId,
-      sessionId: task.sessionId,
-      formatTimestamp: formatLocalTimestamp,
-    }).catch(() => undefined);
-  }
-}
-
-async function startManagedRun(args: {
-  requestId: string;
-  runId: string;
-  serverBaseUrl: string;
-  userId: string;
-  agentId: string;
-  nc: NatsConnection;
-  sessionId?: string | null;
-  codexArgs: string[];
-  cwd: string | null;
-  runtimeEnvPatch: Record<string, string>;
-  codexAuthBundle: CodexAuthBundleResponse | null;
-  agentToken: string;
-}): Promise<PublicRunTask> {
-  const prepared = await prepareCommandExecution({
-    cwd: args.cwd,
-    userId: args.userId,
-    taskId: args.runId,
-    codexAuthBundle: args.codexAuthBundle,
-    runtimeEnvPatch: args.runtimeEnvPatch,
-    agentProjectDir: AGENT_PROJECT_DIR,
-    resolveShellPath: runtimeEnvHelpers.resolveShellPath,
-    resolveTaskWorkspace: runtimeEnvHelpers.resolveTaskWorkspace,
-    resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
-    prepareCodexAuthBundle,
-    readAgentSettingsConfig,
-    resolveWorkspaceRoot,
-    buildAgentSettingsEnvPatch,
-    prepareTaskGitEnv: runtimeEnvHelpers.prepareTaskGitEnv,
-  });
-  const child = spawnManagedCodexCommand({
-    codexArgs: args.codexArgs,
-    taskWorkspace: prepared.taskWorkspace,
-    env: prepared.env,
-    agentToken: args.agentToken,
-  });
-
-  const now = formatLocalTimestamp();
-  const task: PublicRunTask = {
-    id: args.runId,
-    userId: args.userId,
-    agentId: args.agentId,
-    processPid: typeof child.pid === "number" ? child.pid : null,
-    sessionId: typeof args.sessionId === "string" && args.sessionId.trim() ? args.sessionId.trim() : null,
-    sessionFilePath: null,
-    status: "running",
-    cancelRequested: false,
-    resultExitCode: null,
-    resultSignal: null,
-    error: null,
-    createdAt: now,
-    updatedAt: now,
-    startedAt: now,
-    finishedAt: null,
-  };
-
-  let pendingSessionPollClosed = false;
-  const knownPendingSessionFiles = new Set<string>();
-  const pendingSessionTracker = createPendingRunSessionTracker({
-    task,
-    detectPendingRunSession: async () => detectPendingRunSession(resolveWorkspaceRoot(), knownPendingSessionFiles),
-    updateRunSessionMetadata: async (metadata) => updateRunSessionMetadata(task, { ...metadata, nc: args.nc }),
-  });
-  const stopPendingSessionPoll = () => {
-    pendingSessionPollClosed = true;
-    pendingSessionTracker.stop();
-  };
-  const pollPendingSession = async () => {
-    if (pendingSessionPollClosed) {
-      stopPendingSessionPoll();
-      return;
-    }
-    await pendingSessionTracker.poll();
-  };
-
-  if (!task.sessionId) {
-    const existingFiles = await collectSessionJsonlFiles(resolveWorkspaceRoot()).catch(() => []);
-    for (const file of existingFiles) {
-      knownPendingSessionFiles.add(file.filePath);
-    }
-    pendingSessionTracker.start();
-  }
-
-  child.stdout!.on("data", (chunk: string) => writeRunStream(task.id, "stdout", chunk));
-  child.stderr!.on("data", (chunk: string) => writeRunStream(task.id, "stderr", chunk));
-  attachManagedRunProcessLifecycle({
-    child,
-    task,
-    nc: args.nc,
-    stopPendingSessionPoll,
-    getStoredRun: (runId) => getStoredRun(resolveWorkspaceRoot(), runId),
-    publishImmediateRunEvent: (eventArgs) => publishImmediateRunEvent({
-      ...eventArgs,
-      buildRunEventsSubject: buildAgentRunEventsSubject,
-    }),
-    removeRunTask: (runId) => removeRunTask(resolveWorkspaceRoot(), runId),
-    releaseRunStartSlot: ({ runId, sessionId }) => releaseRunStartSlot({
-      workspaceRoot: resolveWorkspaceRoot(),
-      runId,
-      sessionId,
-    }),
-    codexAuthCleanup: prepared.codexAuthCleanup,
-    writeRunStatus,
-    formatTimestamp: formatLocalTimestamp,
-  });
-
-  void persistRunTask(resolveWorkspaceRoot(), task).catch(() => undefined);
-  publishImmediateRunEvent({ nc: args.nc, userId: task.userId, task, buildRunEventsSubject: buildAgentRunEventsSubject });
-  writeRunStatus(task.id, `started requestId=${args.requestId} cwd=${prepared.taskWorkspace}`);
-  if (!task.sessionId) {
-    void pollPendingSession();
-  }
-  return cloneRunTask(task);
 }
 
 function subscribeToSettingsRpc(args: {
@@ -375,154 +145,6 @@ function subscribeToGitRpc(args: {
     },
   });
   writeAgentInfo(`git rpc subscribed subject=${subject}`);
-}
-
-async function handleRunRpcMessage(args: {
-  msg: Msg;
-  jetstream: AgentJetStreamContext;
-  serverBaseUrl: string;
-  userId: string;
-  agentId: string;
-  agentToken: string;
-}): Promise<void> {
-  let requestId = "unknown";
-  let responseSubject = "";
-  try {
-    const payload = JSON.parse(runRpcCodec.decode(args.msg.data)) as AgentRunRpcRequest;
-    const request = normalizeRunRpcRequest<CodexAuthBundleResponse>({
-      request: payload,
-      agentId: args.agentId,
-      normalizeModel: normalizeCodexModel,
-      normalizeImagePaths: normalizeRunImagePaths,
-      normalizeEnvPatch,
-      normalizeCodexAuthBundle: normalizeShellRpcCodexAuthBundle,
-    });
-    requestId = request.requestId;
-    responseSubject = request.responseSubject;
-
-    if (request.action === "start") {
-      const runId = request.runId ?? requestId;
-      await claimRunStartSlot({
-        workspaceRoot: resolveWorkspaceRoot(),
-        runId,
-        sessionId: request.sessionId,
-        formatTimestamp: formatLocalTimestamp,
-      });
-      try {
-        const workspaceRoot = resolveWorkspaceRoot();
-        const localAgentSettings = await readAgentSettingsConfig({ workspaceRoot });
-        const customInstructions = await readAgentModelInstructions(workspaceRoot);
-        const validImagePaths = await filterValidRunImagePaths({
-          workspaceRoot,
-          imagePaths: request.imagePaths,
-          onInvalidImage: (imagePath, reason) => {
-            writeRunStatus(runId, `skipping invalid image path=${imagePath} reason=${reason}`);
-          },
-        });
-        const task = await startManagedRun({
-          requestId,
-          runId,
-          serverBaseUrl: args.serverBaseUrl,
-          userId: args.userId,
-          agentId: args.agentId,
-          nc: args.jetstream.nc,
-          sessionId: request.sessionId,
-          codexArgs: buildManagedCodexArgs({
-            prompt: request.prompt ?? "",
-            imagePaths: validImagePaths,
-            sessionId: request.sessionId,
-            model: request.model,
-            personality: localAgentSettings.general.personality,
-            modelInstructionsFile: customInstructions ? resolveAgentModelInstructionsFilePath(workspaceRoot) : null,
-            configOverrides: [
-              ...buildDaemonMcpConfigArgs({
-                agentProjectDir: AGENT_PROJECT_DIR,
-                workspaceRoot,
-              }),
-              ...buildDatabaseMcpConfigArgs({
-                agentProjectDir: AGENT_PROJECT_DIR,
-                workspaceRoot,
-              }),
-              "--config",
-              `features.computer_use=${localAgentSettings.codex.computerUseEnabled ? "true" : "false"}`,
-              "--config",
-              `features.browser_use=${localAgentSettings.codex.browserUseEnabled ? "true" : "false"}`,
-            ],
-          }),
-          cwd: request.cwd,
-          runtimeEnvPatch: request.runtimeEnvPatch,
-          codexAuthBundle: request.codexAuthBundle,
-          agentToken: args.agentToken,
-        });
-        publishRunRpcResponse({ nc: args.jetstream.nc, responseSubject, payload: { requestId, ok: true, task } });
-      } catch (error) {
-        await releaseRunStartSlot({
-          workspaceRoot: resolveWorkspaceRoot(),
-          runId,
-          sessionId: request.sessionId,
-        }).catch(() => undefined);
-        throw error;
-      }
-      return;
-    }
-    await handleNonStartRunRpc({
-      request,
-      nc: args.jetstream.nc,
-      userId: args.userId,
-      agentId: args.agentId,
-      listPersistedRunTasks: async () => listPersistedRunTasks(resolveWorkspaceRoot()),
-      cloneRunTask,
-      getStoredRun: async (runId) => getStoredRun(resolveWorkspaceRoot(), runId),
-      persistRunTask: async (task) => persistRunTask(resolveWorkspaceRoot(), task),
-      publishImmediateRunEvent: (task) => publishImmediateRunEvent({
-        nc: args.jetstream.nc,
-        userId: task.userId,
-        task,
-        buildRunEventsSubject: buildAgentRunEventsSubject,
-      }),
-      writeRunStatus,
-      sendSignalToPid,
-      formatTimestamp: formatLocalTimestamp,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (responseSubject) {
-      publishRunRpcResponse({
-        nc: args.jetstream.nc,
-        responseSubject,
-        payload: { requestId, ok: false, error: message },
-      });
-    }
-    writeAgentError(`run rpc failed requestId=${requestId} error=${message}`);
-  }
-}
-
-function subscribeToRunRpc(args: {
-  jetstream: AgentJetStreamContext;
-  serverBaseUrl: string;
-  userId: string;
-  agentId: string;
-  agentToken: string;
-}): void {
-  const subject = buildAgentRunRpcSubject(args.userId, args.agentId);
-  args.jetstream.nc.subscribe(subject, {
-    callback: (error, msg) => {
-      if (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        writeAgentError(`run rpc subscription error: ${message}`);
-        return;
-      }
-      void handleRunRpcMessage({
-        msg,
-        jetstream: args.jetstream,
-        serverBaseUrl: args.serverBaseUrl,
-        userId: args.userId,
-        agentId: args.agentId,
-        agentToken: args.agentToken,
-      });
-    },
-  });
-  writeAgentInfo(`run rpc subscribed subject=${subject}`);
 }
 
 function subscribeToFsRpc(args: {
@@ -606,8 +228,6 @@ async function main() {
   process.env.WORKSPACE = startupWorkspaceRoot;
   process.env.CODEX_HOME = path.join(startupWorkspaceRoot, ".codex");
   await mkdir(process.env.CODEX_HOME, { recursive: true }).catch(() => undefined);
-  // Preserve run state for processes that are still alive after an agent restart.
-  await pruneStaleRunsDir(resolveWorkspaceRoot());
 
   const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], DEFAULT_SERVER_BASE_URL);
   const requestedServerBaseUrl = serverBaseUrlRaw.replace(/\/$/, "");
@@ -691,15 +311,6 @@ async function main() {
           onInfo: writeAgentInfo,
           onError: writeAgentError,
         });
-        subscribeToSessionRpc({
-          nc: jetstream.nc,
-          subject: buildAgentSessionRpcSubject(userId, initialAgentId),
-          agentId: initialAgentId,
-          workspaceRoot: resolveWorkspaceRoot(),
-          onInfo: writeAgentInfo,
-          onError: writeAgentError,
-          formatTimestamp: formatLocalTimestamp,
-        });
         subscribeToCodexAuthRpc({
           nc: jetstream.nc,
           subject: buildAgentCodexAuthRpcSubject(userId, initialAgentId),
@@ -712,6 +323,17 @@ async function main() {
           runLocalCodexCliWithInput: localCodexCliTools.runLocalCodexCliWithInput,
           sendSignalToTaskProcess,
           stripAnsi: localCodexCliTools.stripAnsi,
+          onInfo: writeAgentInfo,
+          onError: writeAgentError,
+        });
+        subscribeToCodexAppRpc({
+          nc: jetstream.nc,
+          subject: buildAgentCodexAppRpcSubject(userId, initialAgentId),
+          eventsSubject: buildAgentCodexAppEventsSubject(userId, initialAgentId),
+          agentId: initialAgentId,
+          workspaceRoot: resolveWorkspaceRoot(),
+          resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
+          readAgentSettingsConfig,
           onInfo: writeAgentInfo,
           onError: writeAgentError,
         });
@@ -738,15 +360,7 @@ async function main() {
           onInfo: writeAgentInfo,
           onError: writeAgentError,
         });
-        subscribeToRunRpc({
-          jetstream,
-          serverBaseUrl,
-          userId,
-          agentId: initialAgentId,
-          agentToken,
-        });
       },
-      stopAllSessionWatchers: () => stopAllSessionWatchers({ onError: writeAgentError }),
       onInfraError: writeAgentInfraError,
       sleep,
     });
