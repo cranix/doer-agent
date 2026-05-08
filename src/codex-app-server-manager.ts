@@ -4,6 +4,7 @@ import {
   resolveAgentModelInstructionsFilePath,
   type AgentSettingsConfig,
 } from "./agent-settings.js";
+import { buildDaemonMcpConfigArgs } from "./agent-codex-cli.js";
 import { CodexAppServerClient } from "./codex-app-server-client.js";
 
 function toTomlStringLiteral(value: string): string {
@@ -20,6 +21,7 @@ function buildFeatureArg(enabled: boolean, name: string): string[] {
 
 async function buildCodexAppServerArgs(args: {
   workspaceRoot: string;
+  agentProjectDir: string;
   settings: AgentSettingsConfig;
 }): Promise<string[]> {
   const configArgs = [
@@ -40,6 +42,10 @@ async function buildCodexAppServerArgs(args: {
   return [
     "app-server",
     ...configArgs,
+    ...buildDaemonMcpConfigArgs({
+      agentProjectDir: args.agentProjectDir,
+      workspaceRoot: args.workspaceRoot,
+    }),
     ...buildFeatureArg(args.settings.codex.computerUseEnabled, "computer_use"),
     ...buildFeatureArg(args.settings.codex.browserUseEnabled, "browser_use"),
     "--listen",
@@ -67,6 +73,7 @@ export interface CodexAppServerManager {
 
 export function createCodexAppServerManager(args: {
   workspaceRoot: string;
+  agentProjectDir: string;
   resolveCodexHomePath: () => string;
   readAgentSettingsConfig: (args: { workspaceRoot: string }) => Promise<AgentSettingsConfig>;
   onLog?: (message: string) => void;
@@ -78,7 +85,11 @@ export function createCodexAppServerManager(args: {
 
   const createClient = async (): Promise<CodexAppServerClient> => {
     const settings = await args.readAgentSettingsConfig({ workspaceRoot: args.workspaceRoot });
-    const appServerArgs = await buildCodexAppServerArgs({ workspaceRoot: args.workspaceRoot, settings });
+    const appServerArgs = await buildCodexAppServerArgs({
+      workspaceRoot: args.workspaceRoot,
+      agentProjectDir: args.agentProjectDir,
+      settings,
+    });
     const env = await buildCodexAppServerEnv({
       workspaceRoot: args.workspaceRoot,
       resolveCodexHomePath: args.resolveCodexHomePath,

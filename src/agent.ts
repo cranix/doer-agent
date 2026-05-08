@@ -312,6 +312,7 @@ async function main() {
       subscribeAll: () => {
         const codexAppServerManager = createCodexAppServerManager({
           workspaceRoot: resolveWorkspaceRoot(),
+          agentProjectDir: AGENT_PROJECT_DIR,
           resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
           readAgentSettingsConfig,
           onLog: writeAgentInfo,
