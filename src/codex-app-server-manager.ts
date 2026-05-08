@@ -46,6 +46,7 @@ async function buildCodexAppServerArgs(args: {
       agentProjectDir: args.agentProjectDir,
       workspaceRoot: args.workspaceRoot,
     }),
+    ...buildFeatureArg(true, "goals"),
     ...buildFeatureArg(args.settings.codex.computerUseEnabled, "computer_use"),
     ...buildFeatureArg(args.settings.codex.browserUseEnabled, "browser_use"),
     "--listen",

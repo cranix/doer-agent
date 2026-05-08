@@ -1,5 +1,19 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createRequire } from "node:module";
+import path from "node:path";
 import { createInterface, type Interface } from "node:readline";
+
+const require = createRequire(import.meta.url);
+
+function resolveCodexCliBinPath(): string {
+  const packageJsonPath = require.resolve("@openai/codex/package.json");
+  const packageJson = require(packageJsonPath) as { bin?: { codex?: string } };
+  const codexBin = packageJson.bin?.codex;
+  if (!codexBin) {
+    throw new Error("@openai/codex package does not expose a codex binary");
+  }
+  return path.resolve(path.dirname(packageJsonPath), codexBin);
+}
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -64,7 +78,7 @@ export class CodexAppServerClient {
   }
 
   private async startInner(): Promise<void> {
-    this.child = spawn("codex", this.options.args, {
+    this.child = spawn(process.execPath, [resolveCodexCliBinPath(), ...this.options.args], {
       cwd: this.options.cwd,
       env: this.options.env,
       stdio: ["pipe", "pipe", "pipe"],
