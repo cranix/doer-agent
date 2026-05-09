@@ -24,14 +24,14 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex": "^0.129.0",
     "@openai/codex-sdk": "^0.129.0",
     "nats": "^2.29.3",
-    "tar": "^7.5.13"
+    "tar": "^7.5.15"
   },
   "devDependencies": {
-    "@types/node": "^20",
+    "@types/node": "^20.19.40",
     "tsx": "^4.21.0",
     "typescript": "^5"
   }
