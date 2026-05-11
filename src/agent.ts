@@ -15,6 +15,7 @@ import { createLocalCodexCliTools } from "./agent-codex-cli.js";
 import { connectBootstrapWithRetry, type AgentJetStreamContext } from "./agent-jetstream.js";
 import { runConnectedAgentSession } from "./agent-session-loop.js";
 import { subscribeToSkillRpc } from "./agent-skill-rpc.js";
+import { subscribeToMaintenanceRpc } from "./agent-maintenance-rpc.js";
 import { sendSignalToTaskProcess } from "./agent-task-execution.js";
 import {
   buildAgentCodexAppEventsSubject,
@@ -22,6 +23,7 @@ import {
   buildAgentDaemonRpcSubject,
   buildAgentFsRpcSubject,
   buildAgentGitRpcSubject,
+  buildAgentMaintenanceRpcSubject,
   buildAgentSettingsRpcSubject,
   buildAgentSkillRpcSubject,
   formatLocalTimestamp,
@@ -248,6 +250,7 @@ async function main() {
   process.chdir(startupWorkspaceRoot);
   process.env.WORKSPACE = startupWorkspaceRoot;
   process.env.CODEX_HOME = path.join(startupWorkspaceRoot, ".codex");
+  process.env.DOER_AGENT_STARTED_AT_MS = String(Date.now());
   await mkdir(process.env.CODEX_HOME, { recursive: true }).catch(() => undefined);
 
   const serverBaseUrlRaw = resolveArgOrEnv(args, ["server", "url"], ["DOER_AGENT_SERVER"], DEFAULT_SERVER_BASE_URL);
@@ -386,6 +389,13 @@ async function main() {
           buildAgentSettingsEnvPatch,
           runLocalCodexCli: localCodexCliTools.runLocalCodexCli,
           stripAnsi: localCodexCliTools.stripAnsi,
+          onInfo: writeAgentInfo,
+          onError: writeAgentError,
+        });
+        subscribeToMaintenanceRpc({
+          nc: jetstream.nc,
+          subject: buildAgentMaintenanceRpcSubject(userId, initialAgentId),
+          agentPackageJsonPath: AGENT_PACKAGE_JSON_PATH,
           onInfo: writeAgentInfo,
           onError: writeAgentError,
         });

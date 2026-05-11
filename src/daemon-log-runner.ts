@@ -97,6 +97,9 @@ async function main(): Promise<void> {
   const shellPath = readRequiredEnv("DOER_DAEMON_SHELL_PATH");
 
   const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  childEnv.DOER_AGENT_LAUNCH_COMMAND = command;
+  childEnv.DOER_AGENT_LAUNCH_CWD = cwd;
+  childEnv.DOER_AGENT_LAUNCH_SHELL = shellPath;
   delete childEnv.DOER_DAEMON_STATE_PATH;
   delete childEnv.DOER_DAEMON_EVENTS_PATH;
   delete childEnv.DOER_DAEMON_COMMAND;
