@@ -25,8 +25,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@openai/codex": "^0.129.0",
-    "@openai/codex-sdk": "^0.129.0",
+    "@openai/codex": "^0.130.0",
+    "@openai/codex-sdk": "^0.130.0",
     "nats": "^2.29.3",
     "tar": "^7.5.15"
   },
