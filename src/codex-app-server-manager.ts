@@ -26,6 +26,7 @@ async function buildCodexAppServerArgs(args: {
 }): Promise<string[]> {
   const configArgs = [
     ...buildConfigArg("model", toTomlStringLiteral(args.settings.codex.model)),
+    ...buildConfigArg("model_reasoning_effort", toTomlStringLiteral(args.settings.codex.reasoningEffort)),
     ...buildConfigArg("personality", toTomlStringLiteral(args.settings.general.personality)),
     ...buildConfigArg("approval_policy", toTomlStringLiteral("never")),
     ...buildConfigArg("sandbox_mode", toTomlStringLiteral("danger-full-access")),
@@ -97,7 +98,7 @@ export function createCodexAppServerManager(args: {
       settings,
     });
     args.onLog?.(
-      `starting codex app-server model=${settings.codex.model} personality=${settings.general.personality} computerUse=${settings.codex.computerUseEnabled} browserUse=${settings.codex.browserUseEnabled}`,
+      `starting codex app-server model=${settings.codex.model} reasoningEffort=${settings.codex.reasoningEffort} personality=${settings.general.personality} computerUse=${settings.codex.computerUseEnabled} browserUse=${settings.codex.browserUseEnabled}`,
     );
     return new CodexAppServerClient({
       cwd: args.workspaceRoot,

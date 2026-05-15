@@ -14,6 +14,7 @@ export interface AgentSettingsConfig {
   };
   codex: {
     model: string;
+    reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
     authMode: "api_key" | "chatgpt";
     computerUseEnabled: boolean;
     browserUseEnabled: boolean;
@@ -46,6 +47,7 @@ export interface AgentSettingsPublic {
   };
   codex: {
     model: string;
+    reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
     authMode: "api_key" | "chatgpt";
     computerUseEnabled: boolean;
     browserUseEnabled: boolean;
@@ -97,6 +99,7 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
     },
     codex: {
       model: "gpt-5.5",
+      reasoningEffort: "medium",
       authMode: "api_key",
       computerUseEnabled: false,
       browserUseEnabled: false,
@@ -136,6 +139,20 @@ function normalizeNullableString(value: unknown): string | null {
 
 function normalizeCodexPersonality(value: unknown, fallback: CodexPersonality): CodexPersonality {
   return value === "friendly" || value === "pragmatic" ? value : fallback;
+}
+
+function normalizeReasoningEffort(
+  value: unknown,
+  fallback: AgentSettingsConfig["codex"]["reasoningEffort"],
+): AgentSettingsConfig["codex"]["reasoningEffort"] {
+  return value === "none" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh"
+    ? value
+    : fallback;
 }
 
 function normalizeEnvVarName(value: unknown): string | null {
@@ -203,6 +220,7 @@ export function normalizeAgentSettingsConfig(
     },
     codex: {
       model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
+      reasoningEffort: normalizeReasoningEffort(codex.reasoningEffort, base.codex.reasoningEffort),
       authMode: codex.authMode === "chatgpt" ? "chatgpt" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
       computerUseEnabled:
         typeof codex.computerUseEnabled === "boolean" ? codex.computerUseEnabled : base.codex.computerUseEnabled,
@@ -302,6 +320,7 @@ export async function toAgentSettingsPublic(args: {
     },
     codex: {
       model: args.config.codex.model,
+      reasoningEffort: args.config.codex.reasoningEffort,
       authMode: args.config.codex.authMode,
       computerUseEnabled: args.config.codex.computerUseEnabled,
       browserUseEnabled: args.config.codex.browserUseEnabled,
@@ -365,6 +384,7 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
   move("personality", "general", "personality");
 
   move("codexModel", "codex", "model");
+  move("codexReasoningEffort", "codex", "reasoningEffort");
   move("codexAuthMode", "codex", "authMode");
   move("computerUseEnabled", "codex", "computerUseEnabled");
   move("browserUseEnabled", "codex", "browserUseEnabled");
