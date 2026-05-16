@@ -27,6 +27,9 @@ async function buildCodexAppServerArgs(args: {
   const configArgs = [
     ...buildConfigArg("model", toTomlStringLiteral(args.settings.codex.model)),
     ...buildConfigArg("model_reasoning_effort", toTomlStringLiteral(args.settings.codex.reasoningEffort)),
+    ...(args.settings.codex.serviceTier
+      ? buildConfigArg("service_tier", toTomlStringLiteral(args.settings.codex.serviceTier))
+      : []),
     ...buildConfigArg("personality", toTomlStringLiteral(args.settings.general.personality)),
     ...buildConfigArg("approval_policy", toTomlStringLiteral("never")),
     ...buildConfigArg("sandbox_mode", toTomlStringLiteral("danger-full-access")),
