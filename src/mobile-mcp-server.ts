@@ -35,6 +35,12 @@ interface MobileInfo {
   lastObservedAt: string | null;
 }
 
+interface MobileActiveNotificationsSnapshot extends Record<string, unknown> {
+  mobileAgent?: MobileAgentRecord;
+  notifications: unknown[];
+  count?: number;
+}
+
 function env(name: string): string {
   const value = process.env[name]?.trim() || "";
   if (!value) {
@@ -87,6 +93,24 @@ async function requestJson<T>(path: string): Promise<T> {
   return data as T;
 }
 
+async function postJson<T>(path: string, body: Record<string, unknown>): Promise<T> {
+  const config = getConfig();
+  const response = await fetch(`${config.serverBaseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.agentToken}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({})) as { error?: unknown };
+  if (!response.ok) {
+    throw new Error(typeof data.error === "string" ? data.error : `Doer server returned ${response.status}`);
+  }
+  return data as T;
+}
+
 async function listMobileAgents(): Promise<MobileAgentRecord[]> {
   const config = getConfig();
   const data = await requestJson<{ mobileAgents?: MobileAgentRecord[] }>(
@@ -115,6 +139,37 @@ async function getMobileInfo(deviceId?: string): Promise<{ mobileAgent?: MobileA
     `/api/users/${encodeURIComponent(config.userId)}/agents/${encodeURIComponent(config.agentId)}/mobile-agents/${encodeURIComponent(resolvedDeviceId)}/info`,
   );
 }
+
+async function getMobileActiveNotifications(deviceId?: string): Promise<MobileActiveNotificationsSnapshot> {
+  const config = getConfig();
+  const resolvedDeviceId = await resolveDeviceId(deviceId);
+  const data = await requestJson<MobileActiveNotificationsSnapshot>(
+    `/api/users/${encodeURIComponent(config.userId)}/agents/${encodeURIComponent(config.agentId)}/mobile-agents/${encodeURIComponent(resolvedDeviceId)}/active-notifications`,
+  );
+  return {
+    ...data,
+    notifications: Array.isArray(data.notifications) ? data.notifications : [],
+  };
+}
+
+async function showMobileNotification(args: {
+  deviceId?: string;
+  notificationId?: number;
+  text: string;
+  title: string;
+}): Promise<Record<string, unknown>> {
+  const config = getConfig();
+  const resolvedDeviceId = await resolveDeviceId(args.deviceId);
+  return await postJson<Record<string, unknown>>(
+    `/api/users/${encodeURIComponent(config.userId)}/agents/${encodeURIComponent(config.agentId)}/mobile-agents/${encodeURIComponent(resolvedDeviceId)}/show-notification`,
+    {
+      title: args.title,
+      text: args.text,
+      notificationId: args.notificationId,
+    },
+  );
+}
+
 
 async function getMobileLogs(args: {
   afterSeq?: number;
@@ -214,10 +269,10 @@ async function main(): Promise<void> {
     capabilities: {
       tools: {},
     },
-    instructions: "Inspect mobile agents paired with the current Doer agent. Use these tools to list devices, poll cursor-based logs, and inspect latest location/notification context.",
+    instructions: "Inspect and control mobile devices paired with the current Doer agent. Use list/get/read/search tools for device context, and show tools for user-visible mobile actions.",
   });
 
-  server.registerTool("mobile_list", {
+  server.registerTool("mobile_list_devices", {
     description: "List mobile agents paired with the current Doer agent.",
     inputSchema: {},
   }, async () => {
@@ -228,7 +283,7 @@ async function main(): Promise<void> {
     };
   });
 
-  server.registerTool("mobile_info", {
+  server.registerTool("mobile_get_device_info", {
     description: "Read info for a mobile agent. Defaults to the first registered device.",
     inputSchema: {
       deviceId: z.string().optional().describe("Mobile device id. Defaults to the first registered mobile agent."),
@@ -241,7 +296,7 @@ async function main(): Promise<void> {
     };
   });
 
-  server.registerTool("mobile_logs", {
+  server.registerTool("mobile_read_event_logs", {
     description: "Read a cursor-based page of mobile log events from the device-local SQLite log.",
     inputSchema: {
       afterSeq: z.number().int().min(0).optional().describe("Return events newer than this seq, in ascending order."),
@@ -257,7 +312,7 @@ async function main(): Promise<void> {
     };
   });
 
-  server.registerTool("mobile_search_logs", {
+  server.registerTool("mobile_search_event_logs", {
     description: "Search the device-local mobile SQLite event log by kind, text query, cursor, and observed time range.",
     inputSchema: {
       afterSeq: z.number().int().min(0).optional().describe("Return matching events newer than this seq, in ascending order."),
@@ -277,7 +332,7 @@ async function main(): Promise<void> {
     };
   });
 
-  server.registerTool("mobile_latest_location", {
+  server.registerTool("mobile_get_latest_location", {
     description: "Return the latest location event from recent mobile logs.",
     inputSchema: {
       deviceId: z.string().optional().describe("Mobile device id. Defaults to the first registered mobile agent."),
@@ -292,7 +347,7 @@ async function main(): Promise<void> {
     };
   });
 
-  server.registerTool("mobile_location_history", {
+  server.registerTool("mobile_search_location_logs", {
     description: "Return time-range location events recorded by the mobile agent.",
     inputSchema: {
       afterSeq: z.number().int().min(0).optional().describe("Return location events newer than this seq, in ascending order."),
@@ -312,8 +367,37 @@ async function main(): Promise<void> {
     };
   });
 
-  server.registerTool("mobile_notifications", {
-    description: "Return recent notification events from mobile logs.",
+  server.registerTool("mobile_get_active_notifications", {
+    description: "Return the current active notification snapshot from a mobile device without storing it in the log.",
+    inputSchema: {
+      deviceId: z.string().optional().describe("Mobile device id. Defaults to the first registered mobile agent."),
+    },
+  }, async ({ deviceId }) => {
+    const snapshot = await getMobileActiveNotifications(deviceId);
+    return {
+      content: [{ type: "text", text: formatJson(snapshot) }],
+      structuredContent: snapshot,
+    };
+  });
+
+  server.registerTool("mobile_show_alert_notification", {
+    description: "Show a high-priority notification on a mobile device through the Doer mobile agent.",
+    inputSchema: {
+      deviceId: z.string().optional().describe("Mobile device id. Defaults to the first registered mobile agent."),
+      title: z.string().min(1).describe("Notification title."),
+      text: z.string().min(1).describe("Notification body text."),
+      notificationId: z.number().int().optional().describe("Optional Android notification id. Reusing an id updates the existing notification."),
+    },
+  }, async ({ deviceId, title, text, notificationId }) => {
+    const result = await showMobileNotification({ deviceId, title, text, notificationId });
+    return {
+      content: [{ type: "text", text: formatJson(result) }],
+      structuredContent: result,
+    };
+  });
+
+  server.registerTool("mobile_search_notification_logs", {
+    description: "Return recent notification events stored in mobile logs.",
     inputSchema: {
       deviceId: z.string().optional().describe("Mobile device id. Defaults to the first registered mobile agent."),
       limit: z.number().int().min(1).max(1000).optional().describe("How many recent events to scan."),
