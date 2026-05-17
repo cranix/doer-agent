@@ -4,7 +4,7 @@ import {
   resolveAgentModelInstructionsFilePath,
   type AgentSettingsConfig,
 } from "./agent-settings.js";
-import { buildDaemonMcpConfigArgs } from "./agent-codex-cli.js";
+import { buildDaemonMcpConfigArgs, buildMobileMcpConfigArgs } from "./agent-codex-cli.js";
 import { CodexAppServerClient } from "./codex-app-server-client.js";
 
 function toTomlStringLiteral(value: string): string {
@@ -20,9 +20,13 @@ function buildFeatureArg(enabled: boolean, name: string): string[] {
 }
 
 async function buildCodexAppServerArgs(args: {
+  agentId: string;
+  agentToken: string;
   workspaceRoot: string;
   agentProjectDir: string;
+  serverBaseUrl: string;
   settings: AgentSettingsConfig;
+  userId: string;
 }): Promise<string[]> {
   const configArgs = [
     ...buildConfigArg("model", toTomlStringLiteral(args.settings.codex.model)),
@@ -50,6 +54,14 @@ async function buildCodexAppServerArgs(args: {
       agentProjectDir: args.agentProjectDir,
       workspaceRoot: args.workspaceRoot,
     }),
+    ...buildMobileMcpConfigArgs({
+      agentId: args.agentId,
+      agentProjectDir: args.agentProjectDir,
+      agentToken: args.agentToken,
+      serverBaseUrl: args.serverBaseUrl,
+      userId: args.userId,
+      workspaceRoot: args.workspaceRoot,
+    }),
     ...buildFeatureArg(true, "goals"),
     ...buildFeatureArg(args.settings.codex.computerUseEnabled, "computer_use"),
     ...buildFeatureArg(args.settings.codex.browserUseEnabled, "browser_use"),
@@ -59,14 +71,22 @@ async function buildCodexAppServerArgs(args: {
 }
 
 async function buildCodexAppServerEnv(args: {
+  agentId: string;
+  agentToken: string;
   workspaceRoot: string;
+  serverBaseUrl: string;
   resolveCodexHomePath: () => string;
   settings: AgentSettingsConfig;
+  userId: string;
 }): Promise<NodeJS.ProcessEnv> {
   return {
     ...process.env,
     ...buildAgentSettingsEnvPatch(args.settings),
     CODEX_HOME: args.resolveCodexHomePath(),
+    DOER_AGENT_TOKEN: args.agentToken,
+    DOER_MOBILE_AGENT_ID: args.agentId,
+    DOER_MOBILE_SERVER_BASE_URL: args.serverBaseUrl,
+    DOER_MOBILE_USER_ID: args.userId,
   };
 }
 
@@ -77,10 +97,14 @@ export interface CodexAppServerManager {
 }
 
 export function createCodexAppServerManager(args: {
+  agentId: string;
+  agentToken: string;
   workspaceRoot: string;
   agentProjectDir: string;
+  serverBaseUrl: string;
   resolveCodexHomePath: () => string;
   readAgentSettingsConfig: (args: { workspaceRoot: string }) => Promise<AgentSettingsConfig>;
+  userId: string;
   onLog?: (message: string) => void;
   onNotification?: (method: string, params: unknown) => void;
 }): CodexAppServerManager {
@@ -91,14 +115,22 @@ export function createCodexAppServerManager(args: {
   const createClient = async (): Promise<CodexAppServerClient> => {
     const settings = await args.readAgentSettingsConfig({ workspaceRoot: args.workspaceRoot });
     const appServerArgs = await buildCodexAppServerArgs({
+      agentId: args.agentId,
+      agentToken: args.agentToken,
       workspaceRoot: args.workspaceRoot,
       agentProjectDir: args.agentProjectDir,
+      serverBaseUrl: args.serverBaseUrl,
       settings,
+      userId: args.userId,
     });
     const env = await buildCodexAppServerEnv({
+      agentId: args.agentId,
+      agentToken: args.agentToken,
       workspaceRoot: args.workspaceRoot,
+      serverBaseUrl: args.serverBaseUrl,
       resolveCodexHomePath: args.resolveCodexHomePath,
       settings,
+      userId: args.userId,
     });
     args.onLog?.(
       `starting codex app-server model=${settings.codex.model} reasoningEffort=${settings.codex.reasoningEffort} personality=${settings.general.personality} computerUse=${settings.codex.computerUseEnabled} browserUse=${settings.codex.browserUseEnabled}`,

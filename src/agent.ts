@@ -318,10 +318,14 @@ async function main() {
       heartbeatAgentSession: heartbeatSession,
       subscribeAll: () => {
         const codexAppServerManager = createCodexAppServerManager({
+          agentId: initialAgentId,
+          agentToken,
           workspaceRoot: resolveWorkspaceRoot(),
           agentProjectDir: AGENT_PROJECT_DIR,
+          serverBaseUrl,
           resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
           readAgentSettingsConfig,
+          userId,
           onLog: writeAgentInfo,
           onNotification: (method, params) => {
             if (!shouldForwardCodexAppNotification(method)) {

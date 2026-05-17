@@ -87,6 +87,31 @@ export function buildDaemonMcpConfigArgs(args: {
   });
 }
 
+export function buildMobileMcpConfigArgs(args: {
+  agentId: string;
+  agentProjectDir: string;
+  agentToken: string;
+  serverBaseUrl: string;
+  userId: string;
+  workspaceRoot: string;
+  serverName?: string;
+}): string[] {
+  return buildWorkspaceMcpConfigArgs({
+    agentProjectDir: args.agentProjectDir,
+    workspaceRoot: args.workspaceRoot,
+    serverName: args.serverName?.trim() || "doer_mobile",
+    distEntryRelativePath: path.join("dist", "mobile-mcp-server.js"),
+    srcEntryRelativePath: path.join("src", "mobile-mcp-server.ts"),
+    workspaceRootEnvName: "DOER_MOBILE_WORKSPACE_ROOT",
+    env: {
+      DOER_MOBILE_SERVER_BASE_URL: args.serverBaseUrl,
+      DOER_MOBILE_USER_ID: args.userId,
+      DOER_MOBILE_AGENT_ID: args.agentId,
+      DOER_AGENT_TOKEN: args.agentToken,
+    },
+  });
+}
+
 function buildWorkspaceMcpConfigArgs(args: {
   agentProjectDir: string;
   workspaceRoot: string;
@@ -94,6 +119,7 @@ function buildWorkspaceMcpConfigArgs(args: {
   distEntryRelativePath: string;
   srcEntryRelativePath: string;
   workspaceRootEnvName: string;
+  env?: Record<string, string>;
 }): string[] {
   const serverName = args.serverName.trim();
   const distEntry = path.join(args.agentProjectDir, args.distEntryRelativePath);
@@ -103,7 +129,7 @@ function buildWorkspaceMcpConfigArgs(args: {
   const commandArgs = existsSync(distEntry)
     ? [distEntry, "--workspace-root", args.workspaceRoot]
     : ["--import", tsxLoaderPath, srcEntry, "--workspace-root", args.workspaceRoot];
-  return [
+  const configArgs = [
     "--config",
     `mcp_servers.${serverName}.command=${toTomlStringLiteral(command)}`,
     "--config",
@@ -113,6 +139,10 @@ function buildWorkspaceMcpConfigArgs(args: {
     "--config",
     `mcp_servers.${serverName}.enabled=true`,
   ];
+  for (const [key, value] of Object.entries(args.env ?? {})) {
+    configArgs.push("--config", `mcp_servers.${serverName}.env.${key}=${toTomlStringLiteral(value)}`);
+  }
+  return configArgs;
 }
 
 export function buildLocalCodexCliCommand(args: string[]): string {
