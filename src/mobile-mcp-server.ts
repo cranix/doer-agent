@@ -157,6 +157,7 @@ async function showMobileNotification(args: {
   notificationId?: number;
   text: string;
   title: string;
+  url?: string | null;
 }): Promise<Record<string, unknown>> {
   const config = getConfig();
   const resolvedDeviceId = await resolveDeviceId(args.deviceId);
@@ -166,6 +167,7 @@ async function showMobileNotification(args: {
       title: args.title,
       text: args.text,
       notificationId: args.notificationId,
+      url: args.url,
     },
   );
 }
@@ -386,10 +388,11 @@ async function main(): Promise<void> {
       deviceId: z.string().optional().describe("Mobile device id. Defaults to the first registered mobile agent."),
       title: z.string().min(1).describe("Notification title."),
       text: z.string().min(1).describe("Notification body text."),
+      url: z.string().nullable().optional().describe("Optional URL or deep link to open when the notification is tapped."),
       notificationId: z.number().int().optional().describe("Optional Android notification id. Reusing an id updates the existing notification."),
     },
-  }, async ({ deviceId, title, text, notificationId }) => {
-    const result = await showMobileNotification({ deviceId, title, text, notificationId });
+  }, async ({ deviceId, title, text, url, notificationId }) => {
+    const result = await showMobileNotification({ deviceId, title, text, url, notificationId });
     return {
       content: [{ type: "text", text: formatJson(result) }],
       structuredContent: result,
