@@ -140,6 +140,14 @@ function normalizeNullableString(value: unknown): string | null {
   return trimmed ? trimmed : null;
 }
 
+function normalizeServiceTier(value: unknown): string | null {
+  const normalized = normalizeNullableString(value);
+  if (normalized === "priority") {
+    return "fast";
+  }
+  return normalized;
+}
+
 function normalizeCodexPersonality(value: unknown, fallback: CodexPersonality): CodexPersonality {
   return value === "friendly" || value === "pragmatic" ? value : fallback;
 }
@@ -224,7 +232,7 @@ export function normalizeAgentSettingsConfig(
     codex: {
       model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
       reasoningEffort: normalizeReasoningEffort(codex.reasoningEffort, base.codex.reasoningEffort),
-      serviceTier: codex.serviceTier === null ? null : normalizeNullableString(codex.serviceTier) ?? base.codex.serviceTier,
+      serviceTier: codex.serviceTier === null ? null : normalizeServiceTier(codex.serviceTier) ?? base.codex.serviceTier,
       authMode: codex.authMode === "chatgpt" ? "chatgpt" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
       computerUseEnabled:
         typeof codex.computerUseEnabled === "boolean" ? codex.computerUseEnabled : base.codex.computerUseEnabled,
