@@ -18,6 +18,42 @@ interface AgentCodexAppRpcResponse {
   error?: string;
 }
 
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function stripLargeThreadTurnItemFields(method: string, value: unknown): unknown {
+  if (method !== "thread/turns/list") {
+    return value;
+  }
+  const response = recordValue(value);
+  if (!response || !Array.isArray(response.data)) {
+    return value;
+  }
+
+  return {
+    ...response,
+    data: response.data.map((turnValue) => {
+      const turn = recordValue(turnValue);
+      if (!turn || !Array.isArray(turn.items)) {
+        return turnValue;
+      }
+      return {
+        ...turn,
+        items: turn.items.map((itemValue) => {
+          const item = recordValue(itemValue);
+          if (!item || item.type !== "imageGeneration" || typeof item.result !== "string") {
+            return itemValue;
+          }
+          const withoutResult = { ...item };
+          delete withoutResult.result;
+          return withoutResult;
+        }),
+      };
+    }),
+  };
+}
+
 function normalizeCodexAppRpcRequest(args: {
   request: AgentCodexAppRpcRequest;
   agentId: string;
@@ -56,7 +92,10 @@ async function handleCodexAppRpcMessage(args: {
     const request = normalizeCodexAppRpcRequest({ request: payload, agentId: args.agentId });
     requestId = request.requestId;
 
-    const result = await args.manager.request(request.method, request.params);
+    const result = stripLargeThreadTurnItemFields(
+      request.method,
+      await args.manager.request(request.method, request.params),
+    );
     args.msg.respond(codexAppRpcCodec.encode(JSON.stringify({
       requestId,
       ok: true,
