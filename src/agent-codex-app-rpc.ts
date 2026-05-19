@@ -18,12 +18,43 @@ interface AgentCodexAppRpcResponse {
   error?: string;
 }
 
+interface CodexAppRpcOmitRule {
+  method: string;
+  itemType?: string;
+  keys: string[];
+}
+
+const codexAppRpcOmitRules: CodexAppRpcOmitRule[] = [
+  {
+    method: "thread/turns/list",
+    itemType: "imageGeneration",
+    keys: ["result"],
+  },
+];
+
 function recordValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function stripLargeThreadTurnItemFields(method: string, value: unknown): unknown {
-  if (method !== "thread/turns/list") {
+function omitKeysFromRecord(record: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  const next = { ...record };
+  for (const key of keys) {
+    delete next[key];
+  }
+  return next;
+}
+
+function omitRulesForThreadTurnItem(method: string, item: Record<string, unknown>): CodexAppRpcOmitRule[] {
+  return codexAppRpcOmitRules.filter((rule) => {
+    if (rule.method !== method) {
+      return false;
+    }
+    return !rule.itemType || item.type === rule.itemType;
+  });
+}
+
+function applyCodexAppRpcOmitRules(method: string, value: unknown): unknown {
+  if (!codexAppRpcOmitRules.some((rule) => rule.method === method)) {
     return value;
   }
   const response = recordValue(value);
@@ -42,12 +73,17 @@ function stripLargeThreadTurnItemFields(method: string, value: unknown): unknown
         ...turn,
         items: turn.items.map((itemValue) => {
           const item = recordValue(itemValue);
-          if (!item || item.type !== "imageGeneration" || typeof item.result !== "string") {
+          if (!item) {
             return itemValue;
           }
-          const withoutResult = { ...item };
-          delete withoutResult.result;
-          return withoutResult;
+          const rules = omitRulesForThreadTurnItem(method, item);
+          if (rules.length === 0) {
+            return itemValue;
+          }
+          return rules.reduce(
+            (current, rule) => omitKeysFromRecord(current, rule.keys),
+            item,
+          );
         }),
       };
     }),
@@ -92,7 +128,7 @@ async function handleCodexAppRpcMessage(args: {
     const request = normalizeCodexAppRpcRequest({ request: payload, agentId: args.agentId });
     requestId = request.requestId;
 
-    const result = stripLargeThreadTurnItemFields(
+    const result = applyCodexAppRpcOmitRules(
       request.method,
       await args.manager.request(request.method, request.params),
     );
