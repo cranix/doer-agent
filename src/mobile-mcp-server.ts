@@ -41,6 +41,18 @@ interface MobileActiveNotificationsSnapshot extends Record<string, unknown> {
   count?: number;
 }
 
+interface MobileCommandRunResult extends Record<string, unknown> {
+  command: string;
+  cwd: string | null;
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+}
+
 function env(name: string): string {
   const value = process.env[name]?.trim() || "";
   if (!value) {
@@ -196,6 +208,27 @@ async function showMobileConfirmation(args: {
   );
 }
 
+async function runMobileCommand(args: {
+  command: string;
+  cwd?: string | null;
+  deviceId?: string;
+  env?: Record<string, string>;
+  maxOutputBytes?: number;
+  timeoutMs?: number;
+}): Promise<{ mobileAgent?: MobileAgentRecord; result: MobileCommandRunResult }> {
+  const config = getConfig();
+  const resolvedDeviceId = await resolveDeviceId(args.deviceId);
+  return await postJson<{ mobileAgent?: MobileAgentRecord; result: MobileCommandRunResult }>(
+    `/api/users/${encodeURIComponent(config.userId)}/agents/${encodeURIComponent(config.agentId)}/mobile-agents/${encodeURIComponent(resolvedDeviceId)}/run-command`,
+    {
+      command: args.command,
+      cwd: args.cwd,
+      env: args.env,
+      timeoutMs: args.timeoutMs,
+      maxOutputBytes: args.maxOutputBytes,
+    },
+  );
+}
 
 async function getMobileLogs(args: {
   afterSeq?: number;
@@ -440,6 +473,24 @@ async function main(): Promise<void> {
     },
   }, async ({ deviceId, requestId, title, text, yesLabel, noLabel, notificationId }) => {
     const result = await showMobileConfirmation({ deviceId, requestId, title, text, yesLabel, noLabel, notificationId });
+    return {
+      content: [{ type: "text", text: formatJson(result) }],
+      structuredContent: result,
+    };
+  });
+
+  server.registerTool("mobile_run_shell_command", {
+    description: "Run a shell command on an Android mobile agent using the app sandbox permissions. This is not root; command output is size-limited and timed out.",
+    inputSchema: {
+      deviceId: z.string().optional().describe("Mobile device id. Defaults to the first registered mobile agent."),
+      command: z.string().min(1).describe("Shell command passed to /system/bin/sh -c on the device."),
+      cwd: z.string().nullable().optional().describe("Optional working directory on the Android device. Defaults to the app process default directory."),
+      env: z.record(z.string(), z.string()).optional().describe("Optional environment variables for the command."),
+      timeoutMs: z.number().int().min(1000).max(60000).optional().describe("Command timeout in milliseconds. Defaults to 10000."),
+      maxOutputBytes: z.number().int().min(1024).max(65536).optional().describe("Maximum bytes to capture per stdout/stderr stream. Defaults to 16384."),
+    },
+  }, async ({ deviceId, command, cwd, env, timeoutMs, maxOutputBytes }) => {
+    const result = await runMobileCommand({ deviceId, command, cwd, env, timeoutMs, maxOutputBytes });
     return {
       content: [{ type: "text", text: formatJson(result) }],
       structuredContent: result,
