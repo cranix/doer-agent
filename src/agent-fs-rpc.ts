@@ -45,13 +45,10 @@ function normalizeFsRpcPath(workspaceRoot: string, rawPath: unknown): { abs: str
   const useAbsolute = path.isAbsolute(normalizedRaw);
   const rel = normalizedRaw.replace(/^\/+/, "") || ".";
   const abs = useAbsolute ? path.resolve(normalizedRaw) : path.resolve(workspaceRoot, rel);
-  if (!useAbsolute && abs !== workspaceRoot && !abs.startsWith(workspaceRoot + path.sep)) {
+  if (abs !== workspaceRoot && !abs.startsWith(workspaceRoot + path.sep)) {
     throw new Error("path escapes workspace root");
   }
   const formatPath = (target: string): string => {
-    if (useAbsolute) {
-      return target.split(path.sep).join("/") || "/";
-    }
     return path.relative(workspaceRoot, target).split(path.sep).join("/") || ".";
   };
   return { abs, formatPath };
