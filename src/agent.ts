@@ -16,6 +16,7 @@ import { connectBootstrapWithRetry, type AgentJetStreamContext } from "./agent-j
 import { runConnectedAgentSession } from "./agent-session-loop.js";
 import { subscribeToSkillRpc } from "./agent-skill-rpc.js";
 import { subscribeToMaintenanceRpc } from "./agent-maintenance-rpc.js";
+import { subscribeToHttpProxyRpc } from "./agent-http-proxy-rpc.js";
 import { sendSignalToTaskProcess } from "./agent-task-execution.js";
 import {
   buildAgentCodexAppEventsSubject,
@@ -23,6 +24,7 @@ import {
   buildAgentDaemonRpcSubject,
   buildAgentFsRpcSubject,
   buildAgentGitRpcSubject,
+  buildAgentHttpProxyRpcSubject,
   buildAgentMaintenanceRpcSubject,
   buildAgentSettingsRpcSubject,
   buildAgentSkillRpcSubject,
@@ -400,6 +402,13 @@ async function main() {
           nc: jetstream.nc,
           subject: buildAgentMaintenanceRpcSubject(userId, initialAgentId),
           agentPackageJsonPath: AGENT_PACKAGE_JSON_PATH,
+          onInfo: writeAgentInfo,
+          onError: writeAgentError,
+        });
+        subscribeToHttpProxyRpc({
+          nc: jetstream.nc,
+          subject: buildAgentHttpProxyRpcSubject(userId, initialAgentId),
+          workspaceRoot: resolveWorkspaceRoot(),
           onInfo: writeAgentInfo,
           onError: writeAgentError,
         });
