@@ -4,7 +4,7 @@ import {
   resolveAgentModelInstructionsFilePath,
   type AgentSettingsConfig,
 } from "./agent-settings.js";
-import { buildDaemonMcpConfigArgs, buildMobileMcpConfigArgs } from "./agent-codex-cli.js";
+import { buildCustomMcpConfigArgs, buildDaemonMcpConfigArgs, buildMobileMcpConfigArgs } from "./agent-codex-cli.js";
 import { CodexAppServerClient } from "./codex-app-server-client.js";
 
 function toTomlStringLiteral(value: string): string {
@@ -62,6 +62,7 @@ async function buildCodexAppServerArgs(args: {
       userId: args.userId,
       workspaceRoot: args.workspaceRoot,
     }),
+    ...buildCustomMcpConfigArgs(args.settings.mcp.servers),
     ...buildFeatureArg(true, "goals"),
     ...buildFeatureArg(args.settings.codex.computerUseEnabled, "computer_use"),
     ...buildFeatureArg(args.settings.codex.browserUseEnabled, "browser_use"),
@@ -133,7 +134,7 @@ export function createCodexAppServerManager(args: {
       userId: args.userId,
     });
     args.onLog?.(
-      `starting codex app-server model=${settings.codex.model} reasoningEffort=${settings.codex.reasoningEffort} personality=${settings.general.personality} computerUse=${settings.codex.computerUseEnabled} browserUse=${settings.codex.browserUseEnabled}`,
+      `starting codex app-server model=${settings.codex.model} reasoningEffort=${settings.codex.reasoningEffort} personality=${settings.general.personality} computerUse=${settings.codex.computerUseEnabled} browserUse=${settings.codex.browserUseEnabled} mcpServers=${settings.mcp.servers.filter((server) => server.enabled).length}`,
     );
     return new CodexAppServerClient({
       cwd: args.workspaceRoot,

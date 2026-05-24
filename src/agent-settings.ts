@@ -8,6 +8,14 @@ export interface AgentEnvironmentVariableConfig {
   value: string;
 }
 
+export interface AgentMcpServerConfig {
+  name: string;
+  command: string;
+  args: string[];
+  env: AgentEnvironmentVariableConfig[];
+  enabled: boolean;
+}
+
 export interface AgentSettingsConfig {
   general: {
     personality: CodexPersonality;
@@ -38,6 +46,9 @@ export interface AgentSettingsConfig {
   };
   env: {
     variables: AgentEnvironmentVariableConfig[];
+  };
+  mcp: {
+    servers: AgentMcpServerConfig[];
   };
 }
 
@@ -79,6 +90,9 @@ export interface AgentSettingsPublic {
   };
   env: {
     variables: AgentEnvironmentVariableConfig[];
+  };
+  mcp: {
+    servers: AgentMcpServerConfig[];
   };
 }
 
@@ -125,6 +139,9 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
     },
     env: {
       variables: [],
+    },
+    mcp: {
+      servers: [],
     },
   };
 }
@@ -214,6 +231,81 @@ function normalizeAgentEnvironmentSettings(
   return { variables };
 }
 
+function normalizeMcpServerName(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed || !/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    return null;
+  }
+  if (trimmed === "doer_daemon" || trimmed === "doer_mobile") {
+    return null;
+  }
+  return trimmed;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => (typeof item === "string" ? item.replace(/\r/g, "") : null))
+    .filter((item): item is string => item !== null && item.trim().length > 0);
+}
+
+function normalizeAgentMcpServer(value: unknown): AgentMcpServerConfig | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const raw = value as Record<string, unknown>;
+  const name = normalizeMcpServerName(raw.name);
+  const command = typeof raw.command === "string" ? raw.command.trim() : "";
+  if (!name || !command) {
+    return null;
+  }
+  const env: AgentEnvironmentVariableConfig[] = [];
+  const seenKeys = new Set<string>();
+  const envRaw = Array.isArray(raw.env) ? raw.env : [];
+  for (const item of envRaw) {
+    const normalized = normalizeAgentEnvironmentVariable(item);
+    if (!normalized || seenKeys.has(normalized.key)) {
+      continue;
+    }
+    seenKeys.add(normalized.key);
+    env.push(normalized);
+  }
+  return {
+    name,
+    command,
+    args: normalizeStringArray(raw.args),
+    env,
+    enabled: raw.enabled !== false,
+  };
+}
+
+function normalizeAgentMcpSettings(
+  value: unknown,
+  fallback: AgentSettingsConfig["mcp"],
+): AgentSettingsConfig["mcp"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallback;
+  }
+  const raw = value as Record<string, unknown>;
+  const serversRaw = Array.isArray(raw.servers) ? raw.servers : [];
+  const servers: AgentMcpServerConfig[] = [];
+  const seenNames = new Set<string>();
+  for (const item of serversRaw) {
+    const normalized = normalizeAgentMcpServer(item);
+    if (!normalized || seenNames.has(normalized.name)) {
+      continue;
+    }
+    seenNames.add(normalized.name);
+    servers.push(normalized);
+  }
+  return { servers };
+}
+
 export function normalizeAgentSettingsConfig(
   value: unknown,
   fallback?: AgentSettingsConfig | null,
@@ -225,6 +317,7 @@ export function normalizeAgentSettingsConfig(
   const realtime = raw.realtime && typeof raw.realtime === "object" ? (raw.realtime as Record<string, unknown>) : {};
   const git = raw.git && typeof raw.git === "object" ? (raw.git as Record<string, unknown>) : {};
   const env = raw.env && typeof raw.env === "object" ? raw.env : null;
+  const mcp = raw.mcp && typeof raw.mcp === "object" ? raw.mcp : null;
   return {
     general: {
       personality: normalizeCodexPersonality(general.personality, base.general.personality),
@@ -256,6 +349,7 @@ export function normalizeAgentSettingsConfig(
       oauthScope: git.oauthScope === null ? null : normalizeNullableString(git.oauthScope) ?? base.git.oauthScope,
     },
     env: normalizeAgentEnvironmentSettings(env, base.env),
+    mcp: normalizeAgentMcpSettings(mcp, base.mcp),
   };
 }
 
@@ -367,6 +461,18 @@ export async function toAgentSettingsPublic(args: {
         value: variable.value,
       })),
     },
+    mcp: {
+      servers: args.config.mcp.servers.map((server) => ({
+        name: server.name,
+        command: server.command,
+        args: [...server.args],
+        env: server.env.map((variable) => ({
+          key: variable.key,
+          value: variable.value,
+        })),
+        enabled: server.enabled,
+      })),
+    },
   };
 }
 
@@ -417,6 +523,7 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
   move("gitOauthLogin", "git", "oauthLogin");
   move("gitOauthScope", "git", "oauthScope");
   move("environmentVariables", "env", "variables");
+  move("mcpServers", "mcp", "servers");
 
   return patch;
 }

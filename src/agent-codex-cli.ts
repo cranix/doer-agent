@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import type { CodexPersonality } from "./agent-settings.js";
+import type { AgentMcpServerConfig, CodexPersonality } from "./agent-settings.js";
 
 const ANSI_RE = /\u001b\[[0-9;]*m/g;
 
@@ -24,6 +24,28 @@ function toTomlStringLiteral(value: string): string {
 
 function toTomlStringArray(values: string[]): string {
   return `[${values.map((value) => toTomlStringLiteral(value)).join(", ")}]`;
+}
+
+function buildMcpServerConfigArgs(args: {
+  serverName: string;
+  command: string;
+  commandArgs: string[];
+  env?: Record<string, string>;
+  enabled?: boolean;
+}): string[] {
+  const serverName = args.serverName.trim();
+  const configArgs = [
+    "--config",
+    `mcp_servers.${serverName}.command=${toTomlStringLiteral(args.command)}`,
+    "--config",
+    `mcp_servers.${serverName}.args=${toTomlStringArray(args.commandArgs)}`,
+    "--config",
+    `mcp_servers.${serverName}.enabled=${args.enabled === false ? "false" : "true"}`,
+  ];
+  for (const [key, value] of Object.entries(args.env ?? {})) {
+    configArgs.push("--config", `mcp_servers.${serverName}.env.${key}=${toTomlStringLiteral(value)}`);
+  }
+  return configArgs;
 }
 
 function hasDirectCodexBinary(): boolean {
@@ -112,6 +134,29 @@ export function buildMobileMcpConfigArgs(args: {
   });
 }
 
+export function buildCustomMcpConfigArgs(servers: AgentMcpServerConfig[]): string[] {
+  const configArgs: string[] = [];
+  const reservedNames = new Set(["doer_daemon", "doer_mobile"]);
+  const seenNames = new Set<string>();
+  for (const server of servers) {
+    const serverName = server.name.trim();
+    if (!server.enabled || !serverName || !server.command.trim() || reservedNames.has(serverName) || seenNames.has(serverName)) {
+      continue;
+    }
+    seenNames.add(serverName);
+    configArgs.push(
+      ...buildMcpServerConfigArgs({
+        serverName,
+        command: server.command,
+        commandArgs: server.args,
+        env: Object.fromEntries(server.env.map((variable) => [variable.key, variable.value])),
+        enabled: true,
+      }),
+    );
+  }
+  return configArgs;
+}
+
 function buildWorkspaceMcpConfigArgs(args: {
   agentProjectDir: string;
   workspaceRoot: string;
@@ -129,20 +174,16 @@ function buildWorkspaceMcpConfigArgs(args: {
   const commandArgs = existsSync(distEntry)
     ? [distEntry, "--workspace-root", args.workspaceRoot]
     : ["--import", tsxLoaderPath, srcEntry, "--workspace-root", args.workspaceRoot];
-  const configArgs = [
-    "--config",
-    `mcp_servers.${serverName}.command=${toTomlStringLiteral(command)}`,
-    "--config",
-    `mcp_servers.${serverName}.args=${toTomlStringArray(commandArgs)}`,
-    "--config",
-    `mcp_servers.${serverName}.env.${args.workspaceRootEnvName}=${toTomlStringLiteral(args.workspaceRoot)}`,
-    "--config",
-    `mcp_servers.${serverName}.enabled=true`,
-  ];
-  for (const [key, value] of Object.entries(args.env ?? {})) {
-    configArgs.push("--config", `mcp_servers.${serverName}.env.${key}=${toTomlStringLiteral(value)}`);
-  }
-  return configArgs;
+  return buildMcpServerConfigArgs({
+    serverName,
+    command,
+    commandArgs,
+    env: {
+      [args.workspaceRootEnvName]: args.workspaceRoot,
+      ...(args.env ?? {}),
+    },
+    enabled: true,
+  });
 }
 
 export function buildLocalCodexCliCommand(args: string[]): string {
