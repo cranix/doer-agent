@@ -2,7 +2,7 @@ import path from "node:path";
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import crypto from "node:crypto";
 import { StringCodec, type Msg } from "nats";
-import { create as createTar, extract as extractTar } from "tar";
+import { extract as extractTar } from "tar";
 import { validateImageBytes } from "./agent-runtime-utils.js";
 
 const fsRpcCodec = StringCodec();
@@ -15,7 +15,6 @@ export type AgentFsRpcAction =
   | "write_text"
   | "download_file"
   | "delete_path"
-  | "archive_dir"
   | "extract_archive";
 
 export interface AgentFsRpcRequest {
@@ -35,7 +34,6 @@ export interface AgentFsRpcRequest {
   uploadFieldName?: unknown;
   formFields?: unknown;
   agentId?: unknown;
-  archivePath?: unknown;
   destinationPath?: unknown;
 }
 
@@ -63,7 +61,6 @@ function parseFsRpcAction(value: unknown): AgentFsRpcAction {
     value === "write_text" ||
     value === "download_file" ||
     value === "delete_path" ||
-    value === "archive_dir" ||
     value === "extract_archive"
   ) {
     return value;
@@ -130,19 +127,6 @@ function sha256Hex(bytes: Uint8Array): string {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
-async function createTarGzipBuffer(cwd: string, entries: string[]): Promise<Buffer> {
-  const stream = createTar({
-    cwd,
-    gzip: true,
-    portable: true,
-  }, entries);
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
 async function executeFsRpc(args: {
   workspaceRoot: string;
   request: AgentFsRpcRequest;
@@ -192,37 +176,6 @@ async function executeFsRpc(args: {
       items: items.slice(0, limit),
       truncated: items.length > limit,
       total: items.length,
-    };
-  }
-
-  if (action === "archive_dir") {
-    const entry = await stat(abs);
-    if (!entry.isDirectory()) {
-      throw new Error("path is not a directory");
-    }
-    const rawArchivePath = typeof args.request.archivePath === "string" ? args.request.archivePath : "";
-    if (!rawArchivePath) {
-      throw new Error("archivePath is required");
-    }
-    const archiveTarget = normalizeFsRpcPath(args.workspaceRoot, rawArchivePath);
-    try {
-      const manifestEntry = await stat(path.join(abs, "SKILL.md"));
-      if (!manifestEntry.isFile()) {
-        throw new Error("Selected skill directory must contain SKILL.md");
-      }
-    } catch {
-      throw new Error("Selected skill directory must contain SKILL.md");
-    }
-    await mkdir(path.dirname(archiveTarget.abs), { recursive: true });
-    const archiveBytes = await createTarGzipBuffer(abs, ["."]);
-    await writeFile(archiveTarget.abs, archiveBytes);
-    const archiveStat = await stat(archiveTarget.abs);
-    return {
-      ok: true,
-      action,
-      path: formatPath(abs),
-      archivePath: archiveTarget.formatPath(archiveTarget.abs),
-      size: archiveStat.size,
     };
   }
 
