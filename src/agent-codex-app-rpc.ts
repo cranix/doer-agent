@@ -9,6 +9,7 @@ interface AgentCodexAppRpcRequest {
   agentId?: unknown;
   method?: unknown;
   params?: unknown;
+  timeoutMs?: unknown;
 }
 
 interface AgentCodexAppRpcResponse {
@@ -98,11 +99,15 @@ function normalizeCodexAppRpcRequest(args: {
   action: "request";
   method: string;
   params: unknown;
+  timeoutMs?: number;
 } {
   const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
   const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
   const actionRaw = typeof args.request.action === "string" ? args.request.action.trim() : "";
   const method = typeof args.request.method === "string" ? args.request.method.trim() : "";
+  const timeoutMs = typeof args.request.timeoutMs === "number" && Number.isFinite(args.request.timeoutMs)
+    ? Math.min(180_000, Math.max(1_000, Math.trunc(args.request.timeoutMs)))
+    : undefined;
   if (!requestId || !requestAgentId || requestAgentId !== args.agentId || actionRaw !== "request" || !method) {
     throw new Error("invalid codex app rpc request");
   }
@@ -111,6 +116,7 @@ function normalizeCodexAppRpcRequest(args: {
     action: "request",
     method,
     params: args.request.params,
+    timeoutMs,
   };
 }
 
@@ -130,7 +136,7 @@ async function handleCodexAppRpcMessage(args: {
 
     const result = applyCodexAppRpcOmitRules(
       request.method,
-      await args.manager.request(request.method, request.params),
+      await args.manager.request(request.method, request.params, request.timeoutMs),
     );
     args.msg.respond(codexAppRpcCodec.encode(JSON.stringify({
       requestId,

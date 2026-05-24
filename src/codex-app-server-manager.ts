@@ -92,7 +92,7 @@ async function buildCodexAppServerEnv(args: {
 }
 
 export interface CodexAppServerManager {
-  request(method: string, params: unknown): Promise<unknown>;
+  request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
   restart(reason: string): Promise<void>;
   stop(): Promise<void>;
 }
@@ -170,9 +170,9 @@ export function createCodexAppServerManager(args: {
   };
 
   return {
-    async request(method, params) {
+    async request(method, params, timeoutMs) {
       const activeClient = await getClient();
-      return await activeClient.request(method, params);
+      return await activeClient.request(method, params, timeoutMs);
     },
     async restart(reason) {
       generation += 1;

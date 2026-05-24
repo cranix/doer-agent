@@ -39,9 +39,9 @@ export class CodexAppServerClient {
 
   constructor(private readonly options: CodexAppServerClientOptions) {}
 
-  async request(method: string, params?: unknown): Promise<unknown> {
+  async request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
     await this.start();
-    return await this.requestStarted(method, params);
+    return await this.requestStarted(method, params, timeoutMs);
   }
 
   async notify(method: string, params?: unknown): Promise<void> {
@@ -115,7 +115,7 @@ export class CodexAppServerClient {
     await this.notify("initialized");
   }
 
-  private async requestStarted(method: string, params?: unknown): Promise<unknown> {
+  private async requestStarted(method: string, params?: unknown, timeoutMsOverride?: number): Promise<unknown> {
     const child = this.child;
     if (!child || child.killed) {
       throw new Error("Codex app-server is not running");
@@ -123,7 +123,7 @@ export class CodexAppServerClient {
 
     const id = this.nextRequestId++;
     const payload = params === undefined ? { id, method } : { id, method, params };
-    const timeoutMs = this.options.requestTimeoutMs ?? 30_000;
+    const timeoutMs = timeoutMsOverride ?? this.options.requestTimeoutMs ?? 30_000;
     return await new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
