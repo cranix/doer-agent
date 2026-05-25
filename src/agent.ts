@@ -8,6 +8,8 @@ import {
 } from "./agent-settings.js";
 import { handleFsRpcMessage } from "./agent-fs-rpc.js";
 import { handleGitRpcMessage } from "./agent-git-rpc.js";
+import { handleNotesRpcMessage } from "./agent-notes-rpc.js";
+import { ensureBundledDoerSkills } from "./agent-bundled-skills.js";
 import { subscribeToCodexAppRpc } from "./agent-codex-app-rpc.js";
 import { createCodexAppServerManager, type CodexAppServerManager } from "./codex-app-server-manager.js";
 import { subscribeToDaemonRpc } from "./agent-daemon-rpc.js";
@@ -26,6 +28,7 @@ import {
   buildAgentGitRpcSubject,
   buildAgentHttpProxyRpcSubject,
   buildAgentMaintenanceRpcSubject,
+  buildAgentNotesRpcSubject,
   buildAgentSettingsRpcSubject,
   buildAgentSkillRpcSubject,
   formatLocalTimestamp,
@@ -58,6 +61,7 @@ const DEFAULT_SERVER_BASE_URL = "https://doer.cranix.net";
 const AGENT_MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 const AGENT_PACKAGE_JSON_PATH = path.join(AGENT_PROJECT_DIR, "package.json");
+const BUNDLED_SKILLS_ROOT = path.join(AGENT_PROJECT_DIR, "runtime", "skills");
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const HEARTBEAT_FAILURE_THRESHOLD = 3;
 const codexAppEventCodec = StringCodec();
@@ -179,6 +183,30 @@ function subscribeToFsRpc(args: {
     },
   });
   writeAgentInfo(`fs rpc subscribed subject=${subject}`);
+}
+
+function subscribeToNotesRpc(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+}): void {
+  const subject = buildAgentNotesRpcSubject(args.userId, args.agentId);
+  args.jetstream.nc.subscribe(subject, {
+    callback: (error, msg) => {
+      if (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        writeAgentError(`notes rpc subscription error: ${message}`);
+        return;
+      }
+      void handleNotesRpcMessage({
+        msg,
+        workspaceRoot: resolveWorkspaceRoot(),
+        agentId: args.agentId,
+        onError: writeAgentError,
+      });
+    },
+  });
+  writeAgentInfo(`notes rpc subscribed subject=${subject}`);
 }
 
 function formatCodexAppNotificationParams(params: unknown): string {
@@ -347,12 +375,23 @@ async function main() {
             );
           },
         });
+        void ensureBundledDoerSkills({
+          bundledSkillsRoot: BUNDLED_SKILLS_ROOT,
+          codexHome: runtimeEnvHelpers.resolveCodexHomePath(),
+          onInfo: writeAgentInfo,
+          onError: writeAgentError,
+        });
         subscribeToFsRpc({
           jetstream,
           serverBaseUrl,
           userId,
           agentId: initialAgentId,
           agentToken,
+        });
+        subscribeToNotesRpc({
+          jetstream,
+          userId,
+          agentId: initialAgentId,
         });
         subscribeToDaemonRpc({
           nc: jetstream.nc,

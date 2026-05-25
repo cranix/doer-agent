@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,6 +14,15 @@ import {
 } from "./agent-daemon-rpc.js";
 import { readAgentSettingsConfig } from "./agent-settings.js";
 import { createRuntimeEnvHelpers } from "./agent-runtime-env.js";
+import {
+  agentNotesCapabilitiesLocal,
+  createAgentNoteLocal,
+  deleteAgentNoteLocal,
+  getAgentNoteLocal,
+  listAgentNotesLocal,
+  renameAgentNoteLocal,
+  saveAgentNoteLocal,
+} from "./agent-notes-local.js";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PROJECT_DIR = path.join(MODULE_DIR, "..");
@@ -26,6 +36,24 @@ function parseWorkspaceRoot(argv: string[]): string {
 
 function formatJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
+}
+
+function runSearch(command: string, args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", reject);
+    child.once("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+  });
 }
 
 async function main(): Promise<void> {
@@ -172,6 +200,119 @@ async function main(): Promise<void> {
         },
       ],
       structuredContent: logs,
+    };
+  });
+
+  server.registerTool("notes_list", {
+    description: "List Doer note files in .doer-agent/notes.",
+    inputSchema: {},
+  }, async () => {
+    const notes = await listAgentNotesLocal(workspaceRoot);
+    return {
+      content: [{ type: "text", text: formatJson({ notes, capabilities: agentNotesCapabilitiesLocal() }) }],
+      structuredContent: { notes, capabilities: agentNotesCapabilitiesLocal() },
+    };
+  });
+
+  server.registerTool("notes_read", {
+    description: "Read a Doer note file from .doer-agent/notes.",
+    inputSchema: {
+      noteId: z.string().optional().describe("Note filename. Defaults to the first note when omitted."),
+    },
+  }, async ({ noteId }) => {
+    const notes = await listAgentNotesLocal(workspaceRoot);
+    const targetNoteId = noteId?.trim() || notes[0]?.id || "";
+    const note = targetNoteId ? await getAgentNoteLocal(workspaceRoot, targetNoteId) : null;
+    return {
+      content: [{ type: "text", text: formatJson({ note, capabilities: agentNotesCapabilitiesLocal() }) }],
+      structuredContent: { note, capabilities: agentNotesCapabilitiesLocal() },
+    };
+  });
+
+  server.registerTool("notes_create", {
+    description: "Create an empty Doer note and record a patch entry.",
+    inputSchema: {
+      name: z.string().min(1).describe("Note filename. .md is appended if omitted."),
+    },
+  }, async ({ name }) => {
+    const result = await createAgentNoteLocal(workspaceRoot, name);
+    return {
+      content: [{ type: "text", text: formatJson({ ...result, capabilities: agentNotesCapabilitiesLocal() }) }],
+      structuredContent: { ...result, capabilities: agentNotesCapabilitiesLocal() },
+    };
+  });
+
+  server.registerTool("notes_save", {
+    description: "Save a Doer note and record a git-diff patch entry for the content change.",
+    inputSchema: {
+      noteId: z.string().min(1).describe("Note filename."),
+      content: z.string().describe("Full note content to save."),
+    },
+  }, async ({ noteId, content }) => {
+    const result = await saveAgentNoteLocal({ workspaceRoot, noteId, content });
+    return {
+      content: [{ type: "text", text: formatJson({ ...result, capabilities: agentNotesCapabilitiesLocal() }) }],
+      structuredContent: { ...result, capabilities: agentNotesCapabilitiesLocal() },
+    };
+  });
+
+  server.registerTool("notes_rename", {
+    description: "Rename a Doer note and record a git-diff rename patch entry.",
+    inputSchema: {
+      noteId: z.string().describe("Current note filename."),
+      name: z.string().min(1).describe("New filename. .md is appended if omitted."),
+    },
+  }, async ({ noteId, name }) => {
+    const result = await renameAgentNoteLocal({ workspaceRoot, noteId, name });
+    return {
+      content: [{ type: "text", text: formatJson({ ...result, capabilities: agentNotesCapabilitiesLocal() }) }],
+      structuredContent: { ...result, capabilities: agentNotesCapabilitiesLocal() },
+    };
+  });
+
+  server.registerTool("notes_delete", {
+    description: "Delete a Doer note and record a git-diff deletion patch entry.",
+    inputSchema: {
+      noteId: z.string().describe("Note filename to delete."),
+    },
+  }, async ({ noteId }) => {
+    const result = await deleteAgentNoteLocal({ workspaceRoot, noteId });
+    return {
+      content: [{ type: "text", text: formatJson({ ...result, capabilities: agentNotesCapabilitiesLocal() }) }],
+      structuredContent: { ...result, capabilities: agentNotesCapabilitiesLocal() },
+    };
+  });
+
+  server.registerTool("notes_search", {
+    description: "Search Doer notes with ripgrep under .doer-agent/notes. Patches are excluded by default.",
+    inputSchema: {
+      query: z.string().min(1).describe("Text or regex pattern to search for."),
+      includePatches: z.boolean().optional().describe("Search patch history too."),
+      fixedStrings: z.boolean().optional().describe("Treat query as a literal string."),
+      limit: z.number().int().min(1).max(200).optional().describe("Maximum matching lines to return."),
+    },
+  }, async ({ query, includePatches, fixedStrings, limit }) => {
+    const args = [
+      "--line-number",
+      "--column",
+      "--no-heading",
+      "--color=never",
+      fixedStrings === false ? null : "--fixed-strings",
+      "--glob",
+      "*.md",
+      includePatches ? "--glob" : null,
+      includePatches ? "*.patch" : null,
+      query,
+      ".doer-agent/notes",
+    ].filter((item): item is string => Boolean(item));
+    const result = await runSearch("rg", args, workspaceRoot);
+    if (result.code !== 0 && result.code !== 1) {
+      throw new Error(result.stderr || "notes search failed");
+    }
+    const lines = result.stdout.split("\n").filter(Boolean).slice(0, limit ?? 50);
+    return {
+      content: [{ type: "text", text: formatJson({ matches: lines, truncated: result.stdout.split("\n").filter(Boolean).length > lines.length }) }],
+      structuredContent: { matches: lines, truncated: result.stdout.split("\n").filter(Boolean).length > lines.length },
     };
   });
 
