@@ -196,7 +196,10 @@ export function writeRpcStream(requestId: string, stream: "stdout" | "stderr", c
 
 function resolveLogTimeZone(): string {
   const configured = process.env.DOER_AGENT_LOG_TIMEZONE?.trim() || process.env.TZ?.trim();
-  return configured && configured.length > 0 ? configured : "Asia/Seoul";
+  if (configured && configured.length > 0) {
+    return configured;
+  }
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
 function resolveTimeZoneOffsetString(date: Date, timeZone: string): string {
@@ -236,6 +239,7 @@ export function formatLocalTimestamp(date = new Date()): string {
       minute: "2-digit",
       second: "2-digit",
       hour12: false,
+      hourCycle: "h23",
     }).formatToParts(date);
     const pick = (type: Intl.DateTimeFormatPartTypes): string => {
       return parts.find((part) => part.type === type)?.value || "00";

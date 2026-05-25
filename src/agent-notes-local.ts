@@ -29,20 +29,96 @@ export type AgentNoteChangeResult = {
 const AGENT_NOTES_ROOT = ".doer-agent/notes";
 const PATCHES_ROOT = `${AGENT_NOTES_ROOT}/patches`;
 
+function resolveSystemTimeZone(): string {
+  const configured = process.env.TZ?.trim();
+  if (configured) {
+    return configured;
+  }
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+function resolveTimeZoneOffsetString(date: Date, timeZone: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      timeZoneName: "shortOffset",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(date);
+    const token = parts.find((part) => part.type === "timeZoneName")?.value || "GMT+0";
+    const matched = token.match(/GMT([+-]\d{1,2})(?::?(\d{2}))?/i);
+    if (!matched) {
+      return "+00:00";
+    }
+    const hourRaw = matched[1] || "+0";
+    const minuteRaw = matched[2] || "00";
+    const sign = hourRaw.startsWith("-") ? "-" : "+";
+    const absHour = String(Math.abs(Number.parseInt(hourRaw, 10))).padStart(2, "0");
+    const absMinute = String(Math.abs(Number.parseInt(minuteRaw, 10))).padStart(2, "0");
+    return `${sign}${absHour}:${absMinute}`;
+  } catch {
+    return "+00:00";
+  }
+}
+
+function systemTimeParts(date: Date): {
+  year: string;
+  month: string;
+  day: string;
+  hours: string;
+  minutes: string;
+  seconds: string;
+  milliseconds: string;
+  offset: string;
+} {
+  const timeZone = resolveSystemTimeZone();
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const pick = (type: Intl.DateTimeFormatPartTypes): string => {
+    return parts.find((part) => part.type === type)?.value || "00";
+  };
+  return {
+    year: pick("year"),
+    month: pick("month"),
+    day: pick("day"),
+    hours: pick("hour"),
+    minutes: pick("minute"),
+    seconds: pick("second"),
+    milliseconds: String(date.getMilliseconds()).padStart(3, "0"),
+    offset: resolveTimeZoneOffsetString(date, timeZone),
+  };
+}
+
 function nowIso(): string {
-  return new Date().toISOString();
+  const parts = systemTimeParts(new Date());
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hours}:${parts.minutes}:${parts.seconds}.${parts.milliseconds}${parts.offset}`;
 }
 
 function createTimeBasedPatchId(createdAt: string): string {
-  const stamp = createdAt.replace(/[-:.]/g, "").replace("T", "t").replace("Z", "z");
+  const stamp = createdAt
+    .replace("T", "t")
+    .replace(/([+-])(\d{2}):?(\d{2})$/, (_match, sign: string, hours: string, minutes: string) => {
+      return `${sign === "-" ? "m" : "p"}${hours}${minutes}`;
+    })
+    .replace(/[-:.]/g, "")
+    .replace("Z", "z");
   const random = Math.random().toString(36).slice(2, 8);
   return `${stamp}-${random}`;
 }
 
 function patchRelPath(id: string, createdAt: string): string {
   const date = new Date(createdAt);
-  const year = String(date.getUTCFullYear());
-  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const { year, month } = systemTimeParts(Number.isNaN(date.getTime()) ? new Date() : date);
   return path.posix.join(PATCHES_ROOT, year, month, `${id}.patch`);
 }
 
