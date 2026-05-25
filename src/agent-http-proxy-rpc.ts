@@ -1,12 +1,13 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { appendFile, readFile, writeFile, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { StringCodec, type Msg, type NatsConnection } from "nats";
 
 const proxyRpcCodec = StringCodec();
 const PROXY_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const MAX_PROXY_BODY_BYTES = 5 * 1024 * 1024;
+const MAX_PROXY_LOGS = 100;
 
-type HttpProxyRpcAction = "list" | "create" | "update" | "delete" | "handle";
+type HttpProxyRpcAction = "list" | "create" | "update" | "delete" | "logs" | "handle";
 
 export interface AgentHttpProxyRecord {
   id: string;
@@ -18,6 +19,18 @@ export interface AgentHttpProxyRecord {
   updatedAt: string;
 }
 
+export interface AgentHttpProxyLogRecord {
+  id: string;
+  at: string;
+  method: string;
+  path: string;
+  status: number | null;
+  durationMs: number;
+  requestBytes: number;
+  responseBytes: number;
+  error: string | null;
+}
+
 interface AgentHttpProxyRpcRequest {
   requestId?: unknown;
   action?: unknown;
@@ -26,6 +39,7 @@ interface AgentHttpProxyRpcRequest {
   host?: unknown;
   port?: unknown;
   enabled?: unknown;
+  limit?: unknown;
   method?: unknown;
   path?: unknown;
   headers?: unknown;
@@ -41,6 +55,10 @@ interface AgentHttpProxyFetchResponse {
 
 function getProxyRegistryPath(workspaceRoot: string): string {
   return path.join(workspaceRoot, ".doer-agent", "http-proxies.json");
+}
+
+function getProxyLogsPath(workspaceRoot: string, proxyId: string): string {
+  return path.join(workspaceRoot, ".doer-agent", "http-proxy-logs", `${proxyId}.jsonl`);
 }
 
 function slugify(value: string): string {
@@ -141,6 +159,35 @@ function normalizeProxyRecord(value: unknown): AgentHttpProxyRecord | null {
   };
 }
 
+function normalizeProxyLogRecord(value: unknown): AgentHttpProxyLogRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const row = value as Record<string, unknown>;
+  const id = typeof row.id === "string" && row.id.trim() ? row.id.trim() : "";
+  const at = typeof row.at === "string" && row.at.trim() ? row.at.trim() : "";
+  const method = typeof row.method === "string" && row.method.trim() ? row.method.trim().toUpperCase() : "";
+  const requestPath = typeof row.path === "string" && row.path.trim() ? row.path.trim() : "/";
+  const status = typeof row.status === "number" && Number.isInteger(row.status) ? row.status : null;
+  const durationMs = typeof row.durationMs === "number" && Number.isFinite(row.durationMs) ? Math.max(0, Math.round(row.durationMs)) : 0;
+  const requestBytes = typeof row.requestBytes === "number" && Number.isFinite(row.requestBytes) ? Math.max(0, Math.round(row.requestBytes)) : 0;
+  const responseBytes = typeof row.responseBytes === "number" && Number.isFinite(row.responseBytes) ? Math.max(0, Math.round(row.responseBytes)) : 0;
+  if (!id || !at || !method) {
+    return null;
+  }
+  return {
+    id,
+    at,
+    method,
+    path: requestPath,
+    status,
+    durationMs,
+    requestBytes,
+    responseBytes,
+    error: typeof row.error === "string" && row.error.trim() ? row.error.trim().slice(0, 500) : null,
+  };
+}
+
 async function readProxyRegistry(workspaceRoot: string): Promise<AgentHttpProxyRecord[]> {
   const raw = await readFile(getProxyRegistryPath(workspaceRoot), "utf8").catch(() => "");
   if (!raw) {
@@ -163,6 +210,34 @@ async function writeProxyRegistry(workspaceRoot: string, proxies: AgentHttpProxy
   const registryPath = getProxyRegistryPath(workspaceRoot);
   await mkdir(path.dirname(registryPath), { recursive: true });
   await writeFile(registryPath, `${JSON.stringify({ proxies }, null, 2)}\n`, "utf8");
+}
+
+function normalizeLimit(value: unknown, fallback: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(1, Math.min(Math.floor(numeric), 1000));
+}
+
+async function readProxyLogs(workspaceRoot: string, proxyId: string, limit: number): Promise<AgentHttpProxyLogRecord[]> {
+  const raw = await readFile(getProxyLogsPath(workspaceRoot, proxyId), "utf8").catch(() => "");
+  if (!raw) {
+    return [];
+  }
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-limit)
+    .map((line) => {
+      try {
+        return normalizeProxyLogRecord(JSON.parse(line) as unknown);
+      } catch {
+        return null;
+      }
+    })
+    .filter((log): log is AgentHttpProxyLogRecord => Boolean(log));
 }
 
 async function createProxy(workspaceRoot: string, request: AgentHttpProxyRpcRequest): Promise<AgentHttpProxyRecord> {
@@ -213,53 +288,115 @@ async function updateProxy(workspaceRoot: string, request: AgentHttpProxyRpcRequ
 async function deleteProxy(workspaceRoot: string, proxyId: string): Promise<void> {
   const proxies = await readProxyRegistry(workspaceRoot);
   await writeProxyRegistry(workspaceRoot, proxies.filter((proxy) => proxy.id !== proxyId));
+  await unlink(getProxyLogsPath(workspaceRoot, proxyId)).catch(() => undefined);
 }
 
-async function handleProxyFetch(workspaceRoot: string, request: AgentHttpProxyRpcRequest): Promise<AgentHttpProxyFetchResponse> {
+async function appendProxyLog(workspaceRoot: string, proxyId: string, log: Omit<AgentHttpProxyLogRecord, "id" | "at">): Promise<void> {
+  const entry: AgentHttpProxyLogRecord = {
+    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    at: new Date().toISOString(),
+    ...log,
+  };
+  const logsPath = getProxyLogsPath(workspaceRoot, proxyId);
+  await mkdir(path.dirname(logsPath), { recursive: true });
+  await appendFile(logsPath, `${JSON.stringify(entry)}\n`, "utf8");
+}
+
+async function readProxyLogsForRequest(workspaceRoot: string, request: AgentHttpProxyRpcRequest): Promise<{
+  proxy: AgentHttpProxyRecord;
+  events: AgentHttpProxyLogRecord[];
+}> {
   const proxyId = normalizeProxyId(request.proxyId);
   const proxy = (await readProxyRegistry(workspaceRoot)).find((item) => item.id === proxyId);
   if (!proxy) {
     throw new Error("proxy not found");
   }
-  if (!proxy.enabled) {
-    throw new Error("proxy disabled");
-  }
+  return {
+    proxy,
+    events: await readProxyLogs(workspaceRoot, proxyId, normalizeLimit(request.limit, MAX_PROXY_LOGS)),
+  };
+}
+
+async function handleProxyFetch(workspaceRoot: string, request: AgentHttpProxyRpcRequest): Promise<AgentHttpProxyFetchResponse> {
+  const proxyId = normalizeProxyId(request.proxyId);
+  const proxy = (await readProxyRegistry(workspaceRoot)).find((item) => item.id === proxyId);
+  const startedAt = Date.now();
   const method = normalizeMethod(request.method);
   const requestPath = normalizePath(request.path);
-  const headers = normalizeHeaders(request.headers);
   const bodyBase64 = typeof request.bodyBase64 === "string" ? request.bodyBase64 : "";
   const body = bodyBase64 ? Buffer.from(bodyBase64, "base64") : undefined;
+  const requestBytes = body?.byteLength ?? 0;
+  let status: number | null = null;
+  let responseBytes = 0;
+  let errorMessage: string | null = null;
+
+  const finishLog = async () => {
+    await appendProxyLog(workspaceRoot, proxyId, {
+      method,
+      path: requestPath,
+      status,
+      durationMs: Date.now() - startedAt,
+      requestBytes,
+      responseBytes,
+      error: errorMessage,
+    }).catch(() => undefined);
+  };
+
+  if (!proxy) {
+    throw new Error("proxy not found");
+  }
+  if (!proxy.enabled) {
+    errorMessage = "proxy disabled";
+    await finishLog();
+    throw new Error("proxy disabled");
+  }
+  const headers = normalizeHeaders(request.headers);
   if ((body?.byteLength ?? 0) > MAX_PROXY_BODY_BYTES) {
+    errorMessage = "proxy request body too large";
+    await finishLog();
     throw new Error("proxy request body too large");
   }
-  const url = new URL(requestPath, `http://${proxy.host}:${proxy.port}`);
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: method === "GET" || method === "HEAD" ? undefined : body,
-    redirect: "manual",
-  });
-  const responseBuffer = Buffer.from(await response.arrayBuffer());
-  if (responseBuffer.byteLength > MAX_PROXY_BODY_BYTES) {
-    throw new Error("proxy response body too large");
+  try {
+    const url = new URL(requestPath, `http://${proxy.host}:${proxy.port}`);
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: method === "GET" || method === "HEAD" ? undefined : body,
+      redirect: "manual",
+    });
+    status = response.status;
+    const responseBuffer = Buffer.from(await response.arrayBuffer());
+    responseBytes = responseBuffer.byteLength;
+    if (responseBuffer.byteLength > MAX_PROXY_BODY_BYTES) {
+      errorMessage = "proxy response body too large";
+      await finishLog();
+      throw new Error("proxy response body too large");
+    }
+    const responseHeaders: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      responseHeaders[key] = value;
+    });
+    await finishLog();
+    return {
+      status: response.status,
+      statusText: response.statusText,
+      headers: responseHeaders,
+      bodyBase64: responseBuffer.toString("base64"),
+    };
+  } catch (error) {
+    if (!errorMessage) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+      await finishLog();
+    }
+    throw error;
   }
-  const responseHeaders: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    responseHeaders[key] = value;
-  });
-  return {
-    status: response.status,
-    statusText: response.statusText,
-    headers: responseHeaders,
-    bodyBase64: responseBuffer.toString("base64"),
-  };
 }
 
 async function executeProxyRpc(args: {
   workspaceRoot: string;
   request: AgentHttpProxyRpcRequest;
 }): Promise<Record<string, unknown>> {
-  const action = args.request.action === "create" || args.request.action === "update" || args.request.action === "delete" || args.request.action === "handle"
+  const action = args.request.action === "create" || args.request.action === "update" || args.request.action === "delete" || args.request.action === "logs" || args.request.action === "handle"
     ? args.request.action
     : "list";
   if (action === "list") {
@@ -274,6 +411,9 @@ async function executeProxyRpc(args: {
   if (action === "delete") {
     await deleteProxy(args.workspaceRoot, normalizeProxyId(args.request.proxyId));
     return { ok: true, action };
+  }
+  if (action === "logs") {
+    return { ok: true, action, ...await readProxyLogsForRequest(args.workspaceRoot, args.request) };
   }
   return { ok: true, action, response: await handleProxyFetch(args.workspaceRoot, args.request) };
 }
