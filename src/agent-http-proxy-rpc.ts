@@ -6,13 +6,14 @@ const proxyRpcCodec = StringCodec();
 const PROXY_ID_PATTERN = /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/;
 const MAX_PROXY_BODY_BYTES = 5 * 1024 * 1024;
 
-type HttpProxyRpcAction = "list" | "create" | "delete" | "handle";
+type HttpProxyRpcAction = "list" | "create" | "update" | "delete" | "handle";
 
 export interface AgentHttpProxyRecord {
   id: string;
   name: string | null;
   host: string;
   port: number;
+  enabled: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -24,6 +25,7 @@ interface AgentHttpProxyRpcRequest {
   name?: unknown;
   host?: unknown;
   port?: unknown;
+  enabled?: unknown;
   method?: unknown;
   path?: unknown;
   headers?: unknown;
@@ -133,6 +135,7 @@ function normalizeProxyRecord(value: unknown): AgentHttpProxyRecord | null {
     name: normalizeName(row.name),
     host,
     port,
+    enabled: row.enabled !== false,
     createdAt,
     updatedAt,
   };
@@ -180,11 +183,31 @@ async function createProxy(workspaceRoot: string, request: AgentHttpProxyRpcRequ
     name,
     host,
     port,
+    enabled: request.enabled !== false,
     createdAt: now,
     updatedAt: now,
   };
   await writeProxyRegistry(workspaceRoot, [...proxies, proxy].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
   return proxy;
+}
+
+async function updateProxy(workspaceRoot: string, request: AgentHttpProxyRpcRequest): Promise<AgentHttpProxyRecord> {
+  const proxyId = normalizeProxyId(request.proxyId);
+  const proxies = await readProxyRegistry(workspaceRoot);
+  const proxy = proxies.find((item) => item.id === proxyId);
+  if (!proxy) {
+    throw new Error("proxy not found");
+  }
+  const updated: AgentHttpProxyRecord = {
+    ...proxy,
+    name: request.name === undefined ? proxy.name : normalizeName(request.name),
+    host: request.host === undefined ? proxy.host : normalizeHost(request.host),
+    port: request.port === undefined ? proxy.port : normalizePort(request.port),
+    enabled: request.enabled === undefined ? proxy.enabled : request.enabled !== false,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeProxyRegistry(workspaceRoot, proxies.map((item) => (item.id === proxyId ? updated : item)));
+  return updated;
 }
 
 async function deleteProxy(workspaceRoot: string, proxyId: string): Promise<void> {
@@ -197,6 +220,9 @@ async function handleProxyFetch(workspaceRoot: string, request: AgentHttpProxyRp
   const proxy = (await readProxyRegistry(workspaceRoot)).find((item) => item.id === proxyId);
   if (!proxy) {
     throw new Error("proxy not found");
+  }
+  if (!proxy.enabled) {
+    throw new Error("proxy disabled");
   }
   const method = normalizeMethod(request.method);
   const requestPath = normalizePath(request.path);
@@ -233,7 +259,7 @@ async function executeProxyRpc(args: {
   workspaceRoot: string;
   request: AgentHttpProxyRpcRequest;
 }): Promise<Record<string, unknown>> {
-  const action = args.request.action === "create" || args.request.action === "delete" || args.request.action === "handle"
+  const action = args.request.action === "create" || args.request.action === "update" || args.request.action === "delete" || args.request.action === "handle"
     ? args.request.action
     : "list";
   if (action === "list") {
@@ -241,6 +267,9 @@ async function executeProxyRpc(args: {
   }
   if (action === "create") {
     return { ok: true, action, proxy: await createProxy(args.workspaceRoot, args.request) };
+  }
+  if (action === "update") {
+    return { ok: true, action, proxy: await updateProxy(args.workspaceRoot, args.request) };
   }
   if (action === "delete") {
     await deleteProxy(args.workspaceRoot, normalizeProxyId(args.request.proxyId));
