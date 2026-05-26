@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { StringCodec, type Msg, type NatsConnection } from "nats";
 
 const gitRpcCodec = StringCodec();
@@ -92,6 +93,44 @@ function sanitizeGitPathspec(value: unknown): string {
   return trimmed;
 }
 
+function normalizeWorkspacePath(workspaceRoot: string, value: string): string {
+  const trimmed = value.trim().replace(/\\/g, "/") || ".";
+  if (path.isAbsolute(trimmed)) {
+    throw new Error("absolute paths are not supported for agent git diff");
+  }
+  const abs = path.resolve(workspaceRoot, trimmed);
+  if (abs !== workspaceRoot && !abs.startsWith(workspaceRoot + path.sep)) {
+    throw new Error("path escapes workspace root");
+  }
+  return abs;
+}
+
+function pathspecsForRepo(args: {
+  workspaceRoot: string;
+  repoRootAbs: string;
+  targetPath: string;
+  targetPathAbs: string;
+  pathspecs: string[];
+}): string[] {
+  const normalizedTargetPath = args.targetPath.trim().replace(/\\/g, "/").replace(/\/+$/g, "") || ".";
+  return args.pathspecs.map((pathspec) => {
+    if (path.isAbsolute(pathspec)) {
+      throw new Error("absolute pathspecs are not supported for agent git diff");
+    }
+    const normalizedPathspec = pathspec.trim().replace(/\\/g, "/").replace(/\/+$/g, "") || ".";
+    const workspaceAbs =
+      normalizedPathspec === normalizedTargetPath
+        ? args.targetPathAbs
+        : path.resolve(args.workspaceRoot, pathspec);
+    const repoRelRaw = path.relative(args.repoRootAbs, workspaceAbs).split(path.sep).join("/");
+    const repoRel = repoRelRaw || ".";
+    if (repoRel && repoRel !== ".." && !repoRel.startsWith("../")) {
+      return repoRel;
+    }
+    return pathspec;
+  });
+}
+
 function normalizeGitRpcRequest(args: {
   request: AgentGitRpcRequest;
   agentId: string;
@@ -123,7 +162,7 @@ function normalizeGitRpcRequest(args: {
     args.request.diffAlgorithm === "histogram"
       ? args.request.diffAlgorithm
       : "default";
-  const contextRaw = Number(args.request.contextLines);
+  const contextRaw = typeof args.request.contextLines === "number" ? args.request.contextLines : Number.NaN;
   const contextLines = Number.isFinite(contextRaw) ? Math.max(0, Math.min(200, Math.trunc(contextRaw))) : null;
   const pathspecs = Array.isArray(args.request.pathspecs) ? args.request.pathspecs.map((item) => sanitizeGitPathspec(item)) : [];
   return {
@@ -273,6 +312,7 @@ export async function handleGitRpcMessage(args: {
   msg: Msg;
   nc: NatsConnection;
   agentId: string;
+  workspaceRoot: string;
   onError: (message: string) => void;
 }): Promise<void> {
   let requestId = "unknown";
@@ -282,11 +322,10 @@ export async function handleGitRpcMessage(args: {
     const request = normalizeGitRpcRequest({ request: payload, agentId: args.agentId });
     requestId = request.requestId;
     responseSubject = request.responseSubject;
-    if (!request.targetPath.startsWith("/")) {
-      throw new Error("agent source requires an absolute directory path");
-    }
+    const workspaceRoot = path.resolve(args.workspaceRoot);
+    const targetPathAbs = normalizeWorkspacePath(workspaceRoot, request.targetPath);
 
-    const topLevelResult = await runLocalCommand("git", ["-C", request.targetPath, "rev-parse", "--show-toplevel"], request.targetPath);
+    const topLevelResult = await runLocalCommand("git", ["-C", targetPathAbs, "rev-parse", "--show-toplevel"], targetPathAbs);
     if (topLevelResult.code !== 0) {
       publishGitRpcResponse({
         nc: args.nc,
@@ -300,7 +339,6 @@ export async function handleGitRpcMessage(args: {
             source: "agent",
             agent: { id: args.agentId, name: null },
             currentPath: request.targetPath,
-            repoRoot: null,
             repoRelativePath: null,
             branch: null,
             gitDiff: {
@@ -317,7 +355,17 @@ export async function handleGitRpcMessage(args: {
     }
 
     const repoRootAbs = topLevelResult.stdout.trim();
-    const prefixResult = await runLocalCommand("git", ["-C", request.targetPath, "rev-parse", "--show-prefix"], request.targetPath);
+    const repoRequest: NormalizedGitRpcRequest = {
+      ...request,
+      pathspecs: pathspecsForRepo({
+        workspaceRoot,
+        repoRootAbs,
+        targetPath: request.targetPath,
+        targetPathAbs,
+        pathspecs: request.pathspecs,
+      }),
+    };
+    const prefixResult = await runLocalCommand("git", ["-C", targetPathAbs, "rev-parse", "--show-prefix"], targetPathAbs);
     const repoRelativePath = prefixResult.code === 0 ? (prefixResult.stdout.trim().replace(/\/$/, "") || ".") : ".";
     const branchResult = await runLocalCommand("git", ["-C", repoRootAbs, "symbolic-ref", "--quiet", "--short", "HEAD"], repoRootAbs);
     const detachedResult =
@@ -325,12 +373,12 @@ export async function handleGitRpcMessage(args: {
     const branch =
       branchResult.code === 0 ? branchResult.stdout.trim() || null : detachedResult && detachedResult.code === 0 ? detachedResult.stdout.trim() || null : null;
 
-    const gitDiffArgs = buildAgentGitDiffArgs(repoRootAbs, request);
+    const gitDiffArgs = buildAgentGitDiffArgs(repoRootAbs, repoRequest);
     const gitDiffResult = await runLocalCommand("git", gitDiffArgs.args, repoRootAbs);
     if (gitDiffResult.code !== 0) {
       throw new Error(gitDiffResult.stderr.trim() || "Failed to run agent git diff");
     }
-    const withUntracked = await appendAgentLocalUntrackedDiff(repoRootAbs, request, gitDiffResult.stdout);
+    const withUntracked = await appendAgentLocalUntrackedDiff(repoRootAbs, repoRequest, gitDiffResult.stdout);
     publishGitRpcResponse({
       nc: args.nc,
       responseSubject,
@@ -343,7 +391,6 @@ export async function handleGitRpcMessage(args: {
           source: "agent",
           agent: { id: args.agentId, name: null },
           currentPath: request.targetPath,
-          repoRoot: repoRootAbs,
           repoRelativePath,
           branch,
           gitDiff: {

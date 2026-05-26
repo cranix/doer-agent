@@ -137,6 +137,7 @@ function subscribeToGitRpc(args: {
   jetstream: AgentJetStreamContext;
   userId: string;
   agentId: string;
+  workspaceRoot: string;
 }): void {
   const subject = buildAgentGitRpcSubject(args.userId, args.agentId);
   args.jetstream.nc.subscribe(subject, {
@@ -150,6 +151,7 @@ function subscribeToGitRpc(args: {
         msg,
         nc: args.jetstream.nc,
         agentId: args.agentId,
+        workspaceRoot: args.workspaceRoot,
         onError: writeAgentError,
       });
     },
@@ -423,6 +425,7 @@ async function main() {
           jetstream,
           userId,
           agentId: initialAgentId,
+          workspaceRoot: resolveWorkspaceRoot(),
         });
         subscribeToSkillRpc({
           nc: jetstream.nc,
