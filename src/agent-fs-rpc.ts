@@ -249,6 +249,7 @@ async function executeFsRpc(args: {
       ok: true,
       action,
       path: formatPath(abs),
+      absolutePath: abs.split(path.sep).join("/"),
       size: entry.size,
       upload,
     };
