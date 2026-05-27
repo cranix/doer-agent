@@ -4,7 +4,7 @@ import {
   resolveAgentModelInstructionsFilePath,
   type AgentSettingsConfig,
 } from "./agent-settings.js";
-import { buildCustomMcpConfigArgs, buildDaemonMcpConfigArgs, buildMobileMcpConfigArgs } from "./agent-codex-cli.js";
+import { buildCustomMcpConfigArgs, buildDaemonMcpConfigArgs, buildMobileMcpConfigArgs, buildThreadsMcpConfigArgs } from "./agent-codex-cli.js";
 import { CodexAppServerClient } from "./codex-app-server-client.js";
 
 function toTomlStringLiteral(value: string): string {
@@ -52,6 +52,14 @@ async function buildCodexAppServerArgs(args: {
     ...configArgs,
     ...buildDaemonMcpConfigArgs({
       agentProjectDir: args.agentProjectDir,
+      workspaceRoot: args.workspaceRoot,
+    }),
+    ...buildThreadsMcpConfigArgs({
+      agentId: args.agentId,
+      agentProjectDir: args.agentProjectDir,
+      agentToken: args.agentToken,
+      serverBaseUrl: args.serverBaseUrl,
+      userId: args.userId,
       workspaceRoot: args.workspaceRoot,
     }),
     ...buildMobileMcpConfigArgs({

@@ -109,6 +109,31 @@ export function buildDaemonMcpConfigArgs(args: {
   });
 }
 
+export function buildThreadsMcpConfigArgs(args: {
+  agentId: string;
+  agentProjectDir: string;
+  agentToken: string;
+  serverBaseUrl: string;
+  userId: string;
+  workspaceRoot: string;
+  serverName?: string;
+}): string[] {
+  return buildWorkspaceMcpConfigArgs({
+    agentProjectDir: args.agentProjectDir,
+    workspaceRoot: args.workspaceRoot,
+    serverName: args.serverName?.trim() || "doer_threads",
+    distEntryRelativePath: path.join("dist", "threads-mcp-server.js"),
+    srcEntryRelativePath: path.join("src", "threads-mcp-server.ts"),
+    workspaceRootEnvName: "DOER_THREADS_WORKSPACE_ROOT",
+    env: {
+      DOER_THREADS_AGENT_ID: args.agentId,
+      DOER_AGENT_TOKEN: args.agentToken,
+      DOER_THREADS_SERVER_BASE_URL: args.serverBaseUrl,
+      DOER_THREADS_USER_ID: args.userId,
+    },
+  });
+}
+
 export function buildMobileMcpConfigArgs(args: {
   agentId: string;
   agentProjectDir: string;
@@ -136,7 +161,7 @@ export function buildMobileMcpConfigArgs(args: {
 
 export function buildCustomMcpConfigArgs(servers: AgentMcpServerConfig[]): string[] {
   const configArgs: string[] = [];
-  const reservedNames = new Set(["doer_daemon", "doer_mobile"]);
+  const reservedNames = new Set(["doer_daemon", "doer_mobile", "doer_threads"]);
   const seenNames = new Set<string>();
   for (const server of servers) {
     const serverName = server.name.trim();
