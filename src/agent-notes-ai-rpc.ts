@@ -57,6 +57,7 @@ function buildNotesAiPrompt(request: NotesAiRpcRequest): string {
     "You are editing a Markdown note inside Doer.",
     "Return only Markdown content. Do not include explanations, preambles, or code fences unless the requested content itself needs them.",
     "If a selection is provided, return only the replacement for that selection. If no selection is provided, return content to insert at the cursor.",
+    "When you generate an image, do not write attachment:image links. The generated image will be inserted into the note automatically.",
     "",
     `<instruction>\n${instruction}\n</instruction>`,
     `<document>\n${document}\n</document>`,
@@ -97,6 +98,19 @@ function agentMessageDeltaFromParams(params: unknown): string {
   return stringValue(record.delta) || stringValue(record.text);
 }
 
+function generatedImageMarkdownFromParams(params: unknown, threadId: string): string {
+  const record = recordValue(params);
+  const item = recordValue(record?.item);
+  if (!record || !item || stringValue(item.type) !== "imageGeneration") {
+    return "";
+  }
+  const imageId = stringValue(item.id);
+  if (!threadId || !imageId) {
+    return "";
+  }
+  return `\n\n![generated image](.codex/generated_images/${threadId}/${imageId}.png)\n\n`;
+}
+
 function terminalErrorFromParams(params: unknown): string {
   const record = recordValue(params);
   const error = recordValue(record?.error);
@@ -105,7 +119,7 @@ function terminalErrorFromParams(params: unknown): string {
     stringValue(record?.reason);
 }
 
-async function archiveThread(args: {
+async function archiveCompletedThread(args: {
   manager: CodexAppServerManager;
   threadId: string;
   onError: (message: string) => void;
@@ -140,7 +154,7 @@ async function runNotesAiSession(args: {
   let settled = false;
   let cleanupNotification = () => {};
   let settleCompleted = (_callback: () => void) => {};
-  const completed = new Promise<void>((resolve, reject) => {
+  const completed = new Promise<"completed" | "aborted">((resolve, reject) => {
     const timeout = setTimeout(() => {
       if (!settled) {
         reject(new Error("Timed out while waiting for Codex notes AI result"));
@@ -156,7 +170,7 @@ async function runNotesAiSession(args: {
       callback();
     };
     args.abortController.signal.addEventListener("abort", () => {
-      settleCompleted(() => resolve());
+      settleCompleted(() => resolve("aborted"));
     }, { once: true });
     cleanupNotification = args.manager.onNotification((method, params) => {
       const eventThreadId = threadIdFromParams(params);
@@ -182,6 +196,18 @@ async function runNotesAiSession(args: {
         });
         return;
       }
+      if (method === "item/completed") {
+        const markdown = generatedImageMarkdownFromParams(params, threadId);
+        if (!markdown) {
+          return;
+        }
+        publishEvent({
+          nc: args.nc,
+          subject: args.eventsSubject,
+          payload: { type: "delta", sessionId: args.sessionId, text: markdown },
+        });
+        return;
+      }
       if (!isTerminalTurnMethod(method)) {
         return;
       }
@@ -192,7 +218,7 @@ async function runNotesAiSession(args: {
             subject: args.eventsSubject,
             payload: { type: "done", sessionId: args.sessionId },
           });
-          resolve();
+          resolve("completed");
         });
         return;
       }
@@ -228,18 +254,17 @@ async function runNotesAiSession(args: {
       return;
     }
 
-    await completed.finally(() => cleanupNotification());
-  } catch (error) {
-    settleCompleted(() => {});
-    throw error;
-  } finally {
-    if (threadId) {
-      await archiveThread({
+    const completion = await completed.finally(() => cleanupNotification());
+    if (completion === "completed") {
+      await archiveCompletedThread({
         manager: args.manager,
         threadId,
         onError: args.onError,
       });
     }
+  } catch (error) {
+    settleCompleted(() => {});
+    throw error;
   }
 }
 
