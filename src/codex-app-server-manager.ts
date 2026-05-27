@@ -92,6 +92,7 @@ async function buildCodexAppServerEnv(args: {
 }
 
 export interface CodexAppServerManager {
+  onNotification(listener: (method: string, params: unknown) => void): () => void;
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
   restart(reason: string): Promise<void>;
   stop(): Promise<void>;
@@ -112,6 +113,7 @@ export function createCodexAppServerManager(args: {
   let client: CodexAppServerClient | null = null;
   let createPromise: Promise<CodexAppServerClient> | null = null;
   let generation = 0;
+  const notificationListeners = new Set<(method: string, params: unknown) => void>();
 
   const createClient = async (): Promise<CodexAppServerClient> => {
     const settings = await args.readAgentSettingsConfig({ workspaceRoot: args.workspaceRoot });
@@ -141,7 +143,12 @@ export function createCodexAppServerManager(args: {
       args: appServerArgs,
       env,
       onLog: args.onLog,
-      onNotification: args.onNotification,
+      onNotification: (method, params) => {
+        for (const listener of notificationListeners) {
+          listener(method, params);
+        }
+        args.onNotification?.(method, params);
+      },
     });
   };
 
@@ -170,6 +177,12 @@ export function createCodexAppServerManager(args: {
   };
 
   return {
+    onNotification(listener) {
+      notificationListeners.add(listener);
+      return () => {
+        notificationListeners.delete(listener);
+      };
+    },
     async request(method, params, timeoutMs) {
       const activeClient = await getClient();
       return await activeClient.request(method, params, timeoutMs);

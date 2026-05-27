@@ -9,6 +9,7 @@ import {
 import { handleFsRpcMessage } from "./agent-fs-rpc.js";
 import { handleGitRpcMessage } from "./agent-git-rpc.js";
 import { handleNotesRpcMessage } from "./agent-notes-rpc.js";
+import { subscribeToNotesAiRpc } from "./agent-notes-ai-rpc.js";
 import { ensureBundledDoerSkills } from "./agent-bundled-skills.js";
 import { subscribeToCodexAppRpc } from "./agent-codex-app-rpc.js";
 import { createCodexAppServerManager, type CodexAppServerManager } from "./codex-app-server-manager.js";
@@ -29,6 +30,7 @@ import {
   buildAgentHttpProxyRpcSubject,
   buildAgentMaintenanceRpcSubject,
   buildAgentNotesRpcSubject,
+  buildAgentNotesAiRpcSubject,
   buildAgentSettingsRpcSubject,
   buildAgentSkillRpcSubject,
   formatLocalTimestamp,
@@ -209,6 +211,22 @@ function subscribeToNotesRpc(args: {
     },
   });
   writeAgentInfo(`notes rpc subscribed subject=${subject}`);
+}
+
+function subscribeToNotesAiRpcSession(args: {
+  jetstream: AgentJetStreamContext;
+  userId: string;
+  agentId: string;
+  codexAppServerManager: CodexAppServerManager;
+}): void {
+  subscribeToNotesAiRpc({
+    nc: args.jetstream.nc,
+    subject: buildAgentNotesAiRpcSubject(args.userId, args.agentId),
+    manager: args.codexAppServerManager,
+    agentId: args.agentId,
+    onInfo: writeAgentInfo,
+    onError: writeAgentError,
+  });
 }
 
 function formatCodexAppNotificationParams(params: unknown): string {
@@ -394,6 +412,12 @@ async function main() {
           jetstream,
           userId,
           agentId: initialAgentId,
+        });
+        subscribeToNotesAiRpcSession({
+          jetstream,
+          userId,
+          agentId: initialAgentId,
+          codexAppServerManager,
         });
         subscribeToDaemonRpc({
           nc: jetstream.nc,
