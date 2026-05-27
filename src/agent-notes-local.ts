@@ -11,6 +11,14 @@ export type AgentNoteSummary = {
   mtimeMs: number;
 };
 
+export type AgentNotePatchSummary = {
+  id: string;
+  path: string;
+  name: string;
+  size: number;
+  mtimeMs: number;
+};
+
 export type AgentNoteDocument = {
   id: string;
   path: string;
@@ -261,6 +269,38 @@ export async function listAgentNotesLocal(workspaceRoot: string): Promise<AgentN
     return b.mtimeMs - a.mtimeMs || a.name.localeCompare(b.name);
   });
   return notes;
+}
+
+export async function listAgentNotePatchesLocal(workspaceRoot: string, limit = 10): Promise<AgentNotePatchSummary[]> {
+  const rootAbs = workspacePath(workspaceRoot, PATCHES_ROOT);
+  const patches: AgentNotePatchSummary[] = [];
+
+  async function visit(absDir: string, relDir: string): Promise<void> {
+    const rows = await readdir(absDir, { withFileTypes: true }).catch(() => []);
+    await Promise.all(rows.map(async (row) => {
+      const childAbs = path.join(absDir, row.name);
+      const childRel = path.posix.join(relDir, row.name);
+      if (row.isDirectory()) {
+        await visit(childAbs, childRel);
+        return;
+      }
+      if (!row.isFile() || !row.name.endsWith(".patch")) {
+        return;
+      }
+      const entry = await stat(childAbs);
+      patches.push({
+        id: childRel,
+        path: childRel,
+        name: row.name,
+        size: entry.size,
+        mtimeMs: entry.mtimeMs,
+      });
+    }));
+  }
+
+  await visit(rootAbs, PATCHES_ROOT);
+  patches.sort((a, b) => b.mtimeMs - a.mtimeMs || b.path.localeCompare(a.path));
+  return patches.slice(0, Math.max(0, Math.trunc(limit)));
 }
 
 export async function getAgentNoteLocal(workspaceRoot: string, noteId?: string): Promise<AgentNoteDocument> {

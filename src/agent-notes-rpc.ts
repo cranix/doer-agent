@@ -3,6 +3,7 @@ import {
   agentNotesCapabilitiesLocal,
   createAgentNoteLocal,
   deleteAgentNoteLocal,
+  listAgentNotePatchesLocal,
   getAgentNoteLocal,
   listAgentNotesLocal,
   renameAgentNoteLocal,
@@ -11,7 +12,7 @@ import {
 
 const notesRpcCodec = StringCodec();
 
-type AgentNotesRpcAction = "capabilities" | "list" | "get" | "create" | "save" | "rename" | "delete";
+type AgentNotesRpcAction = "capabilities" | "list" | "listPatches" | "get" | "create" | "save" | "rename" | "delete";
 
 interface AgentNotesRpcRequest {
   requestId?: unknown;
@@ -20,12 +21,14 @@ interface AgentNotesRpcRequest {
   noteId?: unknown;
   content?: unknown;
   name?: unknown;
+  limit?: unknown;
 }
 
 function parseAction(value: unknown): AgentNotesRpcAction {
   if (
     value === "capabilities" ||
     value === "list" ||
+    value === "listPatches" ||
     value === "get" ||
     value === "create" ||
     value === "save" ||
@@ -48,6 +51,10 @@ async function executeNotesRpc(workspaceRoot: string, request: AgentNotesRpcRequ
   }
   if (action === "list") {
     return { ok: true, action, notes: await listAgentNotesLocal(workspaceRoot) };
+  }
+  if (action === "listPatches") {
+    const limit = typeof request.limit === "number" && Number.isFinite(request.limit) ? request.limit : 10;
+    return { ok: true, action, patches: await listAgentNotePatchesLocal(workspaceRoot, limit) };
   }
   if (action === "get") {
     const notes = await listAgentNotesLocal(workspaceRoot);
