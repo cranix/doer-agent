@@ -1,8 +1,10 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import type { AgentMcpServerConfig, CodexPersonality } from "./agent-settings.js";
 
+const require = createRequire(import.meta.url);
 const ANSI_RE = /\u001b\[[0-9;]*m/g;
 
 export interface ShellRpcCodexAuthBundle {
@@ -53,6 +55,20 @@ function hasDirectCodexBinary(): boolean {
     stdio: "ignore",
   });
   return result.status === 0;
+}
+
+function resolveBundledCodexCliBinPath(): string | null {
+  try {
+    const packageJsonPath = require.resolve("@openai/codex/package.json");
+    const packageJson = require(packageJsonPath) as { bin?: { codex?: string } };
+    const codexBin = packageJson.bin?.codex;
+    if (!codexBin) {
+      return null;
+    }
+    return path.resolve(path.dirname(packageJsonPath), codexBin);
+  } catch {
+    return null;
+  }
 }
 
 export function stripAnsi(value: string): string {
@@ -213,6 +229,10 @@ function buildWorkspaceMcpConfigArgs(args: {
 
 export function buildLocalCodexCliCommand(args: string[]): string {
   const quotedArgs = args.map(shellSingleQuote).join(" ");
+  const bundledCodex = resolveBundledCodexCliBinPath();
+  if (bundledCodex) {
+    return `exec ${shellSingleQuote(process.execPath)} ${shellSingleQuote(bundledCodex)} ${quotedArgs}`;
+  }
   const direct = `exec codex ${quotedArgs}`;
   const fallback = `exec npm exec --yes --package doer-agent -- codex ${quotedArgs}`;
   const script = [
@@ -234,14 +254,22 @@ export function spawnManagedCodexCommand(args: {
     ...args.env,
     DOER_AGENT_TOKEN: args.agentToken,
   };
-  const child = hasDirectCodexBinary()
-    ? spawn("codex", args.codexArgs, {
+  const bundledCodex = resolveBundledCodexCliBinPath();
+  const child = bundledCodex
+    ? spawn(process.execPath, [bundledCodex, ...args.codexArgs], {
       cwd: args.taskWorkspace,
       detached: process.platform !== "win32",
       env,
       stdio: ["ignore", "pipe", "pipe"],
     })
-    : spawn("npm", ["exec", "--yes", "--package", "doer-agent", "--", "codex", ...args.codexArgs], {
+    : hasDirectCodexBinary()
+      ? spawn("codex", args.codexArgs, {
+      cwd: args.taskWorkspace,
+      detached: process.platform !== "win32",
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+      : spawn("npm", ["exec", "--yes", "--package", "doer-agent", "--", "codex", ...args.codexArgs], {
       cwd: args.taskWorkspace,
       detached: process.platform !== "win32",
       env,

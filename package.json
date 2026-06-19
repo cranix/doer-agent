@@ -25,15 +25,16 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@openai/codex": "^0.133.0",
-    "@openai/codex-sdk": "^0.133.0",
+    "@openai/codex": "^0.141.0",
+    "@openai/codex-sdk": "^0.141.0",
     "diff": "^9.0.0",
     "nats": "^2.29.3",
     "tar": "^7.5.15"
   },
   "devDependencies": {
     "@types/node": "^20.19.40",
-    "tsx": "^4.21.0",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.22.4",
     "typescript": "^5"
   }
 }

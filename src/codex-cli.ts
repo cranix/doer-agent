@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import { existsSync, realpathSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { createRequire } from "node:module";
+import { delimiter, dirname, join } from "node:path";
 import { spawn } from "node:child_process";
+
+const require = createRequire(import.meta.url);
 
 function isWindows(): boolean {
   return process.platform === "win32";
@@ -25,6 +28,11 @@ function resolveSelf(): string | null {
 }
 
 function findCodexBinary(): string | null {
+  const localCodex = resolveBundledCodexBinary();
+  if (localCodex) {
+    return localCodex;
+  }
+
   const pathValue = process.env.PATH ?? "";
   const dirs = pathValue.split(delimiter).filter(Boolean);
   const self = resolveSelf();
@@ -43,6 +51,20 @@ function findCodexBinary(): string | null {
   }
 
   return null;
+}
+
+function resolveBundledCodexBinary(): string | null {
+  try {
+    const packageJsonPath = require.resolve("@openai/codex/package.json");
+    const packageJson = require(packageJsonPath) as { bin?: { codex?: string } };
+    const codexBin = packageJson.bin?.codex;
+    if (!codexBin) {
+      return null;
+    }
+    return join(dirname(packageJsonPath), codexBin);
+  } catch {
+    return null;
+  }
 }
 
 const binary = findCodexBinary();
