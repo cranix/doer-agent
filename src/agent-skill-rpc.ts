@@ -85,6 +85,14 @@ function buildSkillGeneratorCodexArgs(prompt: string, model: string): string[] {
   return ["--dangerously-bypass-approvals-and-sandbox", "--model", model, "exec", "--", prompt];
 }
 
+function resolveCodexModel(settings: AgentSettingsConfig): string {
+  const providerKey = settings.codex.modelProvider || "openai";
+  if (providerKey === "zai") {
+    return settings.codex.providerModels.zai || "glm-5.2";
+  }
+  return settings.codex.providerModels[providerKey] || settings.codex.providerModels.openai || "gpt-5.5";
+}
+
 async function generateSkillViaCodex(args: {
   userPrompt: string;
   workspaceRoot: string;
@@ -107,7 +115,7 @@ async function generateSkillViaCodex(args: {
   const envPatch = args.buildAgentSettingsEnvPatch(localAgentSettings);
   const prompt = buildSkillGeneratorPrompt(args.userPrompt);
   const result = await args.runLocalCodexCli(
-    buildSkillGeneratorCodexArgs(prompt, localAgentSettings.codex.model || "gpt-5.5"),
+    buildSkillGeneratorCodexArgs(prompt, resolveCodexModel(localAgentSettings)),
     120_000,
     envPatch,
   );

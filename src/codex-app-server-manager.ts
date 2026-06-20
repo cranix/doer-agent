@@ -6,6 +6,7 @@ import {
 } from "./agent-settings.js";
 import { buildCustomMcpConfigArgs, buildDaemonMcpConfigArgs, buildMobileMcpConfigArgs, buildThreadsMcpConfigArgs } from "./agent-codex-cli.js";
 import { CodexAppServerClient } from "./codex-app-server-client.js";
+import { startCodexChatBridge } from "./codex-chat-bridge.js";
 
 function toTomlStringLiteral(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -19,6 +20,33 @@ function buildFeatureArg(enabled: boolean, name: string): string[] {
   return [enabled ? "--enable" : "--disable", name];
 }
 
+function resolveCodexModel(settings: AgentSettingsConfig): string {
+  const providerKey = settings.codex.modelProvider || "openai";
+  if (providerKey === "zai") {
+    return settings.codex.providerModels.zai || "glm-5.2";
+  }
+  return settings.codex.providerModels[providerKey] || settings.codex.providerModels.openai || "gpt-5.5";
+}
+
+function resolveCodexModelContextWindow(settings: AgentSettingsConfig): number | null {
+  return settings.codex.modelProvider === "zai" ? 258400 : null;
+}
+
+function buildModelProviderConfigArgs(settings: AgentSettingsConfig): string[] {
+  const provider = settings.codex.customProvider;
+  const providerId = settings.codex.modelProvider;
+  if (!provider || !providerId || provider.id !== providerId) {
+    return [];
+  }
+  return [
+    ...buildConfigArg("model_provider", toTomlStringLiteral(provider.id)),
+    ...buildConfigArg(`model_providers.${provider.id}.name`, toTomlStringLiteral(provider.name)),
+    ...buildConfigArg(`model_providers.${provider.id}.base_url`, toTomlStringLiteral(provider.baseUrl)),
+    ...buildConfigArg(`model_providers.${provider.id}.env_key`, toTomlStringLiteral(provider.envKey)),
+    ...buildConfigArg(`model_providers.${provider.id}.wire_api`, toTomlStringLiteral("responses")),
+  ];
+}
+
 async function buildCodexAppServerArgs(args: {
   agentId: string;
   agentToken: string;
@@ -28,8 +56,12 @@ async function buildCodexAppServerArgs(args: {
   settings: AgentSettingsConfig;
   userId: string;
 }): Promise<string[]> {
+  const codexModel = resolveCodexModel(args.settings);
+  const modelContextWindow = resolveCodexModelContextWindow(args.settings);
   const configArgs = [
-    ...buildConfigArg("model", toTomlStringLiteral(args.settings.codex.model)),
+    ...buildConfigArg("model", toTomlStringLiteral(codexModel)),
+    ...(modelContextWindow ? buildConfigArg("model_context_window", String(modelContextWindow)) : []),
+    ...buildModelProviderConfigArgs(args.settings),
     ...buildConfigArg("model_reasoning_effort", toTomlStringLiteral(args.settings.codex.reasoningEffort)),
     ...(args.settings.codex.serviceTier
       ? buildConfigArg("service_tier", toTomlStringLiteral(args.settings.codex.serviceTier))
@@ -79,6 +111,42 @@ async function buildCodexAppServerArgs(args: {
   ];
 }
 
+type ProviderProxy = {
+  stop: () => Promise<void>;
+};
+
+async function resolveAppServerSettings(args: {
+  settings: AgentSettingsConfig;
+  onLog?: (message: string) => void;
+}): Promise<{ settings: AgentSettingsConfig; proxy: ProviderProxy | null }> {
+  const provider = args.settings.codex.customProvider;
+  if (args.settings.codex.modelProvider !== "zai" || provider?.id !== "zai") {
+    return { settings: args.settings, proxy: null };
+  }
+  const proxy = await startCodexChatBridge({
+    providerApiKey: provider.apiKey ?? "",
+    providerId: provider.id,
+    providerName: provider.name,
+    targetBaseUrl: provider.baseUrl,
+    onLog: args.onLog,
+  });
+  return {
+    proxy,
+    settings: {
+      ...args.settings,
+      codex: {
+        ...args.settings.codex,
+        customProvider: {
+          ...provider,
+          baseUrl: proxy.baseUrl,
+          envKey: proxy.envKey,
+          apiKey: proxy.apiKey,
+        },
+      },
+    },
+  };
+}
+
 async function buildCodexAppServerEnv(args: {
   agentId: string;
   agentToken: string;
@@ -119,19 +187,22 @@ export function createCodexAppServerManager(args: {
   onNotification?: (method: string, params: unknown) => void;
 }): CodexAppServerManager {
   let client: CodexAppServerClient | null = null;
+  let providerProxy: ProviderProxy | null = null;
   let createPromise: Promise<CodexAppServerClient> | null = null;
   let generation = 0;
   const notificationListeners = new Set<(method: string, params: unknown) => void>();
 
   const createClient = async (): Promise<CodexAppServerClient> => {
     const settings = await args.readAgentSettingsConfig({ workspaceRoot: args.workspaceRoot });
+    const resolved = await resolveAppServerSettings({ settings, onLog: args.onLog });
+    providerProxy = resolved.proxy;
     const appServerArgs = await buildCodexAppServerArgs({
       agentId: args.agentId,
       agentToken: args.agentToken,
       workspaceRoot: args.workspaceRoot,
       agentProjectDir: args.agentProjectDir,
       serverBaseUrl: args.serverBaseUrl,
-      settings,
+      settings: resolved.settings,
       userId: args.userId,
     });
     const env = await buildCodexAppServerEnv({
@@ -140,11 +211,11 @@ export function createCodexAppServerManager(args: {
       workspaceRoot: args.workspaceRoot,
       serverBaseUrl: args.serverBaseUrl,
       resolveCodexHomePath: args.resolveCodexHomePath,
-      settings,
+      settings: resolved.settings,
       userId: args.userId,
     });
     args.onLog?.(
-      `starting codex app-server model=${settings.codex.model} reasoningEffort=${settings.codex.reasoningEffort} personality=${settings.general.personality} computerUse=${settings.codex.computerUseEnabled} browserUse=${settings.codex.browserUseEnabled} mcpServers=${settings.mcp.servers.filter((server) => server.enabled).length}`,
+      `starting codex app-server model=${resolveCodexModel(resolved.settings)} reasoningEffort=${resolved.settings.codex.reasoningEffort} personality=${resolved.settings.general.personality} computerUse=${resolved.settings.codex.computerUseEnabled} browserUse=${resolved.settings.codex.browserUseEnabled} mcpServers=${resolved.settings.mcp.servers.filter((server) => server.enabled).length}`,
     );
     return new CodexAppServerClient({
       cwd: args.workspaceRoot,
@@ -198,7 +269,9 @@ export function createCodexAppServerManager(args: {
     async restart(reason) {
       generation += 1;
       const activeClient = client;
+      const activeProxy = providerProxy;
       client = null;
+      providerProxy = null;
       createPromise = null;
       if (!activeClient) {
         args.onLog?.(`codex app-server restart requested before start reason=${reason}`);
@@ -206,12 +279,20 @@ export function createCodexAppServerManager(args: {
       }
       args.onLog?.(`restarting codex app-server reason=${reason}`);
       await activeClient.stop();
+      await activeProxy?.stop().catch((error) => {
+        args.onLog?.(`failed to stop provider proxy: ${error instanceof Error ? error.message : String(error)}`);
+      });
     },
     async stop() {
       const activeClient = client;
+      const activeProxy = providerProxy;
       client = null;
+      providerProxy = null;
       createPromise = null;
       await activeClient?.stop();
+      await activeProxy?.stop().catch((error) => {
+        args.onLog?.(`failed to stop provider proxy: ${error instanceof Error ? error.message : String(error)}`);
+      });
     },
   };
 }

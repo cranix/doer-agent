@@ -21,7 +21,15 @@ export interface AgentSettingsConfig {
     personality: CodexPersonality;
   };
   codex: {
-    model: string;
+    providerModels: Record<string, string>;
+    modelProvider: string | null;
+    customProvider: {
+      id: string;
+      name: string;
+      baseUrl: string;
+      envKey: string;
+      apiKey: string | null;
+    } | null;
     reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
     serviceTier: string | null;
     authMode: "api_key" | "chatgpt";
@@ -58,7 +66,17 @@ export interface AgentSettingsPublic {
     customInstructions: string | null;
   };
   codex: {
-    model: string;
+    providerModels: Record<string, string>;
+    modelProvider: string | null;
+    customProvider: {
+      id: string;
+      name: string;
+      baseUrl: string;
+      envKey: string;
+      hasApiKey: boolean;
+      apiKeyMasked: string | null;
+      apiKeyLength: number | null;
+    } | null;
     reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
     serviceTier: string | null;
     authMode: "api_key" | "chatgpt";
@@ -114,7 +132,9 @@ export function createDefaultAgentSettingsConfig(): AgentSettingsConfig {
       personality: "pragmatic",
     },
     codex: {
-      model: "gpt-5.5",
+      providerModels: { openai: "gpt-5.5" },
+      modelProvider: null,
+      customProvider: null,
       reasoningEffort: "medium",
       serviceTier: null,
       authMode: "api_key",
@@ -163,6 +183,56 @@ function normalizeServiceTier(value: unknown): string | null {
     return "fast";
   }
   return normalized;
+}
+
+function normalizeCodexCustomProvider(
+  value: unknown,
+  fallback: AgentSettingsConfig["codex"]["customProvider"] = null,
+): AgentSettingsConfig["codex"]["customProvider"] {
+  if (value === null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return fallback;
+  }
+  const raw = value as Record<string, unknown>;
+  const id = typeof raw.id === "string" ? raw.id.trim() : "";
+  const baseUrl = typeof raw.baseUrl === "string" ? raw.baseUrl.trim() : "";
+  if (!id || !baseUrl) {
+    return fallback;
+  }
+  const name = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : id;
+  const envKey = typeof raw.envKey === "string" && raw.envKey.trim() ? raw.envKey.trim() : `${id.toUpperCase()}_API_KEY`;
+  const apiKey =
+    raw.apiKey === null
+      ? null
+      : typeof raw.apiKey === "string" && raw.apiKey.trim()
+        ? raw.apiKey.trim()
+        : fallback?.id === id
+          ? fallback.apiKey
+          : null;
+  return {
+    id,
+    name,
+    baseUrl,
+    envKey,
+    apiKey,
+  };
+}
+
+function normalizeCodexProviderModels(value: unknown, fallback: Record<string, string>): Record<string, string> {
+  const models: Record<string, string> = { ...fallback };
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return models;
+  }
+  for (const [rawKey, rawModel] of Object.entries(value as Record<string, unknown>)) {
+    const key = rawKey.trim();
+    const model = typeof rawModel === "string" ? rawModel.trim() : "";
+    if (key && model) {
+      models[key] = model;
+    }
+  }
+  return models;
 }
 
 function normalizeCodexPersonality(value: unknown, fallback: CodexPersonality): CodexPersonality {
@@ -323,7 +393,14 @@ export function normalizeAgentSettingsConfig(
       personality: normalizeCodexPersonality(general.personality, base.general.personality),
     },
     codex: {
-      model: typeof codex.model === "string" && codex.model.trim() ? codex.model.trim() : base.codex.model,
+      providerModels: normalizeCodexProviderModels(codex.providerModels, base.codex.providerModels),
+      modelProvider:
+        codex.modelProvider === null
+          ? null
+          : typeof codex.modelProvider === "string" && codex.modelProvider.trim()
+            ? codex.modelProvider.trim()
+            : base.codex.modelProvider,
+      customProvider: normalizeCodexCustomProvider(codex.customProvider, base.codex.customProvider),
       reasoningEffort: normalizeReasoningEffort(codex.reasoningEffort, base.codex.reasoningEffort),
       serviceTier: codex.serviceTier === null ? null : normalizeServiceTier(codex.serviceTier) ?? base.codex.serviceTier,
       authMode: codex.authMode === "chatgpt" ? "chatgpt" : codex.authMode === "api_key" ? "api_key" : base.codex.authMode,
@@ -418,6 +495,7 @@ export async function toAgentSettingsPublic(args: {
 }): Promise<AgentSettingsPublic> {
   const realtimeKey = toMaskedSecret(args.config.realtime.apiKey);
   const gitOauth = toMaskedSecret(args.config.git.oauthToken);
+  const codexProviderKey = toMaskedSecret(args.config.codex.customProvider?.apiKey ?? null);
   const customInstructions = await readAgentModelInstructions(args.workspaceRoot);
   return {
     general: {
@@ -425,7 +503,19 @@ export async function toAgentSettingsPublic(args: {
       customInstructions,
     },
     codex: {
-      model: args.config.codex.model,
+      providerModels: { ...args.config.codex.providerModels },
+      modelProvider: args.config.codex.modelProvider,
+      customProvider: args.config.codex.customProvider
+        ? {
+            id: args.config.codex.customProvider.id,
+            name: args.config.codex.customProvider.name,
+            baseUrl: args.config.codex.customProvider.baseUrl,
+            envKey: args.config.codex.customProvider.envKey,
+            hasApiKey: codexProviderKey.has,
+            apiKeyMasked: codexProviderKey.masked,
+            apiKeyLength: codexProviderKey.length,
+          }
+        : null,
       reasoningEffort: args.config.codex.reasoningEffort,
       serviceTier: args.config.codex.serviceTier,
       authMode: args.config.codex.authMode,
@@ -502,7 +592,9 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
 
   move("personality", "general", "personality");
 
-  move("codexModel", "codex", "model");
+  move("codexProviderModels", "codex", "providerModels");
+  move("codexModelProvider", "codex", "modelProvider");
+  move("codexCustomProvider", "codex", "customProvider");
   move("codexReasoningEffort", "codex", "reasoningEffort");
   move("codexServiceTier", "codex", "serviceTier");
   move("codexAuthMode", "codex", "authMode");
@@ -530,6 +622,9 @@ export function normalizeAgentSettingsPatch(value: unknown): Record<string, unkn
 
 export function buildAgentSettingsEnvPatch(config: AgentSettingsConfig): Record<string, string> {
   const envPatch: Record<string, string> = {};
+  if (config.codex.customProvider?.apiKey && config.codex.customProvider.envKey) {
+    envPatch[config.codex.customProvider.envKey] = config.codex.customProvider.apiKey;
+  }
   if (config.git.enabled) {
     if (config.git.name) envPatch.GIT_AUTHOR_NAME = config.git.name;
     if (config.git.name) envPatch.GIT_COMMITTER_NAME = config.git.name;
