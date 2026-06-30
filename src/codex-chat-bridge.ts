@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 const DEFAULT_CHAT_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
+const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
 const CHAT_BRIDGE_ENV_KEY = "DOER_CODEX_CHAT_BRIDGE_API_KEY";
+const ANTHROPIC_VERSION = "2023-06-01";
 
 export interface CodexChatBridge {
   baseUrl: string;
@@ -39,9 +41,38 @@ type ResponseMetadata = {
 };
 
 type ChatMessageContent = string | Array<Record<string, unknown>> | null;
+type ProviderAdapterKind = "chat_completions" | "anthropic_messages";
+
+type ProviderAdapter = {
+  kind: ProviderAdapterKind;
+  defaultBaseUrl: string;
+  upstreamAuthHeaders: (apiKey: string) => Record<string, string>;
+};
+
+const PROVIDER_ADAPTERS: Record<string, ProviderAdapter> = {
+  anthropic: {
+    kind: "anthropic_messages",
+    defaultBaseUrl: DEFAULT_ANTHROPIC_BASE_URL,
+    upstreamAuthHeaders: (apiKey) => ({
+      "x-api-key": apiKey,
+      "anthropic-version": ANTHROPIC_VERSION,
+    }),
+  },
+  default: {
+    kind: "chat_completions",
+    defaultBaseUrl: DEFAULT_CHAT_BASE_URL,
+    upstreamAuthHeaders: (apiKey) => ({
+      authorization: `Bearer ${apiKey}`,
+    }),
+  },
+};
 
 function normalizeBaseUrl(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+function resolveProviderAdapter(providerId?: string | null): ProviderAdapter {
+  return PROVIDER_ADAPTERS[providerId?.trim().toLowerCase() || ""] ?? PROVIDER_ADAPTERS.default;
 }
 
 function resolveTargetBaseUrl(args: { providerId?: string | null; targetBaseUrl?: string | null }): string {
@@ -50,7 +81,8 @@ function resolveTargetBaseUrl(args: { providerId?: string | null; targetBaseUrl?
   if (providerId === "zai" && (!baseUrl || !baseUrl.includes("/coding/paas/"))) {
     return DEFAULT_CHAT_BASE_URL;
   }
-  return normalizeBaseUrl(baseUrl || DEFAULT_CHAT_BASE_URL);
+  const adapter = resolveProviderAdapter(providerId);
+  return normalizeBaseUrl(baseUrl || adapter.defaultBaseUrl);
 }
 
 function stringValue(value: unknown): string | null {
@@ -110,6 +142,15 @@ function contentToText(value: unknown): string {
     })
     .filter(Boolean)
     .join("\n");
+}
+
+function parseJsonObject(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
 }
 
 function responsePartToChatPart(part: unknown): Record<string, unknown> | null {
@@ -440,6 +481,173 @@ function buildChatRequest(
   };
 }
 
+function anthropicContentPartFromChatPart(part: Record<string, unknown>): Record<string, unknown> | null {
+  const type = stringValue(part.type);
+  if (type === "text") {
+    const text = textValue(part.text);
+    return text ? { type: "text", text } : null;
+  }
+  if (type === "image_url") {
+    const rawImageUrl = recordValue(part.image_url);
+    const imageUrl = textValue(part.image_url) ?? textValue(rawImageUrl?.url);
+    const dataUrlMatch = imageUrl?.match(/^data:([^;,]+);base64,(.+)$/);
+    if (!dataUrlMatch) {
+      return null;
+    }
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: dataUrlMatch[1],
+        data: dataUrlMatch[2],
+      },
+    };
+  }
+  return null;
+}
+
+function anthropicContentFromChatContent(content: unknown): string | Array<Record<string, unknown>> {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  const parts = content
+    .map((part) => recordValue(part))
+    .filter((part): part is Record<string, unknown> => Boolean(part))
+    .map(anthropicContentPartFromChatPart)
+    .filter((part): part is Record<string, unknown> => Boolean(part));
+  return parts.length > 0 ? parts : "";
+}
+
+function anthropicMessagesFromChatMessages(messages: Array<Record<string, unknown>>): {
+  system: string | null;
+  messages: Array<Record<string, unknown>>;
+} {
+  const systemParts: string[] = [];
+  const anthropicMessages: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    const role = stringValue(message.role);
+    if (role === "system" || role === "developer") {
+      const text = contentToText(message.content);
+      if (text) {
+        systemParts.push(text);
+      }
+      continue;
+    }
+    if (role === "tool") {
+      const toolUseId = stringValue(message.tool_call_id);
+      if (!toolUseId) {
+        continue;
+      }
+      anthropicMessages.push({
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: toolUseId,
+          content: contentToText(message.content),
+        }],
+      });
+      continue;
+    }
+    if (role === "assistant") {
+      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (toolCalls.length > 0) {
+        const content: Record<string, unknown>[] = toolCalls
+          .map((toolCall) => {
+            const toolCallRecord = recordValue(toolCall);
+            const fn = recordValue(toolCallRecord?.function);
+            const name = stringValue(fn?.name);
+            if (!toolCallRecord || !fn || !name) {
+              return null;
+            }
+            return {
+              type: "tool_use",
+              id: stringValue(toolCallRecord.id) ?? `call_${randomUUID().replace(/-/g, "")}`,
+              name,
+              input: parseJsonObject(typeof fn.arguments === "string" ? fn.arguments : ""),
+            };
+          })
+          .filter((item): item is NonNullable<typeof item> => item !== null);
+        if (content.length > 0) {
+          anthropicMessages.push({ role: "assistant", content });
+        }
+        continue;
+      }
+      anthropicMessages.push({ role: "assistant", content: anthropicContentFromChatContent(message.content) });
+      continue;
+    }
+    anthropicMessages.push({ role: "user", content: anthropicContentFromChatContent(message.content) });
+  }
+  return {
+    system: systemParts.length > 0 ? systemParts.join("\n\n") : null,
+    messages: anthropicMessages,
+  };
+}
+
+function anthropicToolsFromChatTools(tools: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(tools)) {
+    return [];
+  }
+  const converted = tools
+    .map((tool) => {
+      const record = recordValue(tool);
+      const fn = recordValue(record?.function);
+      const name = stringValue(fn?.name);
+      if (!fn || !name) {
+        return null;
+      }
+      return {
+        name,
+        description: stringValue(fn?.description) ?? "",
+        input_schema: schemaValue(fn?.parameters),
+      };
+    });
+  return converted.filter((tool): tool is NonNullable<typeof tool> => tool !== null);
+}
+
+function anthropicToolChoiceFromChatToolChoice(value: unknown): unknown {
+  const text = stringValue(value);
+  if (text === "auto") {
+    return { type: "auto" };
+  }
+  if (text === "required") {
+    return { type: "any" };
+  }
+  if (text === "none") {
+    return undefined;
+  }
+  const record = recordValue(value);
+  const fn = recordValue(record?.function);
+  const name = stringValue(fn?.name);
+  return name ? { type: "tool", name } : undefined;
+}
+
+function buildAnthropicRequest(
+  body: Record<string, unknown>,
+  stream: boolean,
+  onLog?: (message: string) => void,
+): Record<string, unknown> {
+  const chatRequest = buildChatRequest(body, stream, onLog);
+  const chatMessages = Array.isArray(chatRequest.messages) ? chatRequest.messages as Array<Record<string, unknown>> : [];
+  const converted = anthropicMessagesFromChatMessages(chatMessages);
+  const tools = anthropicToolsFromChatTools(chatRequest.tools);
+  const toolChoice = anthropicToolChoiceFromChatToolChoice(chatRequest.tool_choice);
+  return {
+    model: stringValue(chatRequest.model) ?? "claude-sonnet-4-6",
+    messages: converted.messages,
+    stream,
+    max_tokens: finiteNumber(chatRequest.max_tokens) ?? 4096,
+    ...(converted.system ? { system: converted.system } : {}),
+    ...(typeof chatRequest.temperature === "number" ? { temperature: chatRequest.temperature } : {}),
+    ...(typeof chatRequest.top_p === "number" ? { top_p: chatRequest.top_p } : {}),
+    ...(typeof chatRequest.stop === "string" || Array.isArray(chatRequest.stop) ? { stop_sequences: chatRequest.stop } : {}),
+    ...(tools.length > 0 ? { tools } : {}),
+    ...(toolChoice ? { tool_choice: toolChoice } : {}),
+  };
+}
+
 function upstreamErrorMessage(value: unknown): string {
   const body = recordValue(value);
   const error = recordValue(body?.error);
@@ -556,6 +764,105 @@ function chatMessageToResponseOutput(message: Record<string, unknown>): unknown[
     role: "assistant",
     content: [{ type: "output_text", text: contentToText(message.content), annotations: [] }],
   }];
+}
+
+function anthropicUsageToResponseUsage(value: unknown): ResponseUsage | null {
+  const usage = recordValue(value);
+  if (!usage) {
+    return null;
+  }
+  const inputTokens = finiteNumber(usage.input_tokens) ?? 0;
+  const outputTokens = finiteNumber(usage.output_tokens) ?? 0;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: inputTokens + outputTokens,
+  };
+}
+
+function anthropicContentToResponseOutput(content: unknown): unknown[] {
+  const blocks = Array.isArray(content) ? content : [];
+  const output: unknown[] = [];
+  const text = blocks
+    .map((block) => {
+      const record = recordValue(block);
+      return stringValue(record?.type) === "text" ? textValue(record?.text) ?? "" : "";
+    })
+    .filter(Boolean)
+    .join("");
+  if (text) {
+    output.push({
+      id: `msg_${randomUUID().replace(/-/g, "")}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    });
+  }
+  for (const block of blocks) {
+    const record = recordValue(block);
+    if (stringValue(record?.type) !== "tool_use") {
+      continue;
+    }
+    const name = stringValue(record?.name);
+    if (!name) {
+      continue;
+    }
+    const responseName = responsesFunctionCallNameFromChatName(name);
+    output.push({
+      type: "function_call",
+      id: stringValue(record?.id) ?? `fc_${randomUUID().replace(/-/g, "")}`,
+      call_id: stringValue(record?.id) ?? `call_${randomUUID().replace(/-/g, "")}`,
+      ...responseName,
+      arguments: JSON.stringify(record?.input ?? {}),
+      status: "completed",
+    });
+  }
+  return output;
+}
+
+async function forwardAnthropicNonStreaming(args: {
+  body: Record<string, unknown>;
+  res: ServerResponse;
+  signal: AbortSignal;
+  targetBaseUrl: string;
+  upstreamHeaders: Record<string, string>;
+  onLog?: (message: string) => void;
+}): Promise<void> {
+  const anthropicRequest = buildAnthropicRequest(args.body, false, args.onLog);
+  const responseMetadata = responseMetadataFromBody(args.body);
+  const upstream = await fetch(`${normalizeBaseUrl(args.targetBaseUrl)}/messages`, {
+    method: "POST",
+    headers: {
+      ...args.upstreamHeaders,
+      "content-type": "application/json",
+    },
+    signal: args.signal,
+    body: JSON.stringify(anthropicRequest),
+  });
+  const upstreamBody = await upstream.json().catch(async () => ({ error: { message: await upstream.text() } })) as Record<string, unknown>;
+  if (!upstream.ok) {
+    args.res.writeHead(upstream.status, { "content-type": "application/json" });
+    args.res.end(JSON.stringify({
+      error: {
+        message: upstreamErrorMessage(upstreamBody),
+        type: "server_error",
+        status: upstream.status,
+        upstream: recordValue(upstreamBody.error) ?? upstreamBody,
+      },
+    }));
+    return;
+  }
+  const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
+  const usage = anthropicUsageToResponseUsage(upstreamBody.usage);
+  args.res.writeHead(200, { "content-type": "application/json" });
+  args.res.end(JSON.stringify(responseBase(
+    responseId,
+    stringValue(anthropicRequest.model) ?? "claude-sonnet-4-6",
+    anthropicContentToResponseOutput(upstreamBody.content),
+    responseMetadata,
+    usage,
+  )));
 }
 
 async function forwardNonStreaming(args: {
@@ -922,6 +1229,322 @@ async function forwardStreaming(args: {
   args.res.end();
 }
 
+type AnthropicStreamingBlock = {
+  id: string;
+  outputIndex: number;
+  type: "text" | "tool_use";
+  text: string;
+  toolId: string;
+  toolName: string;
+  toolInputJson: string;
+  started: boolean;
+};
+
+async function forwardAnthropicStreaming(args: {
+  body: Record<string, unknown>;
+  res: ServerResponse;
+  signal: AbortSignal;
+  targetBaseUrl: string;
+  upstreamHeaders: Record<string, string>;
+  onLog?: (message: string) => void;
+}): Promise<void> {
+  const anthropicRequest = buildAnthropicRequest(args.body, true, args.onLog);
+  const model = stringValue(anthropicRequest.model) ?? "claude-sonnet-4-6";
+  const responseMetadata = responseMetadataFromBody(args.body);
+  const responseId = `resp_${randomUUID().replace(/-/g, "")}`;
+  const outputItems: unknown[] = [];
+  const blocks = new Map<number, AnthropicStreamingBlock>();
+  let streamUsage: ResponseUsage | null = null;
+
+  args.res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  writeSse(args.res, "response.created", { type: "response.created", response: responseBase(responseId, model, [], responseMetadata) });
+  writeSse(args.res, "response.in_progress", { type: "response.in_progress", response: responseBase(responseId, model, [], responseMetadata, null, "in_progress") });
+
+  const upstream = await fetch(`${normalizeBaseUrl(args.targetBaseUrl)}/messages`, {
+    method: "POST",
+    headers: {
+      ...args.upstreamHeaders,
+      "content-type": "application/json",
+    },
+    signal: args.signal,
+    body: JSON.stringify(anthropicRequest),
+  });
+  if (!upstream.ok || !upstream.body) {
+    const errorText = await upstream.text();
+    writeFailedSse({
+      errorMessage: `Anthropic Messages upstream failed: ${upstream.status} ${errorText}`,
+      model,
+      res: args.res,
+      responseId,
+      responseMetadata,
+    });
+    args.res.end();
+    return;
+  }
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let upstreamDone = false;
+  let streamFailed = false;
+  let currentEvent = "";
+
+  const processAnthropicEvent = (event: string, data: string): boolean => {
+    if (!data) {
+      return false;
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(data) as Record<string, unknown>;
+    } catch (error) {
+      writeFailedSse({
+        errorMessage: `Failed to parse Anthropic stream chunk: ${error instanceof Error ? error.message : String(error)}`,
+        model,
+        res: args.res,
+        responseId,
+        responseMetadata,
+      });
+      args.res.end();
+      streamFailed = true;
+      upstreamDone = true;
+      return true;
+    }
+    const type = stringValue(parsed.type) ?? event;
+    if (type === "error") {
+      writeFailedSse({
+        errorMessage: upstreamErrorMessage(parsed),
+        model,
+        res: args.res,
+        responseId,
+        responseMetadata,
+      });
+      args.res.end();
+      streamFailed = true;
+      upstreamDone = true;
+      return true;
+    }
+    if (type === "message_start") {
+      const usage = anthropicUsageToResponseUsage(recordValue(parsed.message)?.usage);
+      if (usage) {
+        streamUsage = usage;
+      }
+      return false;
+    }
+    if (type === "message_delta") {
+      const usage = anthropicUsageToResponseUsage(parsed.usage);
+      if (usage) {
+        streamUsage = {
+          input_tokens: streamUsage?.input_tokens ?? usage.input_tokens,
+          output_tokens: usage.output_tokens,
+          total_tokens: (streamUsage?.input_tokens ?? usage.input_tokens) + usage.output_tokens,
+        };
+      }
+      return false;
+    }
+    if (type === "content_block_start") {
+      const index = finiteNumber(parsed.index) ?? blocks.size;
+      const block = recordValue(parsed.content_block);
+      const blockType = stringValue(block?.type);
+      if (blockType === "text") {
+        const itemId = `msg_${randomUUID().replace(/-/g, "")}`;
+        blocks.set(index, {
+          id: itemId,
+          outputIndex: index,
+          type: "text",
+          text: "",
+          toolId: "",
+          toolName: "",
+          toolInputJson: "",
+          started: true,
+        });
+        writeSse(args.res, "response.output_item.added", {
+          type: "response.output_item.added",
+          output_index: index,
+          item: { id: itemId, type: "message", status: "in_progress", role: "assistant", content: [] },
+        });
+        writeSse(args.res, "response.content_part.added", {
+          type: "response.content_part.added",
+          item_id: itemId,
+          output_index: index,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+      } else if (blockType === "tool_use") {
+        const toolId = stringValue(block?.id) ?? `call_${randomUUID().replace(/-/g, "")}`;
+        const toolName = stringValue(block?.name) ?? "";
+        const responseName = responsesFunctionCallNameFromChatName(toolName);
+        const itemId = `fc_${toolId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+        blocks.set(index, {
+          id: itemId,
+          outputIndex: index,
+          type: "tool_use",
+          text: "",
+          toolId,
+          toolName,
+          toolInputJson: "",
+          started: true,
+        });
+        writeSse(args.res, "response.output_item.added", {
+          type: "response.output_item.added",
+          output_index: index,
+          item: {
+            id: itemId,
+            type: "function_call",
+            status: "in_progress",
+            call_id: toolId,
+            ...responseName,
+            arguments: "",
+          },
+        });
+      }
+      return false;
+    }
+    if (type === "content_block_delta") {
+      const index = finiteNumber(parsed.index) ?? 0;
+      const block = blocks.get(index);
+      const delta = recordValue(parsed.delta);
+      if (!block || !delta) {
+        return false;
+      }
+      const deltaType = stringValue(delta.type);
+      if (block.type === "text" && deltaType === "text_delta") {
+        const chunk = textValue(delta.text) ?? "";
+        if (!chunk) {
+          return false;
+        }
+        block.text += chunk;
+        writeSse(args.res, "response.output_text.delta", {
+          type: "response.output_text.delta",
+          item_id: block.id,
+          output_index: block.outputIndex,
+          content_index: 0,
+          delta: chunk,
+        });
+      } else if (block.type === "tool_use" && deltaType === "input_json_delta") {
+        const chunk = textValue(delta.partial_json) ?? "";
+        if (!chunk) {
+          return false;
+        }
+        block.toolInputJson += chunk;
+        writeSse(args.res, "response.function_call_arguments.delta", {
+          type: "response.function_call_arguments.delta",
+          item_id: block.id,
+          output_index: block.outputIndex,
+          delta: chunk,
+        });
+      }
+      blocks.set(index, block);
+      return false;
+    }
+    if (type === "content_block_stop") {
+      const index = finiteNumber(parsed.index) ?? 0;
+      const block = blocks.get(index);
+      if (!block) {
+        return false;
+      }
+      if (block.type === "text") {
+        writeSse(args.res, "response.output_text.done", {
+          type: "response.output_text.done",
+          item_id: block.id,
+          output_index: block.outputIndex,
+          content_index: 0,
+          text: block.text,
+        });
+        writeSse(args.res, "response.content_part.done", {
+          type: "response.content_part.done",
+          item_id: block.id,
+          output_index: block.outputIndex,
+          content_index: 0,
+          part: { type: "output_text", text: block.text, annotations: [] },
+        });
+        const item = {
+          id: block.id,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: block.text, annotations: [] }],
+        };
+        outputItems.push(item);
+        writeSse(args.res, "response.output_item.done", { type: "response.output_item.done", output_index: block.outputIndex, item });
+      } else {
+        const responseName = responsesFunctionCallNameFromChatName(block.toolName);
+        const item = {
+          id: block.id,
+          type: "function_call",
+          status: "completed",
+          call_id: block.toolId,
+          ...responseName,
+          arguments: block.toolInputJson || "{}",
+        };
+        outputItems.push(item);
+        writeSse(args.res, "response.function_call_arguments.done", {
+          type: "response.function_call_arguments.done",
+          item_id: block.id,
+          output_index: block.outputIndex,
+          arguments: block.toolInputJson || "{}",
+        });
+        writeSse(args.res, "response.output_item.done", { type: "response.output_item.done", output_index: block.outputIndex, item });
+      }
+      return false;
+    }
+    if (type === "message_stop") {
+      upstreamDone = true;
+      return true;
+    }
+    return false;
+  };
+
+  try {
+    while (!upstreamDone) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        if (trimmed.startsWith("event:")) {
+          currentEvent = trimmed.slice(6).trim();
+          continue;
+        }
+        if (!trimmed.startsWith("data:")) {
+          continue;
+        }
+        const data = trimmed.slice(5).trim();
+        if (processAnthropicEvent(currentEvent, data)) {
+          await reader.cancel().catch(() => undefined);
+          break;
+        }
+      }
+    }
+  } catch (error) {
+    if (args.signal.aborted) {
+      return;
+    }
+    writeFailedSse({
+      errorMessage: `Anthropic Messages stream failed: ${error instanceof Error ? error.message : String(error)}`,
+      model,
+      res: args.res,
+      responseId,
+      responseMetadata,
+    });
+    args.res.end();
+    return;
+  }
+  if (streamFailed) {
+    return;
+  }
+  writeSse(args.res, "response.completed", { type: "response.completed", response: responseBase(responseId, model, outputItems, responseMetadata, streamUsage) });
+  args.res.end();
+}
+
 function requestAbortSignal(req: IncomingMessage, res: ServerResponse): AbortSignal {
   const abortController = new AbortController();
   const abort = () => {
@@ -935,6 +1558,7 @@ function requestAbortSignal(req: IncomingMessage, res: ServerResponse): AbortSig
 }
 
 async function startResponsesBridge(args: {
+  adapter: ProviderAdapter;
   localApiKey: string;
   targetBaseUrl: string;
   upstreamApiKey: string;
@@ -942,7 +1566,7 @@ async function startResponsesBridge(args: {
 }): Promise<{ baseUrl: string; stop: () => Promise<void> }> {
   const targetBaseUrl = normalizeBaseUrl(args.targetBaseUrl);
   const expectedAuthorization = `Bearer ${args.localApiKey}`;
-  const upstreamAuthorization = `Bearer ${args.upstreamApiKey}`;
+  const upstreamHeaders = args.adapter.upstreamAuthHeaders(args.upstreamApiKey);
   const server = createServer(async (req, res) => {
     try {
       if (req.method !== "POST" || !req.url?.replace(/\?.*$/, "").endsWith("/responses")) {
@@ -958,10 +1582,30 @@ async function startResponsesBridge(args: {
       }
       const body = await readRequestJson(req);
       const signal = requestAbortSignal(req, res);
-      if (body.stream === true) {
-        await forwardStreaming({ body, res, signal, targetBaseUrl, upstreamAuthorization, onLog: args.onLog });
+      if (args.adapter.kind === "anthropic_messages") {
+        if (body.stream === true) {
+          await forwardAnthropicStreaming({ body, res, signal, targetBaseUrl, upstreamHeaders, onLog: args.onLog });
+        } else {
+          await forwardAnthropicNonStreaming({ body, res, signal, targetBaseUrl, upstreamHeaders, onLog: args.onLog });
+        }
+      } else if (body.stream === true) {
+        await forwardStreaming({
+          body,
+          res,
+          signal,
+          targetBaseUrl,
+          upstreamAuthorization: upstreamHeaders.authorization ?? "",
+          onLog: args.onLog,
+        });
       } else {
-        await forwardNonStreaming({ body, res, signal, targetBaseUrl, upstreamAuthorization, onLog: args.onLog });
+        await forwardNonStreaming({
+          body,
+          res,
+          signal,
+          targetBaseUrl,
+          upstreamAuthorization: upstreamHeaders.authorization ?? "",
+          onLog: args.onLog,
+        });
       }
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
@@ -1005,14 +1649,16 @@ export async function startCodexChatBridge(args: {
   }
 
   const targetBaseUrl = resolveTargetBaseUrl({ providerId: args.providerId, targetBaseUrl: args.targetBaseUrl });
+  const adapter = resolveProviderAdapter(args.providerId);
   const apiKey = `sk-doer-chat-bridge-${randomUUID().replace(/-/g, "")}`;
   const bridge = await startResponsesBridge({
+    adapter,
     localApiKey: apiKey,
     targetBaseUrl,
     upstreamApiKey: providerApiKey,
     onLog: args.onLog,
   });
-  args.onLog?.(`Codex chat bridge listening baseUrl=${bridge.baseUrl} target=${targetBaseUrl} provider=${providerName}`);
+  args.onLog?.(`Codex provider gateway listening baseUrl=${bridge.baseUrl} target=${targetBaseUrl} provider=${providerName} adapter=${adapter.kind}`);
 
   return {
     baseUrl: bridge.baseUrl,

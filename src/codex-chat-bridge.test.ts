@@ -16,7 +16,7 @@ type BridgeFixture = {
   close: () => Promise<void>;
 };
 
-async function startBridgeFixture(handler: UpstreamHandler): Promise<BridgeFixture> {
+async function startBridgeFixture(handler: UpstreamHandler, options?: { providerId?: string }): Promise<BridgeFixture> {
   const capturedBodies: Record<string, unknown>[] = [];
   const logs: string[] = [];
   const upstream = createServer(async (req, res) => {
@@ -34,7 +34,7 @@ async function startBridgeFixture(handler: UpstreamHandler): Promise<BridgeFixtu
   assert(address && typeof address !== "string");
   const bridge = await startCodexChatBridge({
     providerApiKey: "upstream-test-key",
-    providerId: "openai-compatible",
+    providerId: options?.providerId ?? "openai-compatible",
     providerName: "test upstream",
     targetBaseUrl: `http://127.0.0.1:${address.port}`,
     onLog: (message) => logs.push(message),
@@ -363,6 +363,145 @@ test("returns function_call output for non-streaming Chat tool calls", async () 
       arguments: "{}",
       status: "completed",
     }]);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("maps Responses create request fields to Anthropic Messages", async () => {
+  const fixture = await startBridgeFixture(({ req, res }) => {
+    assert.equal(req.url, "/messages");
+    assert.equal(req.headers["x-api-key"], "upstream-test-key");
+    assert.equal(req.headers["anthropic-version"], "2023-06-01");
+    writeChatJson(res, {
+      content: [
+        { type: "text", text: "claude mapped" },
+        { type: "tool_use", id: "toolu_123", name: "mcp__doer_daemon__daemon_list", input: { includeStopped: true } },
+      ],
+      usage: { input_tokens: 7, output_tokens: 3 },
+    });
+  }, { providerId: "anthropic" });
+  try {
+    const response = await responsesRequest({
+      bridge: fixture.bridge,
+      body: {
+        model: "claude-sonnet-4-6",
+        instructions: "system instruction",
+        input: [
+          { role: "developer", content: [{ type: "input_text", text: "developer note" }] },
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "look at this" },
+              { type: "input_image", image_url: "data:image/png;base64,AA==", detail: "high" },
+            ],
+          },
+          { type: "function_call", call_id: "call_123", name: "lookup", arguments: "{\"q\":\"doer\"}" },
+          { type: "function_call_output", call_id: "call_123", output: "tool result" },
+        ],
+        tools: [{
+          type: "namespace",
+          name: "doer_daemon",
+          tools: [{ name: "daemon_list", description: "List daemons", input_schema: { type: "object" } }],
+        }],
+        tool_choice: "required",
+        max_output_tokens: 64,
+      },
+    });
+    assert.equal(response.status, 200);
+    const anthropic = fixture.capturedBodies[0]!;
+    assert.equal(anthropic.model, "claude-sonnet-4-6");
+    assert.equal(anthropic.stream, false);
+    assert.equal(anthropic.max_tokens, 64);
+    assert.equal(anthropic.system, "system instruction\n\ndeveloper note");
+    assert.deepEqual(anthropic.tool_choice, { type: "any" });
+    assert.deepEqual(anthropic.tools, [{
+      name: "mcp__doer_daemon__daemon_list",
+      description: "Namespace: mcp__doer_daemon__. Original tool: daemon_list. List daemons",
+      input_schema: { type: "object" },
+    }]);
+    assert.deepEqual(anthropic.messages, [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "look at this" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } },
+        ],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_123", name: "lookup", input: { q: "doer" } }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "call_123", content: "tool result" }],
+      },
+    ]);
+    const body = await response.json() as Record<string, unknown>;
+    assert.deepEqual(body.usage, { input_tokens: 7, output_tokens: 3, total_tokens: 10 });
+    const output = body.output as Array<Record<string, unknown>>;
+    assert.equal(output[0]?.type, "message");
+    assert.deepEqual(output[1], {
+      type: "function_call",
+      id: "toolu_123",
+      call_id: "toolu_123",
+      namespace: "mcp__doer_daemon",
+      name: "daemon_list",
+      arguments: "{\"includeStopped\":true}",
+      status: "completed",
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("streams Anthropic Messages text and tool_use as Responses events", async () => {
+  const fixture = await startBridgeFixture(({ res }) => {
+    writeChatSse(res, [
+      { type: "message_start", message: { usage: { input_tokens: 5, output_tokens: 0 } } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "toolu_abc", name: "lookup", input: {} } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: "{\"q\"" } },
+      { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: ":\"doer\"}" } },
+      { type: "content_block_stop", index: 1 },
+      { type: "message_delta", usage: { output_tokens: 4 } },
+      { type: "message_stop" },
+    ]);
+  }, { providerId: "anthropic" });
+  try {
+    const response = await responsesRequest({
+      bridge: fixture.bridge,
+      body: { model: "claude-sonnet-4-6", stream: true, input: "hello" },
+    });
+    const events = parseSse(await response.text());
+    assert.equal(response.status, 200);
+    assert.equal(fixture.capturedBodies[0]?.stream, true);
+    assert.equal(events.find((event) => event.event === "response.output_text.delta")?.data.delta, "hello");
+    assert.deepEqual(
+      events.filter((event) => event.event === "response.function_call_arguments.delta").map((event) => event.data.delta),
+      ["{\"q\"", ":\"doer\"}"],
+    );
+    const completed = events.at(-1)?.data.response as Record<string, unknown>;
+    assert.deepEqual(completed.usage, { input_tokens: 5, output_tokens: 4, total_tokens: 9 });
+    assert.deepEqual(completed.output, [
+      {
+        id: (completed.output as Array<Record<string, unknown>>)[0]?.id,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "hello", annotations: [] }],
+      },
+      {
+        id: "fc_toolu_abc",
+        type: "function_call",
+        status: "completed",
+        call_id: "toolu_abc",
+        name: "lookup",
+        arguments: "{\"q\":\"doer\"}",
+      },
+    ]);
   } finally {
     await fixture.close();
   }

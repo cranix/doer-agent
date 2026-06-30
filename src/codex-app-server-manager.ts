@@ -25,11 +25,21 @@ function resolveCodexModel(settings: AgentSettingsConfig): string {
   if (providerKey === "zai") {
     return settings.codex.providerModels.zai || "glm-5.2";
   }
+  if (providerKey === "anthropic") {
+    return settings.codex.providerModels.anthropic || "claude-sonnet-4-6";
+  }
   return settings.codex.providerModels[providerKey] || settings.codex.providerModels.openai || "gpt-5.5";
 }
 
 function resolveCodexModelContextWindow(settings: AgentSettingsConfig): number | null {
-  return settings.codex.modelProvider === "zai" ? 258400 : null;
+  if (settings.codex.modelProvider === "zai") {
+    return 258400;
+  }
+  if (settings.codex.modelProvider === "anthropic") {
+    const model = resolveCodexModel(settings);
+    return model.startsWith("claude-haiku-") ? 200000 : 1000000;
+  }
+  return null;
 }
 
 function buildModelProviderConfigArgs(settings: AgentSettingsConfig): string[] {
@@ -120,7 +130,9 @@ async function resolveAppServerSettings(args: {
   onLog?: (message: string) => void;
 }): Promise<{ settings: AgentSettingsConfig; proxy: ProviderProxy | null }> {
   const provider = args.settings.codex.customProvider;
-  if (args.settings.codex.modelProvider !== "zai" || provider?.id !== "zai") {
+  const providerId = args.settings.codex.modelProvider;
+  const gatewayProviderIds = new Set(["zai", "anthropic"]);
+  if (!providerId || provider?.id !== providerId || !gatewayProviderIds.has(providerId)) {
     return { settings: args.settings, proxy: null };
   }
   const proxy = await startCodexChatBridge({

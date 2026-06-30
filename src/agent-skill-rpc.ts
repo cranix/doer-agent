@@ -90,6 +90,9 @@ function resolveCodexModel(settings: AgentSettingsConfig): string {
   if (providerKey === "zai") {
     return settings.codex.providerModels.zai || "glm-5.2";
   }
+  if (providerKey === "anthropic") {
+    return settings.codex.providerModels.anthropic || "claude-sonnet-4-6";
+  }
   return settings.codex.providerModels[providerKey] || settings.codex.providerModels.openai || "gpt-5.5";
 }
 
