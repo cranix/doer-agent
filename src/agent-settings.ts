@@ -10,9 +10,14 @@ export interface AgentEnvironmentVariableConfig {
 
 export interface AgentMcpServerConfig {
   name: string;
+  transport: "stdio" | "streamable_http";
   command: string;
   args: string[];
   env: AgentEnvironmentVariableConfig[];
+  url: string;
+  bearerTokenEnvVar: string;
+  httpHeaders: AgentEnvironmentVariableConfig[];
+  envHttpHeaders: AgentEnvironmentVariableConfig[];
   enabled: boolean;
 }
 
@@ -309,7 +314,7 @@ function normalizeMcpServerName(value: unknown): string | null {
   if (!trimmed || !/^[A-Za-z0-9_-]+$/.test(trimmed)) {
     return null;
   }
-  if (trimmed === "doer_daemon" || trimmed === "doer_mobile") {
+  if (trimmed === "doer_daemon" || trimmed === "doer_mobile" || trimmed === "doer_threads") {
     return null;
   }
   return trimmed;
@@ -324,14 +329,39 @@ function normalizeStringArray(value: unknown): string[] {
     .filter((item): item is string => item !== null && item.trim().length > 0);
 }
 
+function normalizeMcpHeaderEntries(value: unknown): AgentEnvironmentVariableConfig[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const entries: AgentEnvironmentVariableConfig[] = [];
+  const seenKeys = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const raw = item as Record<string, unknown>;
+    const key = typeof raw.key === "string" ? raw.key.trim() : "";
+    if (!key || typeof raw.value !== "string" || seenKeys.has(key)) {
+      continue;
+    }
+    seenKeys.add(key);
+    entries.push({ key, value: raw.value.replace(/\r/g, "") });
+  }
+  return entries;
+}
+
 function normalizeAgentMcpServer(value: unknown): AgentMcpServerConfig | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
   const raw = value as Record<string, unknown>;
   const name = normalizeMcpServerName(raw.name);
+  const transport = raw.transport === "streamable_http" || (typeof raw.url === "string" && raw.url.trim())
+    ? "streamable_http"
+    : "stdio";
   const command = typeof raw.command === "string" ? raw.command.trim() : "";
-  if (!name || !command) {
+  const url = typeof raw.url === "string" ? raw.url.trim() : "";
+  if (!name || (transport === "stdio" ? !command : !url)) {
     return null;
   }
   const env: AgentEnvironmentVariableConfig[] = [];
@@ -347,9 +377,14 @@ function normalizeAgentMcpServer(value: unknown): AgentMcpServerConfig | null {
   }
   return {
     name,
+    transport,
     command,
     args: normalizeStringArray(raw.args),
     env,
+    url,
+    bearerTokenEnvVar: typeof raw.bearerTokenEnvVar === "string" ? raw.bearerTokenEnvVar.trim() : "",
+    httpHeaders: normalizeMcpHeaderEntries(raw.httpHeaders),
+    envHttpHeaders: normalizeMcpHeaderEntries(raw.envHttpHeaders),
     enabled: raw.enabled !== false,
   };
 }
@@ -554,12 +589,17 @@ export async function toAgentSettingsPublic(args: {
     mcp: {
       servers: args.config.mcp.servers.map((server) => ({
         name: server.name,
+        transport: server.transport,
         command: server.command,
         args: [...server.args],
         env: server.env.map((variable) => ({
           key: variable.key,
           value: variable.value,
         })),
+        url: server.url,
+        bearerTokenEnvVar: server.bearerTokenEnvVar,
+        httpHeaders: server.httpHeaders.map((header) => ({ ...header })),
+        envHttpHeaders: server.envHttpHeaders.map((header) => ({ ...header })),
         enabled: server.enabled,
       })),
     },

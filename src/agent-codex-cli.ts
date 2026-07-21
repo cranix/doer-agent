@@ -28,6 +28,12 @@ function toTomlStringArray(values: string[]): string {
   return `[${values.map((value) => toTomlStringLiteral(value)).join(", ")}]`;
 }
 
+function toTomlStringMap(values: Record<string, string>): string {
+  return `{ ${Object.entries(values)
+    .map(([key, value]) => `${toTomlStringLiteral(key)} = ${toTomlStringLiteral(value)}`)
+    .join(", ")} }`;
+}
+
 function buildMcpServerConfigArgs(args: {
   serverName: string;
   command: string;
@@ -46,6 +52,33 @@ function buildMcpServerConfigArgs(args: {
   ];
   for (const [key, value] of Object.entries(args.env ?? {})) {
     configArgs.push("--config", `mcp_servers.${serverName}.env.${key}=${toTomlStringLiteral(value)}`);
+  }
+  return configArgs;
+}
+
+function buildRemoteMcpServerConfigArgs(args: {
+  serverName: string;
+  url: string;
+  bearerTokenEnvVar?: string;
+  httpHeaders?: Record<string, string>;
+  envHttpHeaders?: Record<string, string>;
+  enabled?: boolean;
+}): string[] {
+  const prefix = `mcp_servers.${args.serverName.trim()}`;
+  const configArgs = [
+    "--config",
+    `${prefix}.url=${toTomlStringLiteral(args.url)}`,
+    "--config",
+    `${prefix}.enabled=${args.enabled === false ? "false" : "true"}`,
+  ];
+  if (args.bearerTokenEnvVar?.trim()) {
+    configArgs.push("--config", `${prefix}.bearer_token_env_var=${toTomlStringLiteral(args.bearerTokenEnvVar.trim())}`);
+  }
+  if (Object.keys(args.httpHeaders ?? {}).length > 0) {
+    configArgs.push("--config", `${prefix}.http_headers=${toTomlStringMap(args.httpHeaders ?? {})}`);
+  }
+  if (Object.keys(args.envHttpHeaders ?? {}).length > 0) {
+    configArgs.push("--config", `${prefix}.env_http_headers=${toTomlStringMap(args.envHttpHeaders ?? {})}`);
   }
   return configArgs;
 }
@@ -181,10 +214,24 @@ export function buildCustomMcpConfigArgs(servers: AgentMcpServerConfig[]): strin
   const seenNames = new Set<string>();
   for (const server of servers) {
     const serverName = server.name.trim();
-    if (!server.enabled || !serverName || !server.command.trim() || reservedNames.has(serverName) || seenNames.has(serverName)) {
+    const hasEndpoint = server.transport === "streamable_http" ? server.url.trim() : server.command.trim();
+    if (!server.enabled || !serverName || !hasEndpoint || reservedNames.has(serverName) || seenNames.has(serverName)) {
       continue;
     }
     seenNames.add(serverName);
+    if (server.transport === "streamable_http") {
+      configArgs.push(
+        ...buildRemoteMcpServerConfigArgs({
+          serverName,
+          url: server.url,
+          bearerTokenEnvVar: server.bearerTokenEnvVar,
+          httpHeaders: Object.fromEntries(server.httpHeaders.map((header) => [header.key, header.value])),
+          envHttpHeaders: Object.fromEntries(server.envHttpHeaders.map((header) => [header.key, header.value])),
+          enabled: true,
+        }),
+      );
+      continue;
+    }
     configArgs.push(
       ...buildMcpServerConfigArgs({
         serverName,
