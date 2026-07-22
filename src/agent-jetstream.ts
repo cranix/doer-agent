@@ -5,10 +5,32 @@ import {
   JSONCodec,
   RetentionPolicy,
   StorageType,
+  type ConnectionOptions,
   type JetStreamClient,
   type JetStreamManager,
   type NatsConnection,
 } from "nats";
+
+const NATS_PING_INTERVAL_MS = 2_000;
+const NATS_MAX_PING_OUT = 2;
+const NATS_RECONNECT_TIME_WAIT_MS = 1_000;
+const NATS_RECONNECT_JITTER_MS = 250;
+
+export function buildNatsConnectionOptions(args: {
+  servers: string[];
+  token: string | null;
+}): ConnectionOptions {
+  return {
+    servers: args.servers,
+    ...(args.token ? { token: args.token } : {}),
+    pingInterval: NATS_PING_INTERVAL_MS,
+    maxPingOut: NATS_MAX_PING_OUT,
+    maxReconnectAttempts: -1,
+    reconnectTimeWait: NATS_RECONNECT_TIME_WAIT_MS,
+    reconnectJitter: NATS_RECONNECT_JITTER_MS,
+    reconnectJitterTLS: NATS_RECONNECT_JITTER_MS,
+  };
+}
 
 export interface AgentJetStreamContext {
   nc: NatsConnection;
@@ -93,7 +115,7 @@ async function initJetStreamContext(args: {
   const subject = `doer.agent.events.${sanitized}`;
   const durable = `doer-agent-uploader-${sanitized}`;
 
-  const nc = await connect(args.token ? { servers: args.servers, token: args.token } : { servers: args.servers });
+  const nc = await connect(buildNatsConnectionOptions({ servers: args.servers, token: args.token }));
   const jsm = await nc.jetstreamManager();
   await ensureJetStreamInfra({ jsm, stream, subject, durable });
 

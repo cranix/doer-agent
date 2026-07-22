@@ -2,12 +2,25 @@ import type { NatsConnection } from "nats";
 
 export type AgentEventType = "stdout" | "stderr" | "status" | "meta";
 
-export async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+export interface JsonRequestOptions {
+  timeoutMs?: number;
+}
+
+export async function postJson<T>(url: string, body: unknown, options: JsonRequestOptions = {}): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      ...(options.timeoutMs ? { signal: AbortSignal.timeout(options.timeoutMs) } : {}),
+    });
+  } catch (error) {
+    if (options.timeoutMs && error instanceof Error && error.name === "TimeoutError") {
+      throw new Error(`request timed out after ${options.timeoutMs}ms`);
+    }
+    throw error;
+  }
   const text = await res.text();
   let data: unknown = {};
   if (text) {
@@ -177,11 +190,27 @@ export async function heartbeatAgentSession(args: {
   serverBaseUrl: string;
   userId: string;
   agentToken: string;
-  postJson: <T>(url: string, body: unknown) => Promise<T>;
+  timeoutMs: number;
+  postJson: <T>(url: string, body: unknown, options?: JsonRequestOptions) => Promise<T>;
 }): Promise<void> {
-  await args.nc.flush();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      args.nc.flush(),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`nats flush timed out after ${args.timeoutMs}ms`)),
+          args.timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
   await args.postJson<{ ok?: boolean }>(`${args.serverBaseUrl}/api/agent/heartbeat`, {
     userId: args.userId,
     agentToken: args.agentToken,
-  });
+  }, { timeoutMs: args.timeoutMs });
 }

@@ -65,7 +65,8 @@ const AGENT_PROJECT_DIR = path.join(AGENT_MODULE_DIR, "..");
 const AGENT_PACKAGE_JSON_PATH = path.join(AGENT_PROJECT_DIR, "package.json");
 const BUNDLED_SKILLS_ROOT = path.join(AGENT_PROJECT_DIR, "runtime", "skills");
 const HEARTBEAT_INTERVAL_MS = 5_000;
-const HEARTBEAT_FAILURE_THRESHOLD = 3;
+const HEARTBEAT_FAILURE_THRESHOLD = 2;
+const HEARTBEAT_REQUEST_TIMEOUT_MS = 3_000;
 const codexAppEventCodec = StringCodec();
 
 interface AgentEventEnvelope {
@@ -288,6 +289,7 @@ const heartbeatSession = async (args: {
 }): Promise<void> => {
   await heartbeatAgentSession({
     ...args,
+    timeoutMs: HEARTBEAT_REQUEST_TIMEOUT_MS,
     postJson,
   });
 };
