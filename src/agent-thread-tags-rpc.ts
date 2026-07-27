@@ -183,13 +183,14 @@ function configFingerprint(tags: ThreadAiTagDefinition[]): string {
   })))).digest("hex");
 }
 
-function publicConfig(config: ResolvedThreadAiTagConfig) {
+function publicConfig(config: ResolvedThreadAiTagConfig, workspaceRoot: string) {
   return {
     version: config.version,
     tags: config.tags,
     updatedAt: config.updatedAt,
     source: config.source,
     fingerprint: config.fingerprint,
+    workspaceRoot: path.resolve(workspaceRoot),
   };
 }
 
@@ -448,7 +449,7 @@ async function classifyThreads(args: {
   return {
     classifications: [...classifications.values()],
     classificationError,
-    config: publicConfig(config),
+    config: publicConfig(config, args.workspaceRoot),
   };
 }
 
@@ -494,9 +495,9 @@ async function handleThreadTagsRpcMessage(args: {
     const action = stringValue(request.action);
     let result: Record<string, unknown>;
     if (action === "get-config") {
-      result = { config: publicConfig(await readConfig(args.workspaceRoot)) };
+      result = { config: publicConfig(await readConfig(args.workspaceRoot), args.workspaceRoot) };
     } else if (action === "save-config") {
-      result = { config: publicConfig(await writeConfig(args.workspaceRoot, request.tags)) };
+      result = { config: publicConfig(await writeConfig(args.workspaceRoot, request.tags), args.workspaceRoot) };
     } else if (action === "suggest-config") {
       result = {
         suggestedTags: await suggestConfig({
