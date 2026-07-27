@@ -10,7 +10,10 @@ test("buildCustomMcpConfigArgs builds streamable HTTP MCP overrides", () => {
     args: [],
     env: [],
     url: "https://example.com/mcp",
+    auth: "oauth",
     bearerTokenEnvVar: "MCP_TOKEN",
+    scopes: ["read:docs"],
+    oauthResource: "https://example.com/",
     httpHeaders: [{ key: "X-Region", value: "seoul" }],
     envHttpHeaders: [{ key: "X-API-Key", value: "MCP_API_KEY" }],
     enabled: true,
@@ -19,9 +22,12 @@ test("buildCustomMcpConfigArgs builds streamable HTTP MCP overrides", () => {
   assert.deepEqual(args, [
     "--config", 'mcp_servers.remote_docs.url="https://example.com/mcp"',
     "--config", "mcp_servers.remote_docs.enabled=true",
+    "--config", 'mcp_servers.remote_docs.auth="oauth"',
     "--config", 'mcp_servers.remote_docs.bearer_token_env_var="MCP_TOKEN"',
     "--config", 'mcp_servers.remote_docs.http_headers={ "X-Region" = "seoul" }',
     "--config", 'mcp_servers.remote_docs.env_http_headers={ "X-API-Key" = "MCP_API_KEY" }',
+    "--config", 'mcp_servers.remote_docs.scopes=["read:docs"]',
+    "--config", 'mcp_servers.remote_docs.oauth_resource="https://example.com/"',
   ]);
 });
 
@@ -33,7 +39,10 @@ test("buildCustomMcpConfigArgs keeps stdio MCP overrides", () => {
     args: ["-y", "local-mcp"],
     env: [{ key: "LOCAL_TOKEN", value: "secret" }],
     url: "",
+    auth: "oauth",
     bearerTokenEnvVar: "",
+    scopes: [],
+    oauthResource: "",
     httpHeaders: [],
     envHttpHeaders: [],
     enabled: true,

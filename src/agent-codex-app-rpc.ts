@@ -9,6 +9,9 @@ interface AgentCodexAppRpcRequest {
   agentId?: unknown;
   method?: unknown;
   params?: unknown;
+  path?: unknown;
+  search?: unknown;
+  name?: unknown;
   timeoutMs?: unknown;
 }
 
@@ -100,6 +103,15 @@ function normalizeCodexAppRpcRequest(args: {
   method: string;
   params: unknown;
   timeoutMs?: number;
+} | {
+  requestId: string;
+  action: "mcp-oauth-callback";
+  path: string;
+  search: string;
+} | {
+  requestId: string;
+  action: "mcp-oauth-logout";
+  name: string;
 } {
   const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
   const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
@@ -108,7 +120,25 @@ function normalizeCodexAppRpcRequest(args: {
   const timeoutMs = typeof args.request.timeoutMs === "number" && Number.isFinite(args.request.timeoutMs)
     ? Math.min(180_000, Math.max(1_000, Math.trunc(args.request.timeoutMs)))
     : undefined;
-  if (!requestId || !requestAgentId || requestAgentId !== args.agentId || actionRaw !== "request" || !method) {
+  if (!requestId || !requestAgentId || requestAgentId !== args.agentId) {
+    throw new Error("invalid codex app rpc request");
+  }
+  if (actionRaw === "mcp-oauth-callback") {
+    const path = typeof args.request.path === "string" ? args.request.path.trim() : "";
+    const search = typeof args.request.search === "string" ? args.request.search.trim() : "";
+    if (!path.startsWith("/") || search.length > 16_384) {
+      throw new Error("invalid MCP OAuth callback request");
+    }
+    return { requestId, action: "mcp-oauth-callback", path, search };
+  }
+  if (actionRaw === "mcp-oauth-logout") {
+    const name = typeof args.request.name === "string" ? args.request.name.trim() : "";
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      throw new Error("invalid MCP OAuth logout request");
+    }
+    return { requestId, action: "mcp-oauth-logout", name };
+  }
+  if (actionRaw !== "request" || !method) {
     throw new Error("invalid codex app rpc request");
   }
   return {
@@ -134,10 +164,14 @@ async function handleCodexAppRpcMessage(args: {
     const request = normalizeCodexAppRpcRequest({ request: payload, agentId: args.agentId });
     requestId = request.requestId;
 
-    const result = applyCodexAppRpcOmitRules(
-      request.method,
-      await args.manager.request(request.method, request.params, request.timeoutMs),
-    );
+    const result = request.action === "request"
+      ? applyCodexAppRpcOmitRules(
+        request.method,
+        await args.manager.request(request.method, request.params, request.timeoutMs),
+      )
+      : request.action === "mcp-oauth-callback"
+        ? await args.manager.relayMcpOauthCallback(request.path, request.search)
+        : await args.manager.logoutMcpServer(request.name);
     args.msg.respond(codexAppRpcCodec.encode(JSON.stringify({
       requestId,
       ok: true,

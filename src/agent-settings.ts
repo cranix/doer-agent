@@ -15,7 +15,10 @@ export interface AgentMcpServerConfig {
   args: string[];
   env: AgentEnvironmentVariableConfig[];
   url: string;
+  auth: "oauth" | "chatgpt";
   bearerTokenEnvVar: string;
+  scopes: string[];
+  oauthResource: string;
   httpHeaders: AgentEnvironmentVariableConfig[];
   envHttpHeaders: AgentEnvironmentVariableConfig[];
   enabled: boolean;
@@ -382,7 +385,10 @@ function normalizeAgentMcpServer(value: unknown): AgentMcpServerConfig | null {
     args: normalizeStringArray(raw.args),
     env,
     url,
+    auth: raw.auth === "chatgpt" ? "chatgpt" : "oauth",
     bearerTokenEnvVar: typeof raw.bearerTokenEnvVar === "string" ? raw.bearerTokenEnvVar.trim() : "",
+    scopes: normalizeStringArray(raw.scopes),
+    oauthResource: typeof raw.oauthResource === "string" ? raw.oauthResource.trim() : "",
     httpHeaders: normalizeMcpHeaderEntries(raw.httpHeaders),
     envHttpHeaders: normalizeMcpHeaderEntries(raw.envHttpHeaders),
     enabled: raw.enabled !== false,
@@ -597,7 +603,10 @@ export async function toAgentSettingsPublic(args: {
           value: variable.value,
         })),
         url: server.url,
+        auth: server.auth,
         bearerTokenEnvVar: server.bearerTokenEnvVar,
+        scopes: [...server.scopes],
+        oauthResource: server.oauthResource,
         httpHeaders: server.httpHeaders.map((header) => ({ ...header })),
         envHttpHeaders: server.envHttpHeaders.map((header) => ({ ...header })),
         enabled: server.enabled,

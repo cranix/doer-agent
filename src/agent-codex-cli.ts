@@ -59,7 +59,10 @@ function buildMcpServerConfigArgs(args: {
 function buildRemoteMcpServerConfigArgs(args: {
   serverName: string;
   url: string;
+  auth?: "oauth" | "chatgpt";
   bearerTokenEnvVar?: string;
+  scopes?: string[];
+  oauthResource?: string;
   httpHeaders?: Record<string, string>;
   envHttpHeaders?: Record<string, string>;
   enabled?: boolean;
@@ -71,6 +74,9 @@ function buildRemoteMcpServerConfigArgs(args: {
     "--config",
     `${prefix}.enabled=${args.enabled === false ? "false" : "true"}`,
   ];
+  if (args.auth) {
+    configArgs.push("--config", `${prefix}.auth=${toTomlStringLiteral(args.auth)}`);
+  }
   if (args.bearerTokenEnvVar?.trim()) {
     configArgs.push("--config", `${prefix}.bearer_token_env_var=${toTomlStringLiteral(args.bearerTokenEnvVar.trim())}`);
   }
@@ -79,6 +85,12 @@ function buildRemoteMcpServerConfigArgs(args: {
   }
   if (Object.keys(args.envHttpHeaders ?? {}).length > 0) {
     configArgs.push("--config", `${prefix}.env_http_headers=${toTomlStringMap(args.envHttpHeaders ?? {})}`);
+  }
+  if ((args.scopes ?? []).length > 0) {
+    configArgs.push("--config", `${prefix}.scopes=${toTomlStringArray(args.scopes ?? [])}`);
+  }
+  if (args.oauthResource?.trim()) {
+    configArgs.push("--config", `${prefix}.oauth_resource=${toTomlStringLiteral(args.oauthResource.trim())}`);
   }
   return configArgs;
 }
@@ -224,7 +236,10 @@ export function buildCustomMcpConfigArgs(servers: AgentMcpServerConfig[]): strin
         ...buildRemoteMcpServerConfigArgs({
           serverName,
           url: server.url,
+          auth: server.auth,
           bearerTokenEnvVar: server.bearerTokenEnvVar,
+          scopes: server.scopes,
+          oauthResource: server.oauthResource,
           httpHeaders: Object.fromEntries(server.httpHeaders.map((header) => [header.key, header.value])),
           envHttpHeaders: Object.fromEntries(server.envHttpHeaders.map((header) => [header.key, header.value])),
           enabled: true,
