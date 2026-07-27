@@ -10,6 +10,7 @@ import { handleFsRpcMessage } from "./agent-fs-rpc.js";
 import { handleGitRpcMessage } from "./agent-git-rpc.js";
 import { handleNotesRpcMessage } from "./agent-notes-rpc.js";
 import { subscribeToNotesAiRpc } from "./agent-notes-ai-rpc.js";
+import { subscribeToThreadTagsRpc } from "./agent-thread-tags-rpc.js";
 import { ensureBundledDoerSkills } from "./agent-bundled-skills.js";
 import { subscribeToCodexAppRpc } from "./agent-codex-app-rpc.js";
 import { createCodexAppServerManager, type CodexAppServerManager } from "./codex-app-server-manager.js";
@@ -31,6 +32,7 @@ import {
   buildAgentMaintenanceRpcSubject,
   buildAgentNotesRpcSubject,
   buildAgentNotesAiRpcSubject,
+  buildAgentThreadTagsRpcSubject,
   buildAgentSettingsRpcSubject,
   buildAgentSkillRpcSubject,
   formatLocalTimestamp,
@@ -420,6 +422,15 @@ async function main() {
           userId,
           agentId: initialAgentId,
           codexAppServerManager,
+        });
+        subscribeToThreadTagsRpc({
+          nc: jetstream.nc,
+          subject: buildAgentThreadTagsRpcSubject(userId, initialAgentId),
+          agentId: initialAgentId,
+          workspaceRoot: resolveWorkspaceRoot(),
+          manager: codexAppServerManager,
+          onInfo: writeAgentInfo,
+          onError: writeAgentError,
         });
         subscribeToDaemonRpc({
           nc: jetstream.nc,
