@@ -21,13 +21,30 @@ type PendingRequest = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type RequestId = string | number;
+
+export class CodexAppServerRequestError extends Error {
+  constructor(
+    message: string,
+    readonly code = -32603,
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = "CodexAppServerRequestError";
+  }
+}
+
 export interface CodexAppServerClientOptions {
   cwd: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  executable?: string;
+  executableArgs?: string[];
+  gracefulShutdownTimeoutMs?: number;
   requestTimeoutMs?: number;
   onLog?: (message: string) => void;
   onNotification?: (method: string, params: unknown) => void;
+  onServerRequest?: (method: string, params: unknown) => Promise<unknown>;
 }
 
 export class CodexAppServerClient {
@@ -37,10 +54,15 @@ export class CodexAppServerClient {
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly activeTurns = new Map<string, string>();
+  private readonly activeTurnsChanged = new Set<() => void>();
 
   constructor(private readonly options: CodexAppServerClientOptions) {}
 
   async request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
+    if (this.stopPromise) {
+      throw new Error("Codex app-server is stopping");
+    }
     await this.start();
     return await this.requestStarted(method, params, timeoutMs);
   }
@@ -87,7 +109,9 @@ export class CodexAppServerClient {
   }
 
   private async startInner(): Promise<void> {
-    this.child = spawn(process.execPath, [resolveCodexCliBinPath(), ...this.options.args], {
+    const executable = this.options.executable ?? process.execPath;
+    const executableArgs = this.options.executableArgs ?? [resolveCodexCliBinPath()];
+    this.child = spawn(executable, [...executableArgs, ...this.options.args], {
       cwd: this.options.cwd,
       detached: process.platform !== "win32",
       env: this.options.env,
@@ -111,6 +135,8 @@ export class CodexAppServerClient {
       removeExitHooks();
       this.signalProcessGroup(childPid, "SIGTERM");
       this.rejectPending(new Error("Codex app-server exited"));
+      this.activeTurns.clear();
+      this.notifyActiveTurnsChanged();
       this.stdoutLines?.close();
       this.stdoutLines = null;
       this.child = null;
@@ -167,6 +193,15 @@ export class CodexAppServerClient {
       return;
     }
     const record = message as Record<string, unknown>;
+    if (typeof record.method === "string") {
+      if (this.isRequestId(record.id)) {
+        void this.handleServerRequest(record.id, record.method, record.params);
+      } else {
+        this.trackTurnNotification(record.method, record.params);
+        this.options.onNotification?.(record.method, record.params);
+      }
+      return;
+    }
     if (record.id !== undefined) {
       const id = Number(record.id);
       const pending = Number.isInteger(id) ? this.pending.get(id) : null;
@@ -183,8 +218,74 @@ export class CodexAppServerClient {
       }
       return;
     }
-    if (typeof record.method === "string") {
-      this.options.onNotification?.(record.method, record.params);
+  }
+
+  private isRequestId(value: unknown): value is RequestId {
+    return (typeof value === "string" && value.length > 0)
+      || (typeof value === "number" && Number.isFinite(value));
+  }
+
+  private async handleServerRequest(id: RequestId, method: string, params: unknown): Promise<void> {
+    try {
+      if (!this.options.onServerRequest) {
+        throw new CodexAppServerRequestError(`Unsupported Codex app-server request: ${method}`, -32601);
+      }
+      const result = await this.options.onServerRequest(method, params);
+      this.writeMessage({ id, result });
+    } catch (error) {
+      const requestError = error instanceof CodexAppServerRequestError
+        ? error
+        : new CodexAppServerRequestError(error instanceof Error ? error.message : String(error));
+      this.options.onLog?.(`[codex-app-server] server request failed method=${method} error=${requestError.message}`);
+      this.writeMessage({
+        id,
+        error: {
+          code: requestError.code,
+          message: requestError.message,
+          ...(requestError.data === undefined ? {} : { data: requestError.data }),
+        },
+      });
+    }
+  }
+
+  private writeMessage(message: unknown): void {
+    const child = this.child;
+    if (!child || child.killed || child.stdin.destroyed) {
+      return;
+    }
+    child.stdin.write(`${JSON.stringify(message)}\n`, "utf8");
+  }
+
+  private trackTurnNotification(method: string, params: unknown): void {
+    if (method !== "turn/started" && method !== "turn/completed" && method !== "turn/interrupted") {
+      return;
+    }
+    const record = params && typeof params === "object" && !Array.isArray(params)
+      ? params as Record<string, unknown>
+      : null;
+    const turn = record?.turn && typeof record.turn === "object" && !Array.isArray(record.turn)
+      ? record.turn as Record<string, unknown>
+      : null;
+    const threadId = typeof record?.threadId === "string" ? record.threadId : "";
+    const turnId = typeof turn?.id === "string"
+      ? turn.id
+      : typeof record?.turnId === "string"
+        ? record.turnId
+        : "";
+    if (!threadId || !turnId) {
+      return;
+    }
+    if (method === "turn/started") {
+      this.activeTurns.set(threadId, turnId);
+    } else if (this.activeTurns.get(threadId) === turnId) {
+      this.activeTurns.delete(threadId);
+    }
+    this.notifyActiveTurnsChanged();
+  }
+
+  private notifyActiveTurnsChanged(): void {
+    for (const listener of this.activeTurnsChanged) {
+      listener();
     }
   }
 
@@ -197,6 +298,7 @@ export class CodexAppServerClient {
   }
 
   private async stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+    await this.interruptActiveTurns();
     const pid = child.pid;
     if (!pid) {
       child.kill("SIGTERM");
@@ -212,6 +314,49 @@ export class CodexAppServerClient {
     } else {
       this.signalProcessGroup(pid, "SIGTERM");
     }
+  }
+
+  private async interruptActiveTurns(): Promise<void> {
+    const turns = [...this.activeTurns.entries()].map(([threadId, turnId]) => ({ threadId, turnId }));
+    if (turns.length === 0) {
+      return;
+    }
+    this.options.onLog?.(`[codex-app-server] interrupting ${turns.length} active turn(s) before shutdown`);
+    await Promise.allSettled(turns.map(({ threadId, turnId }) =>
+      this.requestStarted("turn/interrupt", { threadId, turnId }, 5_000)
+    ));
+    const timeoutMs = this.options.gracefulShutdownTimeoutMs ?? 10_000;
+    const drained = await this.waitForTurnsToFinish(turns, timeoutMs);
+    if (!drained) {
+      this.options.onLog?.(`[codex-app-server] timed out waiting for active turns to finish before shutdown`);
+    }
+  }
+
+  private async waitForTurnsToFinish(
+    turns: Array<{ threadId: string; turnId: string }>,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    const isFinished = () => turns.every(({ threadId, turnId }) => this.activeTurns.get(threadId) !== turnId);
+    if (isFinished()) {
+      return true;
+    }
+    return await new Promise<boolean>((resolve) => {
+      const onChanged = () => {
+        if (isFinished()) {
+          cleanup();
+          resolve(true);
+        }
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(false);
+      }, timeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.activeTurnsChanged.delete(onChanged);
+      };
+      this.activeTurnsChanged.add(onChanged);
+    });
   }
 
   private registerProcessExitHooks(pid: number | undefined): () => void {
@@ -236,13 +381,14 @@ export class CodexAppServerClient {
     process.once("exit", cleanup);
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as NodeJS.Signals[]) {
       const handler = () => {
-        cleanup();
-        remove();
-        try {
-          process.kill(process.pid, signal);
-        } catch {
-          process.exitCode = 1;
-        }
+        void this.stop().finally(() => {
+          remove();
+          try {
+            process.kill(process.pid, signal);
+          } catch {
+            process.exitCode = 1;
+          }
+        });
       };
       signalHandlers.set(signal, handler);
       process.once(signal, handler);

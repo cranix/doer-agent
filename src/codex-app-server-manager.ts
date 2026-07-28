@@ -11,7 +11,10 @@ import {
   buildThreadsMcpConfigArgs,
   spawnManagedCodexCommand,
 } from "./agent-codex-cli.js";
-import { CodexAppServerClient } from "./codex-app-server-client.js";
+import {
+  CodexAppServerClient,
+  CodexAppServerRequestError,
+} from "./codex-app-server-client.js";
 import { startCodexChatBridge } from "./codex-chat-bridge.js";
 import {
   allocateMcpOauthCallbackPort,
@@ -29,6 +32,36 @@ function buildConfigArg(key: string, tomlValue: string): string[] {
 
 function buildFeatureArg(enabled: boolean, name: string): string[] {
   return [enabled ? "--enable" : "--disable", name];
+}
+
+function safeServerRequestResponse(method: string): unknown {
+  switch (method) {
+    case "item/commandExecution/requestApproval":
+    case "item/fileChange/requestApproval":
+      return { decision: "decline" };
+    case "item/tool/requestUserInput":
+      return { answers: {} };
+    case "mcpServer/elicitation/request":
+      return { action: "decline", content: null, _meta: null };
+    case "item/permissions/requestApproval":
+      return { permissions: {}, scope: "turn" };
+    case "item/tool/call":
+      return {
+        contentItems: [{
+          type: "inputText",
+          text: "This client does not provide a handler for dynamic tools.",
+        }],
+        success: false,
+      };
+    case "applyPatchApproval":
+    case "execCommandApproval":
+      return { decision: { denied: { rejection: "Client approval UI is unavailable." } } };
+    case "account/chatgptAuthTokens/refresh":
+    case "attestation/generate":
+      throw new CodexAppServerRequestError(`Unsupported Codex app-server request: ${method}`, -32601);
+    default:
+      throw new CodexAppServerRequestError(`Unknown Codex app-server request: ${method}`, -32601);
+  }
 }
 
 function resolveCodexModel(settings: AgentSettingsConfig): string {
@@ -222,6 +255,7 @@ export function createCodexAppServerManager(args: {
   let client: CodexAppServerClient | null = null;
   let providerProxy: ProviderProxy | null = null;
   let createPromise: Promise<CodexAppServerClient> | null = null;
+  let lifecyclePromise: Promise<void> | null = null;
   let mcpOauthCallbackPortPromise: Promise<number> | null = null;
   let generation = 0;
   const notificationListeners = new Set<(method: string, params: unknown) => void>();
@@ -271,6 +305,10 @@ export function createCodexAppServerManager(args: {
       args: appServerArgs,
       env,
       onLog: args.onLog,
+      onServerRequest: async (method) => {
+        args.onLog?.(`codex app-server server request method=${method} handled=safe-fallback`);
+        return safeServerRequestResponse(method);
+      },
       onNotification: (method, params) => {
         for (const listener of notificationListeners) {
           listener(method, params);
@@ -281,6 +319,9 @@ export function createCodexAppServerManager(args: {
   };
 
   const getClient = async (): Promise<CodexAppServerClient> => {
+    if (lifecyclePromise) {
+      await lifecyclePromise;
+    }
     if (client) {
       return client;
     }
@@ -320,6 +361,21 @@ export function createCodexAppServerManager(args: {
     await activeProxy?.stop().catch((error) => {
       args.onLog?.(`failed to stop provider proxy: ${error instanceof Error ? error.message : String(error)}`);
     });
+  };
+
+  const scheduleRestart = async (reason: string): Promise<void> => {
+    if (lifecyclePromise) {
+      return await lifecyclePromise;
+    }
+    const pendingRestart = restartClient(reason);
+    lifecyclePromise = pendingRestart;
+    try {
+      await pendingRestart;
+    } finally {
+      if (lifecyclePromise === pendingRestart) {
+        lifecyclePromise = null;
+      }
+    }
   };
 
   const runMcpLogout = async (name: string): Promise<void> => {
@@ -389,7 +445,7 @@ export function createCodexAppServerManager(args: {
       await runMcpLogout(normalizedName);
     },
     async restart(reason) {
-      await restartClient(reason);
+      await scheduleRestart(reason);
     },
     async stop() {
       const activeClient = client;
