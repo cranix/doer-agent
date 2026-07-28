@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { StringCodec, type Msg, type NatsConnection } from "nats";
 import type { CodexAppServerManager } from "./codex-app-server-manager.js";
@@ -11,6 +11,8 @@ const MAX_THREADS_PER_REBUILD = 2_000;
 const MAX_TAGS = 12;
 const MIN_TAGS = 2;
 const OTHER_TAG_ID = "other";
+const MAX_REPOSITORIES = 200;
+const MAX_RELATED_REPOS = 3;
 
 export interface ThreadAiTagDefinition {
   id: string;
@@ -37,20 +39,37 @@ interface ThreadTagInput {
   cwd: string | null;
 }
 
+export interface ThreadRepositoryCandidate {
+  id: string;
+  label: string;
+  relativePath: string;
+  absolutePath: string;
+}
+
+export interface ThreadRelatedRepoClassification {
+  id: string;
+  label: string;
+  confidence: number;
+  source: "ai" | "cwd";
+}
+
 interface ThreadTagClassification {
   threadId: string;
   activityTag: string;
   confidence: number;
   source: "ai";
+  relatedRepos: ThreadRelatedRepoClassification[];
 }
 
 interface StoredThreadTags {
-  version: 2;
+  version: 3;
   threadId: string;
   contentFingerprint: string;
   configFingerprint: string;
+  repositoryFingerprint: string;
   activityTag: string;
   confidence: number;
+  relatedRepos: ThreadRelatedRepoClassification[];
   source: "ai";
   updatedAt: string;
 }
@@ -118,6 +137,84 @@ function tagsFilePath(workspaceRoot: string, threadId: string): string {
 
 function configFilePath(workspaceRoot: string): string {
   return path.join(workspaceRoot, ".doer-agent", "thread-tags", "config.json");
+}
+
+async function isGitRepository(directoryPath: string): Promise<boolean> {
+  try {
+    const gitEntry = await stat(path.join(directoryPath, ".git"));
+    return gitEntry.isDirectory() || gitEntry.isFile();
+  } catch {
+    return false;
+  }
+}
+
+function repositoryCandidate(workspaceRoot: string, absolutePath: string): ThreadRepositoryCandidate {
+  const relativePath = path.relative(workspaceRoot, absolutePath).split(path.sep).join("/") || ".";
+  return {
+    id: relativePath,
+    label: path.basename(absolutePath),
+    relativePath,
+    absolutePath,
+  };
+}
+
+export async function discoverWorkspaceRepositories(workspaceRoot: string): Promise<ThreadRepositoryCandidate[]> {
+  const resolvedRoot = path.resolve(workspaceRoot);
+  const candidates: ThreadRepositoryCandidate[] = [];
+  if (await isGitRepository(resolvedRoot)) {
+    candidates.push(repositoryCandidate(resolvedRoot, resolvedRoot));
+  }
+
+  const entries = await readdir(resolvedRoot, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (
+      candidates.length >= MAX_REPOSITORIES ||
+      !entry.isDirectory() ||
+      entry.name.startsWith(".")
+    ) {
+      continue;
+    }
+    const absolutePath = path.join(resolvedRoot, entry.name);
+    if (await isGitRepository(absolutePath)) {
+      candidates.push(repositoryCandidate(resolvedRoot, absolutePath));
+    }
+  }
+
+  return candidates.sort((left, right) => (
+    left.label.localeCompare(right.label) || left.id.localeCompare(right.id)
+  ));
+}
+
+function repositoryFingerprint(repositories: ThreadRepositoryCandidate[]): string {
+  return crypto.createHash("sha256").update(JSON.stringify(repositories.map((repository) => ({
+    id: repository.id,
+    label: repository.label,
+    relativePath: repository.relativePath,
+  })))).digest("hex");
+}
+
+function pathIsWithin(candidatePath: string, targetPath: string): boolean {
+  const relative = path.relative(candidatePath, targetPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function relatedReposFromCwd(
+  cwd: string | null,
+  repositories: ThreadRepositoryCandidate[],
+): ThreadRelatedRepoClassification[] {
+  if (!cwd) {
+    return [];
+  }
+  const resolvedCwd = path.resolve(cwd);
+  const repository = repositories
+    .filter((candidate) => pathIsWithin(candidate.absolutePath, resolvedCwd))
+    .sort((left, right) => right.absolutePath.length - left.absolutePath.length)[0];
+  return repository ? [{
+    id: repository.id,
+    label: repository.label,
+    confidence: 1,
+    source: "cwd",
+  }] : [];
 }
 
 function normalizeInputs(value: unknown, limit: number): ThreadTagInput[] {
@@ -268,9 +365,11 @@ export function parseThreadTagClassificationResponse(
   text: string,
   requestedThreadIds: ReadonlySet<string>,
   allowedTagIds: ReadonlySet<string> = new Set(DEFAULT_TAGS.map((tag) => tag.id)),
+  repositories: ThreadRepositoryCandidate[] = [],
 ): ThreadTagClassification[] {
   const payload = jsonObjectFromText(text);
   const assignments = Array.isArray(payload.assignments) ? payload.assignments : [];
+  const repositoriesById = new Map(repositories.map((repository) => [repository.id, repository]));
   const seen = new Set<string>();
   const results: ThreadTagClassification[] = [];
   for (const assignmentValue of assignments) {
@@ -286,11 +385,30 @@ export function parseThreadTagClassificationResponse(
       continue;
     }
     seen.add(threadId);
+    const seenRepositoryIds = new Set<string>();
+    const relatedRepos = (Array.isArray(assignment?.relatedRepos) ? assignment.relatedRepos : [])
+      .flatMap((value): ThreadRelatedRepoClassification[] => {
+        const row = recordValue(value);
+        const id = stringValue(row?.id) || stringValue(value);
+        const repository = repositoriesById.get(id);
+        if (!repository || seenRepositoryIds.has(id)) {
+          return [];
+        }
+        seenRepositoryIds.add(id);
+        return [{
+          id: repository.id,
+          label: repository.label,
+          confidence: boundedConfidence(row?.confidence),
+          source: "ai",
+        }];
+      })
+      .slice(0, MAX_RELATED_REPOS);
     results.push({
       threadId,
       activityTag,
       confidence: boundedConfidence(assignment?.confidence),
       source: "ai",
+      relatedRepos,
     });
   }
   return results;
@@ -304,26 +422,46 @@ async function readStoredTags(
   workspaceRoot: string,
   input: ThreadTagInput,
   config: ResolvedThreadAiTagConfig,
+  repositories: ThreadRepositoryCandidate[],
 ): Promise<ThreadTagClassification | null> {
   try {
     const row = recordValue(JSON.parse(await readFile(tagsFilePath(workspaceRoot, input.threadId), "utf8")));
     const activityTag = sanitizeTagId(stringValue(row?.activityTag));
     const allowedTagIds = new Set(config.tags.map((tag) => tag.id));
-    const isLegacyDefaultCache = row?.version === 1 && config.source === "default";
-    const isCurrentCache = row?.version === 2 && stringValue(row.configFingerprint) === config.fingerprint;
+    const isCurrentCache =
+      row?.version === 3 &&
+      stringValue(row.configFingerprint) === config.fingerprint &&
+      stringValue(row.repositoryFingerprint) === repositoryFingerprint(repositories);
     if (
-      (!isLegacyDefaultCache && !isCurrentCache) ||
+      !isCurrentCache ||
       stringValue(row?.threadId) !== input.threadId ||
       stringValue(row?.contentFingerprint) !== contentFingerprint(input) ||
       !allowedTagIds.has(activityTag)
     ) {
       return null;
     }
+    const repositoriesById = new Map(repositories.map((repository) => [repository.id, repository]));
+    const relatedRepos = (Array.isArray(row?.relatedRepos) ? row.relatedRepos : [])
+      .flatMap((value): ThreadRelatedRepoClassification[] => {
+        const stored = recordValue(value);
+        const repository = repositoriesById.get(stringValue(stored?.id));
+        if (!repository) {
+          return [];
+        }
+        return [{
+          id: repository.id,
+          label: repository.label,
+          confidence: boundedConfidence(stored?.confidence),
+          source: stored?.source === "cwd" ? "cwd" : "ai",
+        }];
+      })
+      .slice(0, MAX_RELATED_REPOS);
     return {
       threadId: input.threadId,
       activityTag,
       confidence: boundedConfidence(row?.confidence),
       source: "ai",
+      relatedRepos,
     };
   } catch {
     return null;
@@ -335,17 +473,20 @@ async function writeStoredTags(
   input: ThreadTagInput,
   classification: ThreadTagClassification,
   config: ResolvedThreadAiTagConfig,
+  repositories: ThreadRepositoryCandidate[],
 ): Promise<void> {
   const filePath = tagsFilePath(workspaceRoot, input.threadId);
   await mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   const payload: StoredThreadTags = {
-    version: 2,
+    version: 3,
     threadId: input.threadId,
     contentFingerprint: contentFingerprint(input),
     configFingerprint: config.fingerprint,
+    repositoryFingerprint: repositoryFingerprint(repositories),
     activityTag: classification.activityTag,
     confidence: classification.confidence,
+    relatedRepos: classification.relatedRepos,
     source: "ai",
     updatedAt: new Date().toISOString(),
   };
@@ -357,15 +498,27 @@ function configuredTagsPrompt(tags: ThreadAiTagDefinition[]): string[] {
   return tags.map((tag) => `- ${tag.id} (${tag.label}): ${tag.description}`);
 }
 
-function classifierPrompt(inputs: ThreadTagInput[], tags: ThreadAiTagDefinition[]): string {
+function classifierPrompt(
+  inputs: ThreadTagInput[],
+  tags: ThreadAiTagDefinition[],
+  repositories: ThreadRepositoryCandidate[],
+): string {
   return [
     "You classify Codex threads inside Doer.",
     "Return only one valid JSON object. Do not use Markdown fences or add explanations.",
     "Classify every input thread into exactly one activityTag from the configured list.",
     "Configured activityTag values:",
     ...configuredTagsPrompt(tags),
-    "Use label and preview as the main evidence. Use cwd only as supporting project context.",
-    `Output shape: {"assignments":[{"threadId":"...","activityTag":"${tags[0]?.id ?? OTHER_TAG_ID}","confidence":0.9}]}`,
+    "Also select zero to three relatedRepos for each thread from the repository candidates below.",
+    "A related repository is a code repository that the thread discusses, inspects, modifies, tests, deploys, or otherwise directly works on.",
+    "Do not invent repository ids and do not select a repository merely because it shares the agent workspace.",
+    `Repository candidates: ${JSON.stringify(repositories.map((repository) => ({
+      id: repository.id,
+      label: repository.label,
+      relativePath: repository.relativePath,
+    })))}`,
+    "Use label and preview as the main evidence. Use cwd as strong supporting repository evidence.",
+    `Output shape: {"assignments":[{"threadId":"...","activityTag":"${tags[0]?.id ?? OTHER_TAG_ID}","confidence":0.9,"relatedRepos":[{"id":"repository-id","confidence":0.9}]}]}`,
     "",
     JSON.stringify({ threads: inputs }),
   ].join("\n");
@@ -379,7 +532,7 @@ function suggestionPrompt(inputs: ThreadTagInput[], candidateTags?: ThreadAiTagD
     "Every tag needs: a stable lowercase kebab-case id, a concise label, a one-sentence classification description, and a distinct #RRGGBB color.",
     "Write labels and descriptions in the predominant language of the supplied threads. Use Korean when the threads are predominantly Korean.",
     `Always include "${OTHER_TAG_ID}" as the final fallback tag.`,
-    "Avoid tags for project paths or running status; those are managed separately.",
+    "Avoid tags for repositories or running status; those are managed separately.",
     "Prefer work-intent categories that will remain useful for future threads.",
     'Output shape: {"tags":[{"id":"feature","label":"Feature","description":"Implementation and product changes.","color":"#22c55e"}]}',
     candidateTags?.length
@@ -395,6 +548,30 @@ function suggestionPrompt(inputs: ThreadTagInput[], candidateTags?: ThreadAiTagD
   ].filter(Boolean).join("\n");
 }
 
+function withCwdRelatedRepos(
+  classification: ThreadTagClassification,
+  input: ThreadTagInput,
+  repositories: ThreadRepositoryCandidate[],
+): ThreadTagClassification {
+  const merged = new Map<string, ThreadRelatedRepoClassification>();
+  for (const relatedRepo of classification.relatedRepos) {
+    merged.set(relatedRepo.id, relatedRepo);
+  }
+  for (const relatedRepo of relatedReposFromCwd(input.cwd, repositories)) {
+    merged.set(relatedRepo.id, relatedRepo);
+  }
+  return {
+    ...classification,
+    relatedRepos: [...merged.values()]
+      .sort((left, right) => (
+        Number(right.source === "cwd") - Number(left.source === "cwd")
+        || right.confidence - left.confidence
+        || left.label.localeCompare(right.label)
+      ))
+      .slice(0, MAX_RELATED_REPOS),
+  };
+}
+
 async function classifyThreads(args: {
   workspaceRoot: string;
   manager: CodexAppServerManager;
@@ -406,10 +583,11 @@ async function classifyThreads(args: {
   config: ReturnType<typeof publicConfig>;
 }> {
   const config = await readConfig(args.workspaceRoot);
+  const repositories = await discoverWorkspaceRepositories(args.workspaceRoot);
   const classifications = new Map<string, ThreadTagClassification>();
   const staleInputs: ThreadTagInput[] = [];
   for (const input of args.inputs) {
-    const stored = args.force ? null : await readStoredTags(args.workspaceRoot, input, config);
+    const stored = args.force ? null : await readStoredTags(args.workspaceRoot, input, config, repositories);
     if (stored) {
       classifications.set(input.threadId, stored);
     } else {
@@ -422,12 +600,13 @@ async function classifyThreads(args: {
     try {
       const resultText = await runCodexTextTask({
         manager: args.manager,
-        prompt: classifierPrompt(staleInputs, config.tags),
+        prompt: classifierPrompt(staleInputs, config.tags, repositories),
       });
       const resolved = parseThreadTagClassificationResponse(
         resultText,
         new Set(staleInputs.map((input) => input.threadId)),
         new Set(config.tags.map((tag) => tag.id)),
+        repositories,
       );
       const inputsById = new Map(staleInputs.map((input) => [input.threadId, input]));
       await Promise.all(resolved.map(async (classification) => {
@@ -435,8 +614,9 @@ async function classifyThreads(args: {
         if (!input) {
           return;
         }
-        await writeStoredTags(args.workspaceRoot, input, classification, config);
-        classifications.set(classification.threadId, classification);
+        const completedClassification = withCwdRelatedRepos(classification, input, repositories);
+        await writeStoredTags(args.workspaceRoot, input, completedClassification, config, repositories);
+        classifications.set(classification.threadId, completedClassification);
       }));
       if (resolved.length !== staleInputs.length) {
         classificationError = `AI classified ${resolved.length} of ${staleInputs.length} threads`;

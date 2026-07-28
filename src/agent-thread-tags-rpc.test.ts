@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
+  discoverWorkspaceRepositories,
   parseSuggestedThreadTags,
   parseThreadTagClassificationResponse,
+  relatedReposFromCwd,
+  type ThreadRepositoryCandidate,
 } from "./agent-thread-tags-rpc.js";
 
 test("parses only requested valid thread tag assignments", () => {
@@ -21,6 +27,7 @@ test("parses only requested valid thread tag assignments", () => {
     activityTag: "feature",
     confidence: 0.91,
     source: "ai",
+    relatedRepos: [],
   }]);
 });
 
@@ -39,6 +46,66 @@ test("accepts classifications from a custom configured range", () => {
     new Set(["customer-request", "other"]),
   );
   assert.equal(result[0]?.activityTag, "customer-request");
+});
+
+test("accepts only configured related repository ids", () => {
+  const repositories: ThreadRepositoryCandidate[] = [{
+    id: "doer",
+    label: "doer",
+    relativePath: "doer",
+    absolutePath: "/workspace/doer",
+  }];
+  const result = parseThreadTagClassificationResponse(
+    JSON.stringify({
+      assignments: [{
+        threadId: "a",
+        activityTag: "feature",
+        confidence: 0.9,
+        relatedRepos: [
+          { id: "doer", confidence: 0.82 },
+          { id: "invented", confidence: 1 },
+        ],
+      }],
+    }),
+    new Set(["a"]),
+    new Set(["feature", "other"]),
+    repositories,
+  );
+  assert.deepEqual(result[0]?.relatedRepos, [{
+    id: "doer",
+    label: "doer",
+    confidence: 0.82,
+    source: "ai",
+  }]);
+});
+
+test("uses the most specific repository containing cwd", () => {
+  const repositories: ThreadRepositoryCandidate[] = [
+    { id: ".", label: "workspace", relativePath: ".", absolutePath: "/workspace" },
+    { id: "doer", label: "doer", relativePath: "doer", absolutePath: "/workspace/doer" },
+  ];
+  assert.deepEqual(relatedReposFromCwd("/workspace/doer/src", repositories), [{
+    id: "doer",
+    label: "doer",
+    confidence: 1,
+    source: "cwd",
+  }]);
+});
+
+test("discovers the workspace root and immediate child git repositories", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "doer-thread-repos-"));
+  try {
+    await mkdir(path.join(root, ".git"));
+    await mkdir(path.join(root, "child", ".git"), { recursive: true });
+    await mkdir(path.join(root, "not-a-repo"), { recursive: true });
+    await mkdir(path.join(root, "worktree"), { recursive: true });
+    await writeFile(path.join(root, "worktree", ".git"), "gitdir: ../actual\n", "utf8");
+
+    const repositories = await discoverWorkspaceRepositories(root);
+    assert.deepEqual(repositories.map((repository) => repository.id).sort(), [".", "child", "worktree"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("normalizes AI suggested tags and always adds other", () => {
