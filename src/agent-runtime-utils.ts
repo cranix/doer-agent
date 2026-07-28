@@ -38,10 +38,6 @@ export function buildAgentNotesAiRpcSubject(userId: string, agentId: string): st
   return `doer.agent.notes.ai.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
 
-export function buildAgentThreadTagsRpcSubject(userId: string, agentId: string): string {
-  return `doer.agent.thread.tags.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
-}
-
 export function buildAgentDaemonRpcSubject(userId: string, agentId: string): string {
   return `doer.agent.daemon.rpc.${sanitizeUserId(userId)}.${agentId.trim()}`;
 }
