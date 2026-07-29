@@ -4,6 +4,7 @@ import {
   createCodexThreadHandoff,
   type CodexThreadHandoffGoal,
 } from "./codex-thread-handoff.js";
+import { CodexThreadHandoffJobManager } from "./codex-thread-handoff-jobs.js";
 
 const codexAppRpcCodec = StringCodec();
 
@@ -21,6 +22,7 @@ interface AgentCodexAppRpcRequest {
   activeTurnId?: unknown;
   latestUserText?: unknown;
   sourceGoal?: unknown;
+  jobId?: unknown;
   timeoutMs?: unknown;
 }
 
@@ -129,6 +131,18 @@ function normalizeCodexAppRpcRequest(args: {
   activeTurnId: string;
   latestUserText: string;
   sourceGoal: CodexThreadHandoffGoal | null;
+} | {
+  requestId: string;
+  action: "thread-handoff-start";
+  sourceThreadId: string;
+  targetName: string;
+  activeTurnId: string;
+  latestUserText: string;
+  sourceGoal: CodexThreadHandoffGoal | null;
+} | {
+  requestId: string;
+  action: "thread-handoff-status";
+  jobId: string;
 } {
   const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
   const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
@@ -155,7 +169,7 @@ function normalizeCodexAppRpcRequest(args: {
     }
     return { requestId, action: "mcp-oauth-logout", name };
   }
-  if (actionRaw === "thread-handoff") {
+  if (actionRaw === "thread-handoff" || actionRaw === "thread-handoff-start") {
     const sourceThreadId = typeof args.request.sourceThreadId === "string" ? args.request.sourceThreadId.trim() : "";
     const targetName = typeof args.request.targetName === "string" ? args.request.targetName.trim() : "";
     const activeTurnId = typeof args.request.activeTurnId === "string" ? args.request.activeTurnId.trim() : "";
@@ -173,13 +187,20 @@ function normalizeCodexAppRpcRequest(args: {
     }
     return {
       requestId,
-      action: "thread-handoff",
+      action: actionRaw,
       sourceThreadId,
       targetName,
       activeTurnId,
       latestUserText,
       sourceGoal,
     };
+  }
+  if (actionRaw === "thread-handoff-status") {
+    const jobId = typeof args.request.jobId === "string" ? args.request.jobId.trim() : "";
+    if (!jobId) {
+      throw new Error("invalid thread handoff status request");
+    }
+    return { requestId, action: "thread-handoff-status", jobId };
   }
   if (actionRaw !== "request" || !method) {
     throw new Error("invalid codex app rpc request");
@@ -198,6 +219,7 @@ async function handleCodexAppRpcMessage(args: {
   nc: NatsConnection;
   agentId: string;
   manager: CodexAppServerManager;
+  handoffJobs: CodexThreadHandoffJobManager;
   onInfo: (message: string) => void;
   onError: (message: string) => void;
 }): Promise<void> {
@@ -207,24 +229,41 @@ async function handleCodexAppRpcMessage(args: {
     const request = normalizeCodexAppRpcRequest({ request: payload, agentId: args.agentId });
     requestId = request.requestId;
 
-    const result = request.action === "request"
-      ? applyCodexAppRpcOmitRules(
+    let result: unknown;
+    if (request.action === "request") {
+      result = applyCodexAppRpcOmitRules(
         request.method,
         await args.manager.request(request.method, request.params, request.timeoutMs),
-      )
-      : request.action === "mcp-oauth-callback"
-        ? await args.manager.relayMcpOauthCallback(request.path, request.search)
-        : request.action === "mcp-oauth-logout"
-          ? await args.manager.logoutMcpServer(request.name)
-          : await createCodexThreadHandoff({
-              manager: args.manager,
-              sourceThreadId: request.sourceThreadId,
-              targetName: request.targetName,
-              activeTurnId: request.activeTurnId,
-              latestUserText: request.latestUserText,
-              sourceGoal: request.sourceGoal,
-              onLog: args.onInfo,
-            });
+      );
+    } else if (request.action === "mcp-oauth-callback") {
+      result = await args.manager.relayMcpOauthCallback(request.path, request.search);
+    } else if (request.action === "mcp-oauth-logout") {
+      result = await args.manager.logoutMcpServer(request.name);
+    } else if (request.action === "thread-handoff-status") {
+      const job = args.handoffJobs.get(request.jobId);
+      if (!job) {
+        throw new Error("thread handoff job not found");
+      }
+      result = job;
+    } else if (request.action === "thread-handoff-start") {
+      result = args.handoffJobs.start({
+        sourceThreadId: request.sourceThreadId,
+        targetName: request.targetName,
+        activeTurnId: request.activeTurnId,
+        latestUserText: request.latestUserText,
+        sourceGoal: request.sourceGoal,
+      });
+    } else {
+      result = await createCodexThreadHandoff({
+        manager: args.manager,
+        sourceThreadId: request.sourceThreadId,
+        targetName: request.targetName,
+        activeTurnId: request.activeTurnId,
+        latestUserText: request.latestUserText,
+        sourceGoal: request.sourceGoal,
+        onLog: args.onInfo,
+      });
+    }
     args.msg.respond(codexAppRpcCodec.encode(JSON.stringify({
       requestId,
       ok: true,
@@ -250,6 +289,21 @@ export function subscribeToCodexAppRpc(args: {
   onInfo: (message: string) => void;
   onError: (message: string) => void;
 }): void {
+  const handoffJobs = new CodexThreadHandoffJobManager(async (input, onProgress) => {
+    try {
+      const result = await createCodexThreadHandoff({
+        manager: args.manager,
+        ...input,
+        onProgress,
+        onLog: args.onInfo,
+      });
+      args.onInfo(`thread handoff completed sourceThreadId=${input.sourceThreadId} targetThreadId=${result.threadId}`);
+      return result;
+    } catch (error) {
+      args.onError(`thread handoff failed sourceThreadId=${input.sourceThreadId} error=${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  });
   args.nc.closed().finally(() => {
     void args.manager.stop().catch(() => undefined);
   });
@@ -265,6 +319,7 @@ export function subscribeToCodexAppRpc(args: {
         nc: args.nc,
         agentId: args.agentId,
         manager: args.manager,
+        handoffJobs,
         onInfo: args.onInfo,
         onError: args.onError,
       });

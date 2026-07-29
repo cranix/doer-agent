@@ -19,6 +19,14 @@ export interface CodexThreadHandoffResult {
   warnings: string[];
 }
 
+export type CodexThreadHandoffPhase =
+  | "preparing"
+  | "collecting"
+  | "summarizing"
+  | "creating"
+  | "injecting"
+  | "finalizing";
+
 const PAGE_SIZE = 10;
 const MAX_PAGES = 100;
 const MAX_TURNS = PAGE_SIZE * MAX_PAGES;
@@ -316,6 +324,7 @@ export async function createCodexThreadHandoff(args: {
   latestUserText?: string;
   sourceGoal?: CodexThreadHandoffGoal | null;
   onLog?: (message: string) => void;
+  onProgress?: (phase: CodexThreadHandoffPhase) => void;
 }): Promise<CodexThreadHandoffResult> {
   const sourceThreadId = stringValue(args.sourceThreadId);
   if (!sourceThreadId) {
@@ -324,6 +333,7 @@ export async function createCodexThreadHandoff(args: {
   const warnings: string[] = [];
   const sourceGoal = normalizeGoal(args.sourceGoal);
 
+  args.onProgress?.("preparing");
   if (sourceGoal?.status === "active") {
     await args.manager.request("thread/goal/set", {
       threadId: sourceThreadId,
@@ -342,6 +352,7 @@ export async function createCodexThreadHandoff(args: {
     });
   }
 
+  args.onProgress?.("collecting");
   args.onLog?.(`collecting handoff history sourceThreadId=${sourceThreadId}`);
   const sourceRead = recordValue(await args.manager.request("thread/read", {
     threadId: sourceThreadId,
@@ -365,6 +376,7 @@ export async function createCodexThreadHandoff(args: {
   const turnsOmitted = Math.max(0, collected.turnCount - bounded.includedTurns)
     + (collected.truncated ? 1 : 0);
 
+  args.onProgress?.("summarizing");
   args.onLog?.(`summarizing handoff sourceThreadId=${sourceThreadId} turns=${collected.turnCount}`);
   const handoffRaw = await runCodexTextTask({
     manager: args.manager,
@@ -383,6 +395,7 @@ export async function createCodexThreadHandoff(args: {
     throw new Error("Codex did not return a thread handoff summary");
   }
 
+  args.onProgress?.("creating");
   args.onLog?.(`creating handoff target sourceThreadId=${sourceThreadId}`);
   const startResult = recordValue(await args.manager.request("thread/start", {
     cwd: sourceCwd || null,
@@ -396,6 +409,7 @@ export async function createCodexThreadHandoff(args: {
   }
 
   try {
+    args.onProgress?.("injecting");
     await args.manager.request("thread/inject_items", {
       threadId,
       items: [{
@@ -412,6 +426,7 @@ export async function createCodexThreadHandoff(args: {
     throw error;
   }
 
+  args.onProgress?.("finalizing");
   const targetName = stringValue(args.targetName).slice(0, 200);
   if (targetName) {
     await args.manager.request("thread/name/set", {
