@@ -34,6 +34,57 @@ const MAX_ITEM_TEXT_CHARS = 4_000;
 const MAX_TURN_TEXT_CHARS = 8_000;
 const MAX_TRANSCRIPT_CHARS = 160_000;
 const MAX_HANDOFF_CHARS = 20_000;
+const HANDOFF_USER_MARKER = "Continue from the handoff summary above and wait for my next request.";
+
+export function buildThreadHandoffInjectionItems(handoff: string): UnknownRecord[] {
+  return [
+    {
+      type: "message",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: handoff,
+      }],
+    },
+  ];
+}
+
+export function buildThreadHandoffSeedInput(): UnknownRecord[] {
+  return [{
+    type: "text",
+    text: HANDOFF_USER_MARKER,
+  }];
+}
+
+async function waitForThreadTurnStarted(
+  manager: CodexAppServerManager,
+  threadId: string,
+  timeoutMs = 1_000,
+): Promise<void> {
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    let cleanup: () => void = () => {};
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    cleanup = manager.onNotification((method, params) => {
+      if (method !== "turn/started") {
+        return;
+      }
+      const event = recordValue(params);
+      if (stringValue(event?.threadId) === threadId) {
+        finish();
+      }
+    });
+  });
+}
 
 function recordValue(value: unknown): UnknownRecord | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -411,16 +462,27 @@ export async function createCodexThreadHandoff(args: {
 
   try {
     args.onProgress?.("injecting");
+    // Raw injected items do not make a new thread discoverable through thread/list.
+    const seedStarted = waitForThreadTurnStarted(args.manager, threadId);
+    const seedResult = recordValue(await args.manager.request("turn/start", {
+      threadId,
+      input: buildThreadHandoffSeedInput(),
+    }, 30_000));
+    const seedTurnId = stringValue(recordValue(seedResult?.turn)?.id);
+    if (!seedTurnId) {
+      throw new Error("Codex app-server did not return a handoff seed turn");
+    }
+    await seedStarted;
+    await args.manager.request("turn/interrupt", {
+      threadId,
+      turnId: seedTurnId,
+    }, 30_000).catch((error) => {
+      warnings.push(`Could not interrupt handoff seed turn: ${error instanceof Error ? error.message : String(error)}`);
+    });
+
     await args.manager.request("thread/inject_items", {
       threadId,
-      items: [{
-        type: "message",
-        role: "assistant",
-        content: [{
-          type: "output_text",
-          text: handoff,
-        }],
-      }],
+      items: buildThreadHandoffInjectionItems(handoff),
     }, 90_000);
   } catch (error) {
     await args.manager.request("thread/delete", { threadId }, 30_000).catch(() => undefined);

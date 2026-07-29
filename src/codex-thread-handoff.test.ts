@@ -2,8 +2,30 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildBoundedHandoffTranscript,
+  buildThreadHandoffInjectionItems,
+  buildThreadHandoffSeedInput,
   summarizeThreadTurn,
 } from "./codex-thread-handoff.js";
+
+test("buildThreadHandoffInjectionItems adds the summary to model-visible history", () => {
+  assert.deepEqual(buildThreadHandoffInjectionItems("# Thread handoff\n\nContinue the work."), [
+    {
+      type: "message",
+      role: "assistant",
+      content: [{
+        type: "output_text",
+        text: "# Thread handoff\n\nContinue the work.",
+      }],
+    },
+  ]);
+});
+
+test("buildThreadHandoffSeedInput creates a real user turn for thread indexing", () => {
+  assert.deepEqual(buildThreadHandoffSeedInput(), [{
+    type: "text",
+    text: "Continue from the handoff summary above and wait for my next request.",
+  }]);
+});
 
 test("summarizeThreadTurn omits raw command output, diffs, images, and MCP results", () => {
   const summary = summarizeThreadTurn({
