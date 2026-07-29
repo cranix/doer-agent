@@ -124,5 +124,9 @@ export async function runCodexTextTask(args: {
   } catch (error) {
     settle(() => {});
     throw error;
+  } finally {
+    if (threadId) {
+      await args.manager.request("thread/unsubscribe", { threadId }, 30_000).catch(() => undefined);
+    }
   }
 }

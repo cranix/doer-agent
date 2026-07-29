@@ -1,5 +1,9 @@
 import { StringCodec, type Msg, type NatsConnection } from "nats";
 import type { CodexAppServerManager } from "./codex-app-server-manager.js";
+import {
+  createCodexThreadHandoff,
+  type CodexThreadHandoffGoal,
+} from "./codex-thread-handoff.js";
 
 const codexAppRpcCodec = StringCodec();
 
@@ -12,6 +16,11 @@ interface AgentCodexAppRpcRequest {
   path?: unknown;
   search?: unknown;
   name?: unknown;
+  sourceThreadId?: unknown;
+  targetName?: unknown;
+  activeTurnId?: unknown;
+  latestUserText?: unknown;
+  sourceGoal?: unknown;
   timeoutMs?: unknown;
 }
 
@@ -112,6 +121,14 @@ function normalizeCodexAppRpcRequest(args: {
   requestId: string;
   action: "mcp-oauth-logout";
   name: string;
+} | {
+  requestId: string;
+  action: "thread-handoff";
+  sourceThreadId: string;
+  targetName: string;
+  activeTurnId: string;
+  latestUserText: string;
+  sourceGoal: CodexThreadHandoffGoal | null;
 } {
   const requestId = typeof args.request.requestId === "string" ? args.request.requestId.trim() : "";
   const requestAgentId = typeof args.request.agentId === "string" ? args.request.agentId.trim() : "";
@@ -137,6 +154,32 @@ function normalizeCodexAppRpcRequest(args: {
       throw new Error("invalid MCP OAuth logout request");
     }
     return { requestId, action: "mcp-oauth-logout", name };
+  }
+  if (actionRaw === "thread-handoff") {
+    const sourceThreadId = typeof args.request.sourceThreadId === "string" ? args.request.sourceThreadId.trim() : "";
+    const targetName = typeof args.request.targetName === "string" ? args.request.targetName.trim() : "";
+    const activeTurnId = typeof args.request.activeTurnId === "string" ? args.request.activeTurnId.trim() : "";
+    const latestUserText = typeof args.request.latestUserText === "string" ? args.request.latestUserText.trim().slice(0, 4_000) : "";
+    const sourceGoalRecord = recordValue(args.request.sourceGoal);
+    const sourceGoal = sourceGoalRecord && typeof sourceGoalRecord.objective === "string" && typeof sourceGoalRecord.status === "string"
+      ? {
+          objective: sourceGoalRecord.objective,
+          status: sourceGoalRecord.status,
+          tokenBudget: typeof sourceGoalRecord.tokenBudget === "number" ? sourceGoalRecord.tokenBudget : null,
+        } as CodexThreadHandoffGoal
+      : null;
+    if (!sourceThreadId || targetName.length > 200) {
+      throw new Error("invalid thread handoff request");
+    }
+    return {
+      requestId,
+      action: "thread-handoff",
+      sourceThreadId,
+      targetName,
+      activeTurnId,
+      latestUserText,
+      sourceGoal,
+    };
   }
   if (actionRaw !== "request" || !method) {
     throw new Error("invalid codex app rpc request");
@@ -171,7 +214,17 @@ async function handleCodexAppRpcMessage(args: {
       )
       : request.action === "mcp-oauth-callback"
         ? await args.manager.relayMcpOauthCallback(request.path, request.search)
-        : await args.manager.logoutMcpServer(request.name);
+        : request.action === "mcp-oauth-logout"
+          ? await args.manager.logoutMcpServer(request.name)
+          : await createCodexThreadHandoff({
+              manager: args.manager,
+              sourceThreadId: request.sourceThreadId,
+              targetName: request.targetName,
+              activeTurnId: request.activeTurnId,
+              latestUserText: request.latestUserText,
+              sourceGoal: request.sourceGoal,
+              onLog: args.onInfo,
+            });
     args.msg.respond(codexAppRpcCodec.encode(JSON.stringify({
       requestId,
       ok: true,
