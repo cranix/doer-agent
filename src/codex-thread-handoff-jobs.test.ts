@@ -21,12 +21,18 @@ async function nextTick(): Promise<void> {
 
 test("starts handoff work asynchronously and reports progress", async () => {
   let finish: ((result: CodexThreadHandoffResult) => void) | undefined;
-  const manager = new CodexThreadHandoffJobManager(async (input, onProgress) => {
-    onProgress("collecting");
-    return await new Promise<CodexThreadHandoffResult>((resolve) => {
-      finish = resolve;
-    });
-  });
+  const statuses: string[] = [];
+  const manager = new CodexThreadHandoffJobManager(
+    async (input, onProgress) => {
+      onProgress("collecting");
+      return await new Promise<CodexThreadHandoffResult>((resolve) => {
+        finish = resolve;
+      });
+    },
+    {
+      onStatus: (job) => statuses.push(job.phase),
+    },
+  );
 
   const started = manager.start({ sourceThreadId: "source-thread" });
   assert.equal(started.job.phase, "queued");
@@ -40,6 +46,7 @@ test("starts handoff work asynchronously and reports progress", async () => {
   const completed = manager.get(started.job.jobId);
   assert.equal(completed?.phase, "completed");
   assert.equal(completed?.result?.threadId, "target-thread");
+  assert.deepEqual(statuses, ["queued", "collecting", "completed"]);
 });
 
 test("deduplicates active jobs for the same source thread", () => {
@@ -55,9 +62,15 @@ test("deduplicates active jobs for the same source thread", () => {
 });
 
 test("keeps a failed job status for polling", async () => {
-  const manager = new CodexThreadHandoffJobManager(async () => {
-    throw new Error("summary failed");
-  });
+  const statuses: Array<{ phase: string; error?: string }> = [];
+  const manager = new CodexThreadHandoffJobManager(
+    async () => {
+      throw new Error("summary failed");
+    },
+    {
+      onStatus: (job) => statuses.push({ phase: job.phase, error: job.error }),
+    },
+  );
 
   const started = manager.start({ sourceThreadId: "source-thread" });
   await nextTick();
@@ -66,4 +79,8 @@ test("keeps a failed job status for polling", async () => {
   const failed = manager.get(started.job.jobId);
   assert.equal(failed?.phase, "failed");
   assert.equal(failed?.error, "summary failed");
+  assert.deepEqual(statuses, [
+    { phase: "queued", error: undefined },
+    { phase: "failed", error: "summary failed" },
+  ]);
 });

@@ -389,6 +389,7 @@ export async function createCodexThreadHandoff(args: {
       turnsCollected: collected.turnCount,
       turnsOmitted,
     }),
+    onLog: args.onLog,
   });
   const handoff = boundedText(handoffRaw, MAX_HANDOFF_CHARS);
   if (!handoff) {

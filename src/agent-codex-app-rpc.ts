@@ -289,21 +289,31 @@ export function subscribeToCodexAppRpc(args: {
   onInfo: (message: string) => void;
   onError: (message: string) => void;
 }): void {
-  const handoffJobs = new CodexThreadHandoffJobManager(async (input, onProgress) => {
-    try {
-      const result = await createCodexThreadHandoff({
+  const handoffJobs = new CodexThreadHandoffJobManager(
+    async (input, onProgress) => {
+      return await createCodexThreadHandoff({
         manager: args.manager,
         ...input,
         onProgress,
         onLog: args.onInfo,
       });
-      args.onInfo(`thread handoff completed sourceThreadId=${input.sourceThreadId} targetThreadId=${result.threadId}`);
-      return result;
-    } catch (error) {
-      args.onError(`thread handoff failed sourceThreadId=${input.sourceThreadId} error=${error instanceof Error ? error.message : String(error)}`);
-      throw error;
-    }
-  });
+    },
+    {
+      onStatus: (job) => {
+        const elapsedMs = Math.max(0, Date.parse(job.updatedAt) - Date.parse(job.createdAt));
+        const target = job.result?.threadId ? ` targetThreadId=${job.result.threadId}` : "";
+        const error = job.error
+          ? ` error=${JSON.stringify(job.error.replace(/\s+/g, " ").slice(0, 500))}`
+          : "";
+        const message = `thread handoff job status jobId=${job.jobId} sourceThreadId=${job.sourceThreadId} phase=${job.phase} elapsedMs=${elapsedMs}${target}${error}`;
+        if (job.phase === "failed") {
+          args.onError(message);
+        } else {
+          args.onInfo(message);
+        }
+      },
+    },
+  );
   args.nc.closed().finally(() => {
     void args.manager.stop().catch(() => undefined);
   });

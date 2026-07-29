@@ -28,6 +28,12 @@ export interface CodexThreadHandoffJobStartResult {
   deduplicated: boolean;
 }
 
+export interface CodexThreadHandoffJobManagerOptions {
+  terminalTtlMs?: number;
+  maxJobs?: number;
+  onStatus?: (job: CodexThreadHandoffJobSnapshot) => void;
+}
+
 type HandoffRunner = (
   input: CodexThreadHandoffJobInput,
   onProgress: (phase: CodexThreadHandoffPhase) => void,
@@ -45,12 +51,18 @@ function copySnapshot(job: CodexThreadHandoffJobSnapshot): CodexThreadHandoffJob
 export class CodexThreadHandoffJobManager {
   private readonly jobs = new Map<string, CodexThreadHandoffJobSnapshot>();
   private readonly activeJobBySourceThreadId = new Map<string, string>();
+  private readonly terminalTtlMs: number;
+  private readonly maxJobs: number;
+  private readonly onStatus?: (job: CodexThreadHandoffJobSnapshot) => void;
 
   constructor(
     private readonly run: HandoffRunner,
-    private readonly terminalTtlMs = 30 * 60_000,
-    private readonly maxJobs = 100,
-  ) {}
+    options: CodexThreadHandoffJobManagerOptions = {},
+  ) {
+    this.terminalTtlMs = options.terminalTtlMs ?? 30 * 60_000;
+    this.maxJobs = options.maxJobs ?? 100;
+    this.onStatus = options.onStatus;
+  }
 
   start(input: CodexThreadHandoffJobInput): CodexThreadHandoffJobStartResult {
     this.cleanup();
@@ -73,6 +85,7 @@ export class CodexThreadHandoffJobManager {
     };
     this.jobs.set(job.jobId, job);
     this.activeJobBySourceThreadId.set(input.sourceThreadId, job.jobId);
+    this.emitStatus(job);
 
     setImmediate(() => {
       void this.execute(job.jobId, input);
@@ -94,6 +107,7 @@ export class CodexThreadHandoffJobManager {
       }
       current.phase = phase;
       current.updatedAt = new Date().toISOString();
+      this.emitStatus(current);
     };
 
     try {
@@ -103,6 +117,7 @@ export class CodexThreadHandoffJobManager {
         current.phase = "completed";
         current.result = result;
         current.updatedAt = new Date().toISOString();
+        this.emitStatus(current);
       }
     } catch (error) {
       const current = this.jobs.get(jobId);
@@ -110,12 +125,17 @@ export class CodexThreadHandoffJobManager {
         current.phase = "failed";
         current.error = error instanceof Error ? error.message : String(error);
         current.updatedAt = new Date().toISOString();
+        this.emitStatus(current);
       }
     } finally {
       if (this.activeJobBySourceThreadId.get(input.sourceThreadId) === jobId) {
         this.activeJobBySourceThreadId.delete(input.sourceThreadId);
       }
     }
+  }
+
+  private emitStatus(job: CodexThreadHandoffJobSnapshot): void {
+    this.onStatus?.(copySnapshot(job));
   }
 
   private cleanup(): void {

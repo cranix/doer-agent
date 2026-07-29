@@ -50,15 +50,21 @@ export async function runCodexTextTask(args: {
   manager: CodexAppServerManager;
   prompt: string;
   timeoutMs?: number;
+  onLog?: (message: string) => void;
 }): Promise<string> {
+  const startedAt = Date.now();
   let threadId = "";
   let turnId = "";
   let output = "";
+  let outputStarted = false;
   let settled = false;
   let cleanupNotification = () => {};
   let settle = (_callback: () => void) => {};
   const completed = new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
+      args.onLog?.(
+        `codex text task status phase=timed_out threadId=${threadId || "pending"} turnId=${turnId || "pending"} elapsedMs=${Date.now() - startedAt} outputChars=${output.length}`,
+      );
       settle(() => reject(new Error("Timed out while waiting for Codex text task")));
     }, args.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     settle = (callback: () => void) => {
@@ -85,11 +91,20 @@ export async function runCodexTextTask(args: {
       if (method === "item/agentMessage/delta") {
         const record = recordValue(params);
         output += stringValue(record?.delta) || stringValue(record?.text);
+        if (!outputStarted && output) {
+          outputStarted = true;
+          args.onLog?.(
+            `codex text task status phase=responding threadId=${threadId} turnId=${turnId || eventTurnId || "pending"} elapsedMs=${Date.now() - startedAt}`,
+          );
+        }
         return;
       }
       if (!isTerminalTurnMethod(method)) {
         return;
       }
+      args.onLog?.(
+        `codex text task status phase=terminal_notification method=${method} threadId=${threadId} turnId=${turnId || eventTurnId || "pending"} elapsedMs=${Date.now() - startedAt} outputChars=${output.length}`,
+      );
       if (method === "turn/completed") {
         settle(resolve);
         return;
@@ -109,6 +124,9 @@ export async function runCodexTextTask(args: {
     if (!threadId) {
       throw new Error("Codex app-server did not return a text task thread id");
     }
+    args.onLog?.(
+      `codex text task status phase=thread_started threadId=${threadId} elapsedMs=${Date.now() - startedAt}`,
+    );
 
     const turnResult = recordValue(await args.manager.request("turn/start", {
       threadId,
@@ -118,15 +136,34 @@ export async function runCodexTextTask(args: {
     if (!turnId) {
       throw new Error("Codex app-server did not return a text task turn id");
     }
+    args.onLog?.(
+      `codex text task status phase=turn_started threadId=${threadId} turnId=${turnId} elapsedMs=${Date.now() - startedAt}`,
+    );
 
     await completed.finally(() => cleanupNotification());
+    args.onLog?.(
+      `codex text task status phase=completed threadId=${threadId} turnId=${turnId} elapsedMs=${Date.now() - startedAt} outputChars=${output.length}`,
+    );
     return output;
   } catch (error) {
     settle(() => {});
+    args.onLog?.(
+      `codex text task status phase=failed threadId=${threadId || "pending"} turnId=${turnId || "pending"} elapsedMs=${Date.now() - startedAt} error=${JSON.stringify((error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 500))}`,
+    );
     throw error;
   } finally {
     if (threadId) {
-      await args.manager.request("thread/unsubscribe", { threadId }, 30_000).catch(() => undefined);
+      await args.manager.request("thread/unsubscribe", { threadId }, 30_000)
+        .then(() => {
+          args.onLog?.(
+            `codex text task status phase=unsubscribed threadId=${threadId} turnId=${turnId || "pending"} elapsedMs=${Date.now() - startedAt}`,
+          );
+        })
+        .catch((error) => {
+          args.onLog?.(
+            `codex text task status phase=unsubscribe_failed threadId=${threadId} turnId=${turnId || "pending"} elapsedMs=${Date.now() - startedAt} error=${JSON.stringify((error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 500))}`,
+          );
+        });
     }
   }
 }
