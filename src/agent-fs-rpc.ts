@@ -37,17 +37,30 @@ export interface AgentFsRpcRequest {
   destinationPath?: unknown;
 }
 
-function normalizeFsRpcPath(workspaceRoot: string, rawPath: unknown): { abs: string; formatPath: (target: string) => string } {
+function isPathInsideRoot(root: string, target: string): boolean {
+  return target === root || target.startsWith(root + path.sep);
+}
+
+export function normalizeFsRpcPath(
+  workspaceRoot: string,
+  rawPath: unknown,
+  options: { allowOutsideWorkspace?: boolean } = {},
+): { abs: string; formatPath: (target: string) => string } {
   const raw = typeof rawPath === "string" && rawPath.trim() ? rawPath.trim() : ".";
   const normalizedRaw = raw.replace(/\\/g, "/");
   const useAbsolute = path.isAbsolute(normalizedRaw);
   const rel = normalizedRaw.replace(/^\/+/, "") || ".";
-  const abs = useAbsolute ? path.resolve(normalizedRaw) : path.resolve(workspaceRoot, rel);
-  if (abs !== workspaceRoot && !abs.startsWith(workspaceRoot + path.sep)) {
+  const resolvedWorkspaceRoot = path.resolve(workspaceRoot);
+  const abs = useAbsolute ? path.resolve(normalizedRaw) : path.resolve(resolvedWorkspaceRoot, rel);
+  if (!options.allowOutsideWorkspace && !isPathInsideRoot(resolvedWorkspaceRoot, abs)) {
     throw new Error("path escapes workspace root");
   }
   const formatPath = (target: string): string => {
-    return path.relative(workspaceRoot, target).split(path.sep).join("/") || ".";
+    const resolvedTarget = path.resolve(target);
+    if (!isPathInsideRoot(resolvedWorkspaceRoot, resolvedTarget)) {
+      return resolvedTarget.split(path.sep).join("/") || "/";
+    }
+    return path.relative(resolvedWorkspaceRoot, resolvedTarget).split(path.sep).join("/") || ".";
   };
   return { abs, formatPath };
 }
@@ -134,7 +147,14 @@ async function executeFsRpc(args: {
   agentToken: string;
 }): Promise<Record<string, unknown>> {
   const action = parseFsRpcAction(args.request.action);
-  const { abs, formatPath } = normalizeFsRpcPath(args.workspaceRoot, args.request.path);
+  const allowOutsideWorkspace =
+    action === "list" ||
+    action === "stat" ||
+    action === "upload_file" ||
+    action === "read_text";
+  const { abs, formatPath } = normalizeFsRpcPath(args.workspaceRoot, args.request.path, {
+    allowOutsideWorkspace,
+  });
 
   if (action === "stat") {
     const entry = await stat(abs);
