@@ -6,6 +6,27 @@ export interface JsonRequestOptions {
   timeoutMs?: number;
 }
 
+export function publishNatsBestEffort(args: {
+  nc: NatsConnection;
+  subject: string;
+  data: Uint8Array;
+  context: string;
+  onError: (message: string) => void;
+}): boolean {
+  if (args.nc.isClosed()) {
+    args.onError(`${args.context}: NATS connection is closed; event dropped`);
+    return false;
+  }
+  try {
+    args.nc.publish(args.subject, args.data);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    args.onError(`${args.context}: ${message}; event dropped`);
+    return false;
+  }
+}
+
 export async function postJson<T>(url: string, body: unknown, options: JsonRequestOptions = {}): Promise<T> {
   let res: Response;
   try {

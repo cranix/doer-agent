@@ -43,6 +43,11 @@ const fixtureSource = String.raw`
       send({ id: message.id, result: {} });
       return;
     }
+    if (message.method === "test/notification-handler-error") {
+      send({ method: "test/notification", params: { value: 1 } });
+      send({ id: message.id, result: { ok: true } });
+      return;
+    }
     if (message.method === "turn/interrupt") {
       trace("turn-interrupt");
       send({ id: message.id, result: {} });
@@ -93,4 +98,32 @@ test("handles server requests and drains active turns before shutdown", async ()
     "turn-interrupt",
     "sigterm",
   ]);
+});
+
+test("isolates notification handler errors from the app-server reader", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "doer-app-server-client-"));
+  const tracePath = path.join(tempDir, "trace.log");
+  const logs: string[] = [];
+  const client = new CodexAppServerClient({
+    cwd: tempDir,
+    args: [],
+    executable: process.execPath,
+    executableArgs: ["--eval", fixtureSource],
+    env: {
+      ...process.env,
+      DOER_CODEX_FIXTURE_TRACE: tracePath,
+    },
+    onLog: (message) => logs.push(message),
+    onNotification: () => {
+      throw new Error("CONNECTION_CLOSED");
+    },
+  });
+
+  const result = await client.request("test/notification-handler-error");
+  assert.deepEqual(result, { ok: true });
+  assert.ok(logs.some((message) => (
+    message.includes("notification handler failed method=test/notification: CONNECTION_CLOSED")
+  )));
+
+  await client.stop();
 });

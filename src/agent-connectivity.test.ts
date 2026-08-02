@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { NatsConnection } from "nats";
 import { buildNatsConnectionOptions } from "./agent-jetstream.js";
-import { heartbeatAgentSession, type JsonRequestOptions } from "./agent-runtime-io.js";
+import {
+  heartbeatAgentSession,
+  publishNatsBestEffort,
+  type JsonRequestOptions,
+} from "./agent-runtime-io.js";
 
 test("NATS connection detects stale networks quickly and keeps reconnecting", () => {
   const options = buildNatsConnectionOptions({
@@ -48,4 +52,48 @@ test("heartbeat forwards its timeout to the HTTP probe", async () => {
   });
 
   assert.equal(observedTimeout, 3_000);
+});
+
+test("Codex notifications are dropped instead of crashing after NATS closes", () => {
+  const errors: string[] = [];
+  let publishCalled = false;
+  const published = publishNatsBestEffort({
+    nc: {
+      isClosed: () => true,
+      publish: () => {
+        publishCalled = true;
+      },
+    } as unknown as NatsConnection,
+    subject: "agent.codex.events",
+    data: new Uint8Array([1]),
+    context: "failed to forward codex notification",
+    onError: (message) => errors.push(message),
+  });
+
+  assert.equal(published, false);
+  assert.equal(publishCalled, false);
+  assert.deepEqual(errors, [
+    "failed to forward codex notification: NATS connection is closed; event dropped",
+  ]);
+});
+
+test("Codex notification publish errors stay non-fatal during a close race", () => {
+  const errors: string[] = [];
+  const published = publishNatsBestEffort({
+    nc: {
+      isClosed: () => false,
+      publish: () => {
+        throw new Error("CONNECTION_CLOSED");
+      },
+    } as unknown as NatsConnection,
+    subject: "agent.codex.events",
+    data: new Uint8Array([1]),
+    context: "failed to forward codex notification",
+    onError: (message) => errors.push(message),
+  });
+
+  assert.equal(published, false);
+  assert.deepEqual(errors, [
+    "failed to forward codex notification: CONNECTION_CLOSED; event dropped",
+  ]);
 });

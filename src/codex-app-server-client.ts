@@ -198,7 +198,14 @@ export class CodexAppServerClient {
         void this.handleServerRequest(record.id, record.method, record.params);
       } else {
         this.trackTurnNotification(record.method, record.params);
-        this.options.onNotification?.(record.method, record.params);
+        try {
+          this.options.onNotification?.(record.method, record.params);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.options.onLog?.(
+            `[codex-app-server] notification handler failed method=${record.method}: ${message}`,
+          );
+        }
       }
       return;
     }

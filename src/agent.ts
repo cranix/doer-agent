@@ -48,6 +48,7 @@ import {
   getJson,
   heartbeatAgentSession,
   postJson,
+  publishNatsBestEffort,
 } from "./agent-runtime-io.js";
 import { handleSettingsRpcMessage } from "./agent-settings-rpc.js";
 
@@ -391,10 +392,13 @@ async function main() {
               params,
               emittedAt: new Date().toISOString(),
             };
-            jetstream.nc.publish(
-              buildAgentCodexAppEventsSubject(userId, initialAgentId),
-              codexAppEventCodec.encode(JSON.stringify(event)),
-            );
+            publishNatsBestEffort({
+              nc: jetstream.nc,
+              subject: buildAgentCodexAppEventsSubject(userId, initialAgentId),
+              data: codexAppEventCodec.encode(JSON.stringify(event)),
+              context: `failed to forward codex app-server notification method=${method}`,
+              onError: writeAgentInfraError,
+            });
           },
         });
         void ensureBundledDoerSkills({
