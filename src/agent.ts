@@ -86,6 +86,11 @@ interface ActiveTaskLogContext {
   userId: string;
 }
 
+interface CodexAppEventTransport {
+  nc: NatsConnection;
+  subject: string;
+}
+
 let activeTaskLogContext: ActiveTaskLogContext | null = null;
 let workspaceRootOverride: string | null = null;
 
@@ -318,6 +323,11 @@ async function main() {
   const agentToken = agentSecret;
   const agentVersion = await resolveAgentVersion(AGENT_PACKAGE_JSON_PATH);
   let bannerShown = false;
+  let codexAppServerManagerState: {
+    agentId: string;
+    manager: CodexAppServerManager;
+  } | null = null;
+  let codexAppEventTransport: CodexAppEventTransport | null = null;
 
   while (true) {
     const { natsBootstrap, jetstream } = await connectBootstrapWithRetry<AgentNatsBootstrapResponse>({
@@ -334,6 +344,58 @@ async function main() {
     if (!initialAgentId) {
       throw new Error("agent id missing from bootstrap");
     }
+
+    if (codexAppServerManagerState?.agentId !== initialAgentId) {
+      await codexAppServerManagerState?.manager.stop();
+      const managerAgentId: string = initialAgentId;
+      codexAppServerManagerState = {
+        agentId: managerAgentId,
+        manager: createCodexAppServerManager({
+          agentId: managerAgentId,
+          agentToken,
+          workspaceRoot: resolveWorkspaceRoot(),
+          agentProjectDir: AGENT_PROJECT_DIR,
+          serverBaseUrl,
+          resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
+          readAgentSettingsConfig,
+          userId,
+          onLog: writeAgentInfo,
+          onNotification: (method, params) => {
+            if (!shouldForwardCodexAppNotification(method)) {
+              return;
+            }
+            writeAgentInfo(`codex app-server notification method=${method} params=${formatCodexAppNotificationParams(params)}`);
+            const event = {
+              type: "codex.app.notification",
+              agentId: managerAgentId,
+              method,
+              params,
+              emittedAt: new Date().toISOString(),
+            };
+            const transport = codexAppEventTransport;
+            if (!transport) {
+              writeAgentInfraError(
+                `failed to forward codex app-server notification method=${method}: no active NATS session; event dropped`,
+              );
+              return;
+            }
+            publishNatsBestEffort({
+              nc: transport.nc,
+              subject: transport.subject,
+              data: codexAppEventCodec.encode(JSON.stringify(event)),
+              context: `failed to forward codex app-server notification method=${method}`,
+              onError: writeAgentInfraError,
+            });
+          },
+        }),
+      };
+    }
+    const codexAppServerManager = codexAppServerManagerState.manager;
+    const sessionCodexAppEventTransport: CodexAppEventTransport = {
+      nc: jetstream.nc,
+      subject: buildAgentCodexAppEventsSubject(userId, initialAgentId),
+    };
+    codexAppEventTransport = sessionCodexAppEventTransport;
 
     if (!bannerShown) {
       process.stdout.write(`\n[doer-agent v${agentVersion}]\n`);
@@ -370,37 +432,6 @@ async function main() {
       formatTimestamp: formatLocalTimestamp,
       heartbeatAgentSession: heartbeatSession,
       subscribeAll: () => {
-        const codexAppServerManager = createCodexAppServerManager({
-          agentId: initialAgentId,
-          agentToken,
-          workspaceRoot: resolveWorkspaceRoot(),
-          agentProjectDir: AGENT_PROJECT_DIR,
-          serverBaseUrl,
-          resolveCodexHomePath: runtimeEnvHelpers.resolveCodexHomePath,
-          readAgentSettingsConfig,
-          userId,
-          onLog: writeAgentInfo,
-          onNotification: (method, params) => {
-            if (!shouldForwardCodexAppNotification(method)) {
-              return;
-            }
-            writeAgentInfo(`codex app-server notification method=${method} params=${formatCodexAppNotificationParams(params)}`);
-            const event = {
-              type: "codex.app.notification",
-              agentId: initialAgentId,
-              method,
-              params,
-              emittedAt: new Date().toISOString(),
-            };
-            publishNatsBestEffort({
-              nc: jetstream.nc,
-              subject: buildAgentCodexAppEventsSubject(userId, initialAgentId),
-              data: codexAppEventCodec.encode(JSON.stringify(event)),
-              context: `failed to forward codex app-server notification method=${method}`,
-              onError: writeAgentInfraError,
-            });
-          },
-        });
         void ensureBundledDoerSkills({
           bundledSkillsRoot: BUNDLED_SKILLS_ROOT,
           codexHome: runtimeEnvHelpers.resolveCodexHomePath(),
@@ -488,6 +519,9 @@ async function main() {
       onInfraError: writeAgentInfraError,
       sleep,
     });
+    if (codexAppEventTransport === sessionCodexAppEventTransport) {
+      codexAppEventTransport = null;
+    }
   }
 }
 main().catch((error) => {

@@ -314,9 +314,6 @@ export function subscribeToCodexAppRpc(args: {
       },
     },
   );
-  args.nc.closed().finally(() => {
-    void args.manager.stop().catch(() => undefined);
-  });
   args.nc.subscribe(args.subject, {
     callback: (error, msg) => {
       if (error) {
