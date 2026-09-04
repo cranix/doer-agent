@@ -38,7 +38,7 @@ export interface AgentSettingsConfig {
       envKey: string;
       apiKey: string | null;
     } | null;
-    reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+    reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
     serviceTier: string | null;
     authMode: "api_key" | "chatgpt";
     computerUseEnabled: boolean;
@@ -85,7 +85,7 @@ export interface AgentSettingsPublic {
       apiKeyMasked: string | null;
       apiKeyLength: number | null;
     } | null;
-    reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+    reasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
     serviceTier: string | null;
     authMode: "api_key" | "chatgpt";
     computerUseEnabled: boolean;
@@ -256,7 +256,9 @@ function normalizeReasoningEffort(
     value === "low" ||
     value === "medium" ||
     value === "high" ||
-    value === "xhigh"
+    value === "xhigh" ||
+    value === "max" ||
+    value === "ultra"
     ? value
     : fallback;
 }
