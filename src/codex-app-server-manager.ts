@@ -15,6 +15,10 @@ import {
   CodexAppServerClient,
   CodexAppServerRequestError,
 } from "./codex-app-server-client.js";
+import {
+  CodexServerRequestBroker,
+  type PendingCodexServerRequest,
+} from "./codex-server-request-broker.js";
 import { startCodexChatBridge } from "./codex-chat-bridge.js";
 import {
   allocateMcpOauthCallbackPort,
@@ -59,6 +63,8 @@ function safeServerRequestResponse(method: string): unknown {
     case "account/chatgptAuthTokens/refresh":
     case "attestation/generate":
       throw new CodexAppServerRequestError(`Unsupported Codex app-server request: ${method}`, -32601);
+    case "currentTime/read":
+      return { currentTimeAt: Math.floor(Date.now() / 1000) };
     default:
       throw new CodexAppServerRequestError(`Unknown Codex app-server request: ${method}`, -32601);
   }
@@ -230,6 +236,8 @@ async function buildCodexAppServerEnv(args: {
 export interface CodexAppServerManager {
   onNotification(listener: (method: string, params: unknown) => void): () => void;
   request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
+  listPendingServerRequests(threadId?: string | null): PendingCodexServerRequest[];
+  respondToServerRequest(requestId: string, response: unknown): boolean;
   relayMcpOauthCallback(path: string, search: string): Promise<{
     status: number;
     headers: Record<string, string>;
@@ -259,6 +267,16 @@ export function createCodexAppServerManager(args: {
   let mcpOauthCallbackPortPromise: Promise<number> | null = null;
   let generation = 0;
   const notificationListeners = new Set<(method: string, params: unknown) => void>();
+  const emitNotification = (method: string, params: unknown) => {
+    for (const listener of notificationListeners) {
+      listener(method, params);
+    }
+    args.onNotification?.(method, params);
+  };
+  const serverRequestBroker = new CodexServerRequestBroker(
+    safeServerRequestResponse,
+    (event, request) => emitNotification(`doer/serverRequest/${event}`, request),
+  );
   const mcpOauthCallbackUrl = buildMcpOauthCallbackBaseUrl({
     serverBaseUrl: args.serverBaseUrl,
     userId: args.userId,
@@ -305,15 +323,24 @@ export function createCodexAppServerManager(args: {
       args: appServerArgs,
       env,
       onLog: args.onLog,
-      onServerRequest: async (method) => {
+      onServerRequest: async (method, params, requestId) => {
+        if (method === "item/tool/requestUserInput" || method === "mcpServer/elicitation/request") {
+          args.onLog?.(`codex app-server server request method=${method} handled=interactive requestId=${String(requestId)}`);
+          return await serverRequestBroker.waitForResponse({ requestId, method, params });
+        }
         args.onLog?.(`codex app-server server request method=${method} handled=safe-fallback`);
         return safeServerRequestResponse(method);
       },
       onNotification: (method, params) => {
-        for (const listener of notificationListeners) {
-          listener(method, params);
+        if (method === "serverRequest/resolved") {
+          const requestId = params && typeof params === "object" && !Array.isArray(params)
+            ? (params as Record<string, unknown>).requestId
+            : null;
+          if (typeof requestId === "string" || typeof requestId === "number") {
+            serverRequestBroker.resolveWithFallback(String(requestId));
+          }
         }
-        args.onNotification?.(method, params);
+        emitNotification(method, params);
       },
     });
   };
@@ -347,6 +374,7 @@ export function createCodexAppServerManager(args: {
 
   const restartClient = async (reason: string): Promise<void> => {
     generation += 1;
+    serverRequestBroker.close();
     const activeClient = client;
     const activeProxy = providerProxy;
     client = null;
@@ -428,6 +456,12 @@ export function createCodexAppServerManager(args: {
       const activeClient = await getClient();
       return await activeClient.request(method, params, timeoutMs);
     },
+    listPendingServerRequests(threadId) {
+      return serverRequestBroker.list(threadId);
+    },
+    respondToServerRequest(requestId, response) {
+      return serverRequestBroker.respond(requestId, response);
+    },
     async relayMcpOauthCallback(path, search) {
       await getClient();
       return await relayMcpOauthCallbackToLocalListener({
@@ -448,6 +482,7 @@ export function createCodexAppServerManager(args: {
       await scheduleRestart(reason);
     },
     async stop() {
+      serverRequestBroker.close();
       const activeClient = client;
       const activeProxy = providerProxy;
       client = null;

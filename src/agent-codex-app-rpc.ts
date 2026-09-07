@@ -231,10 +231,25 @@ async function handleCodexAppRpcMessage(args: {
 
     let result: unknown;
     if (request.action === "request") {
-      result = applyCodexAppRpcOmitRules(
-        request.method,
-        await args.manager.request(request.method, request.params, request.timeoutMs),
-      );
+      const params = recordValue(request.params);
+      if (request.method === "doer/serverRequest/list") {
+        result = {
+          data: args.manager.listPendingServerRequests(
+            typeof params?.threadId === "string" ? params.threadId : null,
+          ),
+        };
+      } else if (request.method === "doer/serverRequest/respond") {
+        const serverRequestId = typeof params?.requestId === "string" ? params.requestId.trim() : "";
+        if (!serverRequestId || !args.manager.respondToServerRequest(serverRequestId, params?.response)) {
+          throw new Error("Codex server request is no longer pending");
+        }
+        result = {};
+      } else {
+        result = applyCodexAppRpcOmitRules(
+          request.method,
+          await args.manager.request(request.method, request.params, request.timeoutMs),
+        );
+      }
     } else if (request.action === "mcp-oauth-callback") {
       result = await args.manager.relayMcpOauthCallback(request.path, request.search);
     } else if (request.action === "mcp-oauth-logout") {

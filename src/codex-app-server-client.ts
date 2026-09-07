@@ -44,7 +44,7 @@ export interface CodexAppServerClientOptions {
   requestTimeoutMs?: number;
   onLog?: (message: string) => void;
   onNotification?: (method: string, params: unknown) => void;
-  onServerRequest?: (method: string, params: unknown) => Promise<unknown>;
+  onServerRequest?: (method: string, params: unknown, requestId: RequestId) => Promise<unknown>;
 }
 
 export class CodexAppServerClient {
@@ -237,7 +237,7 @@ export class CodexAppServerClient {
       if (!this.options.onServerRequest) {
         throw new CodexAppServerRequestError(`Unsupported Codex app-server request: ${method}`, -32601);
       }
-      const result = await this.options.onServerRequest(method, params);
+      const result = await this.options.onServerRequest(method, params, id);
       this.writeMessage({ id, result });
     } catch (error) {
       const requestError = error instanceof CodexAppServerRequestError
