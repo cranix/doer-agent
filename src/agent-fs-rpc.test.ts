@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -97,6 +98,65 @@ test("filesystem RPC lists and reads files outside the workspace but does not de
     assert.match(String(deletion.error), /path escapes workspace root/);
     assert.equal(await readFile(externalFile, "utf8"), "outside workspace");
   } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("filesystem RPC downloads a chunked response into the workspace", async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "doer-fs-download-"));
+  const rpcWorkspaceRoot = path.join(tempRoot, "workspace");
+  const targetPath = path.join("uploads", "large.bin");
+  const payload = Buffer.alloc(4 * 1024 * 1024, 0x5a);
+  const codec = StringCodec();
+  const server = createServer((_request, response) => {
+    response.writeHead(200, {
+      "content-length": String(payload.byteLength),
+      "content-type": "application/octet-stream",
+    });
+    for (let offset = 0; offset < payload.byteLength; offset += 64 * 1024) {
+      response.write(payload.subarray(offset, offset + 64 * 1024));
+    }
+    response.end();
+  });
+
+  await mkdir(rpcWorkspaceRoot);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const serverBaseUrl = `http://127.0.0.1:${address.port}`;
+  let responseData: Uint8Array | undefined;
+  const msg = {
+    data: codec.encode(JSON.stringify({
+      action: "download_file",
+      path: targetPath,
+      downloadPath: "/large.bin",
+    })),
+    respond(data: Uint8Array) {
+      responseData = data;
+      return true;
+    },
+  } as unknown as Msg;
+
+  try {
+    await handleFsRpcMessage({
+      msg,
+      workspaceRoot: rpcWorkspaceRoot,
+      serverBaseUrl,
+      agentId: "agent-1",
+      agentToken: "token",
+      onError: () => undefined,
+    });
+
+    assert.ok(responseData);
+    const result = JSON.parse(codec.decode(responseData)) as Record<string, unknown>;
+    assert.equal(result.ok, true);
+    assert.equal(result.size, payload.byteLength);
+    assert.deepEqual(await readFile(path.join(rpcWorkspaceRoot, targetPath)), payload);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await rm(tempRoot, { recursive: true, force: true });
   }
 });

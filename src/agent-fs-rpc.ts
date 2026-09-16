@@ -322,17 +322,37 @@ async function executeFsRpc(args: {
       const text = await response.text().catch(() => "");
       throw new Error(text || `download failed: ${response.status}`);
     }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    const validationError = validateImageBytes(abs, bytes);
-    if (validationError) {
-      throw new Error(validationError);
-    }
     const parentDir = path.dirname(abs);
     await mkdir(parentDir, { recursive: true });
-    await writeFile(abs, bytes);
+    const temporaryPath = `${abs}.doer-download-${crypto.randomUUID()}.tmp`;
+    try {
+      const handle = await open(temporaryPath, "wx");
+      try {
+        if (!response.body) {
+          throw new Error("download response body is empty");
+        }
+        for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
+          await handle.write(Buffer.from(chunk));
+        }
+      } finally {
+        await handle.close();
+      }
+
+      if (path.extname(abs).toLowerCase() === ".png") {
+        const validationError = validateImageBytes(abs, await readFile(temporaryPath));
+        if (validationError) {
+          throw new Error(validationError);
+        }
+      }
+      await rename(temporaryPath, abs);
+    } catch (error) {
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
     if (abs.endsWith(".skillpkg")) {
+      const skillPackageBytes = await readFile(abs);
       console.log(
-        `[doer-agent] skillpkg downloaded path=${formatPath(abs)} size=${bytes.byteLength} sha256=${sha256Hex(bytes)}`,
+        `[doer-agent] skillpkg downloaded path=${formatPath(abs)} size=${skillPackageBytes.byteLength} sha256=${sha256Hex(skillPackageBytes)}`,
       );
     }
     const entry = await stat(abs);
