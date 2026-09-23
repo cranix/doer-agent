@@ -128,7 +128,6 @@ async function buildCodexAppServerArgs(args: {
     ...(args.settings.codex.serviceTier
       ? buildConfigArg("service_tier", toTomlStringLiteral(args.settings.codex.serviceTier))
       : []),
-    ...buildConfigArg("personality", toTomlStringLiteral(args.settings.general.personality)),
     ...buildConfigArg("approval_policy", toTomlStringLiteral("never")),
     ...buildConfigArg("sandbox_mode", toTomlStringLiteral("danger-full-access")),
     ...buildConfigArg("mcp_oauth_callback_port", String(args.mcpOauthCallbackPort)),
@@ -316,7 +315,7 @@ export function createCodexAppServerManager(args: {
       userId: args.userId,
     });
     args.onLog?.(
-      `starting codex app-server model=${resolveCodexModel(resolved.settings)} reasoningEffort=${resolved.settings.codex.reasoningEffort} personality=${resolved.settings.general.personality} computerUse=${resolved.settings.codex.computerUseEnabled} browserUse=${resolved.settings.codex.browserUseEnabled} mcpServers=${resolved.settings.mcp.servers.filter((server) => server.enabled).length} mcpOauthCallbackPort=${mcpOauthCallbackPort}`,
+      `starting codex app-server model=${resolveCodexModel(resolved.settings)} reasoningEffort=${resolved.settings.codex.reasoningEffort} computerUse=${resolved.settings.codex.computerUseEnabled} browserUse=${resolved.settings.codex.browserUseEnabled} mcpServers=${resolved.settings.mcp.servers.filter((server) => server.enabled).length} mcpOauthCallbackPort=${mcpOauthCallbackPort}`,
     );
     return new CodexAppServerClient({
       cwd: args.workspaceRoot,

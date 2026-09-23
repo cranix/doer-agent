@@ -2,7 +2,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import type { AgentMcpServerConfig, CodexPersonality } from "./agent-settings.js";
+import type { AgentMcpServerConfig } from "./agent-settings.js";
 
 const require = createRequire(import.meta.url);
 const ANSI_RE = /\u001b\[[0-9;]*m/g;
@@ -130,14 +130,12 @@ export function buildManagedCodexArgs(args: {
   imagePaths: string[];
   sessionId: string | null;
   model: string;
-  personality?: CodexPersonality | null;
   modelInstructionsFile?: string | null;
   configOverrides?: string[];
 }): string[] {
   const promptArgs = ["--", args.prompt];
   const fixedArgs = ["--dangerously-bypass-approvals-and-sandbox"];
   const configArgs = [
-    ...(args.personality ? ["--config", `personality=${toTomlStringLiteral(args.personality)}`] : []),
     ...(args.modelInstructionsFile
       ? ["--config", `model_instructions_file=${toTomlStringLiteral(args.modelInstructionsFile)}`]
       : []),
