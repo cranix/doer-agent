@@ -3,6 +3,10 @@ import { test } from "node:test";
 import { generateKeyPairSync, publicEncrypt, createPublicKey, randomBytes, createCipheriv, constants } from "node:crypto";
 import { createServer } from "node:http";
 import net from "node:net";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { BrowserCredentialVault } from "./browser-credential-vault.js";
 import { chromium } from "playwright-core";
 import { BrowserLoginBroker, browserLoginError, decryptLoginCommand } from "./browser-login-broker.js";
 
@@ -25,6 +29,80 @@ test("encrypted login commands bind to the request and single-use screen revisio
   assert.throws(() => decryptLoginCommand(privateKey, "session", "stale-revision", envelope));
   assert.throws(() => decryptLoginCommand(privateKey, "session", "revision", { ...envelope, data: "AAAA" }));
   assert.ok(!browserLoginError(new Error("fill(test-only-secret) failed")).includes("test-only-secret"));
+});
+
+test("saved login management and Chromium automation respect opt-in, form boundaries and handoff exclusivity", { skip: !process.env.DOER_BROWSER_TEST_EXECUTABLE }, async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "doer-saved-login-"));
+  let submitted = "";
+  const server = createServer((req, res) => {
+    res.setHeader("Content-Type", "text/html");
+    if (req.url === "/done") {
+      req.on("data", (chunk) => { submitted += chunk.toString(); });
+      req.on("end", () => res.end("<h1>Signed in</h1>")); return;
+    }
+    const cross = req.url === "/cross", otp = req.url === "/otp", registration = req.url === "/register";
+    res.end(`<form method="post" action="${cross ? "https://example.com" : "/done"}"><input name="email"><input name="password" type="password" ${registration ? 'autocomplete="new-password"' : ""}>${otp ? '<input autocomplete="one-time-code" name="otp">' : ""}<button>Sign in</button></form>`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+  const portServer = net.createServer();
+  await new Promise<void>((resolve) => portServer.listen(0, "127.0.0.1", resolve));
+  const port = (portServer.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => portServer.close(() => resolve()));
+  const browser = await chromium.launch({ executablePath: process.env.DOER_BROWSER_TEST_EXECUTABLE, headless: true, args: [`--remote-debugging-port=${port}`] });
+  const vault = new BrowserCredentialVault(directory);
+  const broker = new BrowserLoginBroker(`http://127.0.0.1:${port}`, 60_000, vault);
+  try {
+    let management = await broker.vaultView();
+    const input = { action: "save", origin: base, username: "test-user", password: "test-password", label: "Fixture", autoLogin: false };
+    const envelope = await encryptBrowserLoginCommand(management.publicKey, management.id, management.revision, input);
+    await broker.vaultCommand(management.id, management.revision, envelope);
+    await assert.rejects(broker.vaultCommand(management.id, management.revision, envelope), /stale/);
+    management = await broker.vaultView();
+    assert.ok(!JSON.stringify(management).includes("test-password"));
+    const account = management.accounts[0];
+    const page = await browser.newPage(); await page.goto(base);
+    const tab = (await broker.tabs()).find((tab) => tab.origin === base)!;
+    assert.equal((await broker.loginSaved(tab.id)).status, "needs_user");
+    assert.equal(await page.locator('[name=password]').inputValue(), "");
+    await vault.save({ ...account, password: "", autoLogin: true });
+    const pending = await broker.request(tab.id);
+    assert.equal((await broker.loginSaved(tab.id)).status, "needs_user");
+    let view = await broker.view(pending.id);
+    await broker.command(view.id, view.revision, await encryptBrowserLoginCommand(view.publicKey, view.id, view.revision, { action: "fillSaved", accountId: account.id, origin: base }));
+    assert.equal(await page.locator('[name=password]').inputValue(), "test-password");
+    assert.ok(!JSON.stringify(await broker.view(pending.id)).includes("test-password"));
+    broker.cancel(pending.id);
+    for (const route of ["/cross", "/otp", "/register"]) {
+      await page.goto(base + route);
+      assert.equal((await broker.loginSaved(tab.id)).status, "needs_user");
+      assert.equal(await page.locator('[name=password]').inputValue(), "");
+    }
+    await page.goto(base);
+    const automatic = await broker.loginSaved(tab.id);
+    assert.equal(automatic.status, "submitted");
+    assert.ok(!JSON.stringify(automatic).includes("test-password"));
+    assert.ok(!JSON.stringify(automatic).includes("test-user"));
+    await page.waitForURL(/\/done/);
+    assert.match(submitted, /email=test-user/); assert.match(submitted, /password=test-password/);
+    await page.goto(base);
+    assert.equal((await broker.loginSaved(tab.id)).status, "needs_user");
+    // Explicit save during handoff updates credentials; normal fill never persists an OTP.
+    const next = await broker.request(tab.id); view = await broker.view(next.id);
+    const username = view.fields.find((field) => field.purpose === "username")!, password = view.fields.find((field) => field.purpose === "password")!;
+    await broker.command(view.id, view.revision, await encryptBrowserLoginCommand(view.publicKey, view.id, view.revision, { action: "fill", origin: base, values: { [username.id]: "test-user", [password.id]: "new-password" }, saveAccount: true, autoLogin: false }));
+    assert.equal((await vault.get(account.id, base)).password, "new-password");
+    await assert.rejects(vault.get(account.id, base, true));
+    await writeFile(path.join(directory, "vault.json"), "damaged vault");
+    view = await broker.view(next.id);
+    assert.equal(view.canSave, false);
+    assert.deepEqual(view.savedAccounts, []);
+    assert.equal(view.fields.length, 2); // One-time handoff still works if saved storage is unavailable.
+  } finally {
+    await broker.close(); await browser.close(); server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("real Chromium handoff: fill, multi-step OTP, replay, navigation, cancel and expiry", { skip: !process.env.DOER_BROWSER_TEST_EXECUTABLE }, async () => {

@@ -1,5 +1,6 @@
 import { generateKeyPairSync, privateDecrypt, createDecipheriv, constants, randomUUID, type KeyObject } from "node:crypto";
 import { LoginTab } from "./browser-login-cdp.js";
+import { BrowserCredentialVault, type SavedBrowserAccount } from "./browser-credential-vault.js";
 
 export class BrowserLoginError extends Error {}
 function fail(message: string): never { throw new BrowserLoginError(message); }
@@ -8,7 +9,7 @@ export function browserLoginError(error: unknown): string {
   return error instanceof BrowserLoginError ? error.message : "Browser operation failed. Refresh the login screen and try again.";
 }
 export type LoginStatus = "waiting" | "completed" | "cancelled" | "expired";
-interface Field { objectId: string; origin: string; type: string; label: string }
+interface Field { objectId: string; origin: string; type: string; label: string; purpose: "username" | "password" | "other" }
 interface LoginSession {
   id: string; tabId: string; origin: string; status: LoginStatus; expiresAt: number;
   page: LoginTab; privateKey: KeyObject | null; publicKey: JsonWebKey;
@@ -48,8 +49,67 @@ function originOf(url: string): string {
 export class BrowserLoginBroker {
   private readonly targets = new Map<string, { origin: string; websocket: string }>();
   private readonly sessions = new Map<string, LoginSession>();
+  private readonly vaultScreens = new Map<string, { privateKey: KeyObject; revision: string; expiresAt: number }>();
+  private readonly automaticTabs = new Set<string>();
+  private readonly attempts = new Map<string, number>();
   private creating = false;
-  constructor(private readonly endpoint = process.env.DOER_BROWSER_CDP_URL || "http://127.0.0.1:9222", private readonly ttlMs = 15 * 60_000) {}
+  constructor(private readonly endpoint = process.env.DOER_BROWSER_CDP_URL || "http://127.0.0.1:9222", private readonly ttlMs = 15 * 60_000, private readonly vault?: BrowserCredentialVault) {}
+
+  private credentialVault() { if (!this.vault) return fail("Saved logins are unavailable. Update the agent."); return this.vault; }
+  async vaultView() {
+    const accounts = await this.credentialVault().list();
+    for (const [id, screen] of this.vaultScreens) if (screen.expiresAt < Date.now() || this.vaultScreens.size >= 8) this.vaultScreens.delete(id);
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const id = randomUUID(), revision = randomUUID();
+    this.vaultScreens.set(id, { privateKey, revision, expiresAt: Date.now() + this.ttlMs });
+    return { id, revision, publicKey: publicKey.export({ format: "jwk" }), accounts };
+  }
+  async vaultCommand(id: string, revision: string, envelope: EncryptedLoginCommand) {
+    const screen = this.vaultScreens.get(id);
+    if (!screen || screen.expiresAt < Date.now() || screen.revision !== revision) fail("Saved logins screen is stale. Refresh and try again.");
+    this.vaultScreens.delete(id);
+    const command = decryptLoginCommand(screen.privateKey, id, revision, envelope);
+    try {
+      if (command.action === "save") await this.credentialVault().save(command);
+      else if (command.action === "delete" && typeof command.accountId === "string") await this.credentialVault().remove(command.accountId);
+      else fail("Unsupported saved login operation.");
+      return { ok: true };
+    } finally { command.password = ""; }
+  }
+  async loginSaved(tabId: string, accountId?: string) {
+    if (this.automaticTabs.has(tabId) || this.list().some((session) => session.tabId === tabId)) return { status: "needs_user", reason: "A login is already in progress. Wait for it to finish." };
+    this.automaticTabs.add(tabId);
+    let page: LoginTab | undefined;
+    let credential: Awaited<ReturnType<BrowserCredentialVault["get"]>> | undefined;
+    try {
+      await this.tabs();
+      const target = this.targets.get(tabId);
+      if (!target) fail("Browser tab is unavailable.");
+      const eligible = (await this.credentialVault().list()).filter((entry) => entry.origin === target.origin && entry.autoLogin);
+      const account = accountId ? eligible.find((entry) => entry.id === accountId) : eligible.length === 1 ? eligible[0] : undefined;
+      if (!account) return { status: "needs_user", reason: eligible.length > 1 ? "Multiple accounts. Ask the user which saved account to use." : "No permitted saved account for this exact site.", accounts: eligible.map(({ id, label, origin }) => ({ id, label, origin })) };
+      const attemptKey = `${tabId}:${account.id}:${account.updatedAt}`;
+      for (const [key, time] of this.attempts) if (Date.now() - time > 5 * 60_000) this.attempts.delete(key);
+      if (this.attempts.has(attemptKey) || this.attempts.size >= 128) return { status: "needs_user", reason: "Already attempted this account. Use a human handoff instead of retrying." };
+      page = await LoginTab.connect(target.websocket);
+      const snapshot = await page.snapshot(false);
+      const usernames = snapshot.fields.filter((field) => field.purpose === "username");
+      const passwords = snapshot.fields.filter((field) => field.purpose === "password");
+      if (snapshot.origin !== target.origin || snapshot.fields.length !== 2 || usernames.length !== 1 || passwords.length !== 1 || !await page.canAutoSubmit(passwords[0].objectId, usernames[0].objectId, target.origin)) return { status: "needs_user", reason: "Login form needs human input (additional verification, multi-step or unsupported form)." };
+      const username = usernames[0], password = passwords[0];
+      credential = await this.credentialVault().get(account.id, target.origin, true);
+      this.attempts.set(attemptKey, Date.now());
+      let submitted = false;
+      try {
+        if (!await page.fill(username.objectId, target.origin, credential.username) || !await page.fill(password.objectId, target.origin, credential.password)) fail("Login destination changed. Use a human handoff.");
+        submitted = await page.autoSubmit(password.objectId, username.objectId, target.origin);
+        return { status: submitted ? "submitted" : "needs_user", origin: target.origin, accountId: account.id,
+          next: "Verify the intended account is signed in. Submission is not proof of login. If authentication, CAPTCHA or a different account is needed, request a human handoff; never retry the password." };
+      } finally {
+        if (!submitted) for (const field of [username, password]) await page.onObject(field.objectId, "function(){if(this.isConnected)this.value=''}").catch(() => undefined);
+      }
+    } finally { if (credential) credential.password = ""; page?.close(); this.automaticTabs.delete(tabId); }
+  }
 
   async tabs() {
     const url = new URL(this.endpoint);
@@ -77,6 +137,7 @@ export class BrowserLoginBroker {
   list() { return [...this.sessions.values()].map((session) => this.summary(session)).filter((session) => session.status === "waiting"); }
   status(id: string) { return this.summary(this.get(id, false)); }
   async request(tabId: string) {
+    if (this.automaticTabs.has(tabId)) fail("A saved login is in progress. Try again shortly.");
     if (this.creating) fail("Another login request is being created. Try again.");
     this.creating = true;
     try {
@@ -144,12 +205,18 @@ export class BrowserLoginBroker {
       session.width = snapshot.width; session.height = snapshot.height;
       const fields = snapshot.fields.map((field) => {
         const id = randomUUID(); session.fields.set(id, field);
-        return { id, label: field.label, type: field.type, origin: field.origin };
+        return { id, label: field.label, type: field.type, origin: field.origin, purpose: field.purpose };
       });
       this.get(id);
       if (snapshot.screenshot.length > 800_000) fail("Browser preview is too large. Reduce the browser window size.");
+      let savedAccounts: SavedBrowserAccount[] = [], canSave = false;
+      if (this.vault) {
+        try { savedAccounts = (await this.vault.list()).filter((account) => account.origin === origin); canSave = true; }
+        catch { /* A damaged/unavailable vault must not prevent one-time human input. */ }
+      }
+      this.get(id);
       session.revision = randomUUID();
-      return { ...this.summary(session), currentOrigin: origin, revision: session.revision, publicKey: session.publicKey,
+      return { ...this.summary(session), currentOrigin: origin, revision: session.revision, publicKey: session.publicKey, savedAccounts, canSave,
         fields, screenshot: snapshot.screenshot, width: snapshot.width, height: snapshot.height };
     } finally { session.busy = false; }
   }
@@ -173,6 +240,16 @@ export class BrowserLoginBroker {
         for (const [fieldId, value] of entries) {
           if (!session.fields.has(fieldId) || typeof value !== "string" || value.length > 4096) fail("Invalid login input.");
         }
+        let save: Record<string, unknown> | undefined;
+        if (command.saveAccount === true) {
+          const usernames = [...session.fields.entries()].filter(([, field]) => field.purpose === "username");
+          const passwords = [...session.fields.entries()].filter(([, field]) => field.purpose === "password");
+          if (usernames.length !== 1 || passwords.length !== 1) fail("Select a username and password in saved login management.");
+          const username = (values as Record<string, unknown>)[usernames[0][0]], password = (values as Record<string, unknown>)[passwords[0][0]];
+          if (typeof username !== "string" || !username || typeof password !== "string" || !password) fail("Enter both username and password to save this account.");
+          const previous = (await this.credentialVault().list()).find((account) => account.origin === origin && account.username === username);
+          save = { id: previous?.id, origin, username, password, label: previous?.label || "", autoLogin: command.autoLogin === true };
+        }
         for (const [fieldId, value] of entries) {
           this.get(id);
           const field = session.fields.get(fieldId)!;
@@ -183,6 +260,18 @@ export class BrowserLoginBroker {
           if (!written) fail("Input destination changed or uses another site. Refresh and review the page.");
           (values as Record<string, unknown>)[fieldId] = "";
         }
+        if (save) { try { await this.credentialVault().save(save); } finally { save.password = ""; } }
+      } else if (command.action === "fillSaved") {
+        const usernames = [...session.fields.values()].filter((field) => field.purpose === "username");
+        const passwords = [...session.fields.values()].filter((field) => field.purpose === "password");
+        if (typeof command.accountId !== "string" || usernames.length !== 1 || passwords.length !== 1) fail("Saved input requires username and password fields.");
+        const account = await this.credentialVault().get(command.accountId, origin);
+        try {
+          for (const [field, value] of [[usernames[0], account.username], [passwords[0], account.password]] as const) {
+            if (!await session.page.fill(field.objectId, field.origin, value)) fail("Input destination changed. Refresh and review the page.");
+            session.touched.add(field.objectId);
+          }
+        } finally { account.password = ""; }
       } else if (command.action === "click") {
         const { x, y } = command;
         const size = { width: session.width, height: session.height };
@@ -199,6 +288,7 @@ export class BrowserLoginBroker {
     } finally { session.busy = false; }
   }
   async close() {
+    this.vaultScreens.clear();
     for (const session of this.sessions.values()) if (session.status === "waiting") this.finish(session, "cancelled");
   }
 }

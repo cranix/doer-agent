@@ -18,10 +18,14 @@ async function call(operation: string, params: Record<string, unknown> = {}) {
   if (!response.ok) throw new Error("Browser login service is unavailable. Do not request credentials in chat.");
   return await response.json() as Record<string, unknown>;
 }
-const instructions = "When a browser task needs login, use browser_login_request for its tab. Ask the user to open the Doer Browser login panel. Stop all browser actions, screenshots, shell/CDP inspection of that tab while waiting; keep using browser_login_wait until completed/cancelled/expired. Never ask for passwords or OTPs in chat or pass them to tools. After completed, verify the intended account is signed in before continuing. Completion means the user finished, not proof of authentication.";
+const instructions = "When a browser task needs login, first use browser_login_saved for its login tab. It only uses accounts the user explicitly allowed for automatic login on that exact site. Never read passwords from disk, the keychain or page inputs. After submitted, verify the intended account is signed in; never retry a failed password. If there is no permitted account, an unsupported form, CAPTCHA or extra authentication, use browser_login_request. Ask the user to open the Doer Browser login panel. Stop all browser actions, screenshots, shell/CDP inspection of that tab while waiting; keep using browser_login_wait until completed/cancelled/expired. Never ask for passwords or OTPs in chat or pass them to tools. After completed, verify the intended account is signed in before continuing. Completion means the user finished, not proof of authentication.";
 const server = new McpServer({ name: "doer-browser", version: "0.1.0" }, { instructions });
 function result(value: unknown) { return { content: [{ type: "text" as const, text: JSON.stringify(value) }] }; }
 server.registerTool("browser_login_tabs", { description: "List local Chromium tab IDs and origins for login handoff. No page contents or credentials.", inputSchema: {} }, async () => result(await call("tabs")));
+server.registerTool("browser_login_saved", {
+  description: "Attempt one login using an account saved on this agent and explicitly permitted for automatic login at this exact origin. Passwords never appear in tool results. Only unambiguous username/password POST forms with a login button are supported. On needs_user, request a human handoff. On submitted, verify authentication; never retry a failed password. Do not use on a tab with a pending human handoff.",
+  inputSchema: { tabId: z.string().min(1), accountId: z.string().optional().describe("Use only an account ID returned by this tool, chosen by the user when there are multiple accounts.") },
+}, async ({ tabId, accountId }) => result(await call("login-saved", { tabId, accountId })));
 server.registerTool("browser_login_request", {
   description: instructions,
   inputSchema: { tabId: z.string().min(1).describe("Existing Chromium tab ID from browser_login_tabs.") },

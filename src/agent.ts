@@ -51,6 +51,7 @@ import {
   publishNatsBestEffort,
 } from "./agent-runtime-io.js";
 import { handleSettingsRpcMessage } from "./agent-settings-rpc.js";
+import { configureBrowserLoginBroker } from "./browser-login-rpc.js";
 
 interface AgentNatsBootstrapResponse {
   servers?: unknown;
@@ -344,6 +345,7 @@ async function main() {
     if (!initialAgentId) {
       throw new Error("agent id missing from bootstrap");
     }
+    await configureBrowserLoginBroker(serverBaseUrl, userId, initialAgentId);
 
     if (codexAppServerManagerState?.agentId !== initialAgentId) {
       await codexAppServerManagerState?.manager.stop();
