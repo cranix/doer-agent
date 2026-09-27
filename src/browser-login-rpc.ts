@@ -21,6 +21,10 @@ export async function handleBrowserLoginRpc(params: unknown): Promise<unknown> {
       case "tabs": return { tabs: await broker.tabs() };
       case "list": return { requests: broker.list() };
       case "request": return await broker.request(typeof p.tabId === "string" ? p.tabId : "");
+      case "handoff-request": return await broker.request(typeof p.tabId === "string" ? p.tabId : "", p.kind === "login" ? "login" : "control", typeof p.reason === "string" ? p.reason : "");
+      case "open-tab": return await broker.openTab(typeof p.url === "string" ? p.url : "");
+      case "control-view": return await broker.controlView(typeof p.tabId === "string" ? p.tabId : "");
+      case "control-action": return await broker.controlAction(typeof p.tabId === "string" ? p.tabId : "", typeof p.revision === "string" ? p.revision : "", p.command && typeof p.command === "object" ? p.command as Record<string, unknown> : {});
       case "status": return broker.status(id);
       case "cancel": return broker.cancel(id);
       case "view": return await broker.view(id);

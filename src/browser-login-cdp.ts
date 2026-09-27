@@ -1,4 +1,15 @@
 import WebSocket from "ws";
+import { browserUrl } from "./browser-control-actions.js";
+
+// Classification is evaluated again in the browser immediately before agent input.
+const sensitiveInput = `(input)=>{
+  const autocomplete=(input.autocomplete||'').toLowerCase();
+  const identity=[input.name,input.id,input.getAttribute('aria-label')].join(' ');
+  const form=input.form||document;
+  return input.type==='password'||/password|one-time-code|username|cc-/.test(autocomplete)||
+    /password|passwd|otp|totp|token|secret|verification|captcha|cardnumber|cvv|cvc|비밀번호|인증번호|보안코드/i.test(identity)||/(^|[ _-])pw([ _-]|$)/i.test(identity)||
+    !!form.querySelector('input[type=password],input[autocomplete="current-password"],input[autocomplete="new-password"],input[name="pw"],input[name="passwd"],input[name="password"]');
+}`;
 
 // A single tab connection. Never enable Network, tracing or console event capture.
 export class LoginTab {
@@ -50,30 +61,34 @@ export class LoginTab {
     if (response.exceptionDetails) throw new Error("Browser evaluation failed");
     return response.result.value;
   }
-  async snapshot(capturePreview = true) {
+  async snapshot(capturePreview = true, mode: "login" | "control" = "login") {
     const { frameTree } = await this.call("Page.getFrameTree");
     const { executionContextId: contextId } = await this.call("Page.createIsolatedWorld", { frameId: frameTree.frame.id, worldName: "doer-login" });
     const origin = new URL(frameTree.frame.url).origin;
     const documentId = await this.evaluate<string>("document.documentElement", contextId, false);
-    const metadata = await this.evaluate<Array<{ index: number; type: string; label: string; purpose: "username" | "password" | "other" }>>(`Array.from(document.querySelectorAll('input')).map((input,index)=>({input,index})).filter(({input})=>!['hidden','submit','button','checkbox','radio','file'].includes(input.type)&&!input.disabled&&!input.readOnly&&input.getBoundingClientRect().width>0&&input.getBoundingClientRect().height>0&&getComputedStyle(input).visibility!=='hidden').slice(0,20).map(({input,index})=>{
+    const metadata = await this.evaluate<Array<{ index: number; type: string; label: string; purpose: "username" | "password" | "other"; sensitive: boolean }>>(`Array.from(document.querySelectorAll('input,textarea')).map((input,index)=>({input,index})).filter(({input})=>!['hidden','submit','button','checkbox','radio','file'].includes(input.type)&&!input.disabled&&!input.readOnly&&input.getBoundingClientRect().width>0&&input.getBoundingClientRect().height>0&&getComputedStyle(input).visibility!=='hidden').slice(0,20).map(({input,index})=>{
       const autocomplete=(input.autocomplete||'').split(/\\s+/), names=[input.name,input.id];
       let purpose='other';
       if(!autocomplete.includes('one-time-code')&&!autocomplete.includes('new-password')) {
         if(input.type==='password'||autocomplete.includes('current-password')||names.some(n=>/^(pw|passwd|password)$/i.test(n))) purpose='password';
         else if(autocomplete.includes('username')||input.type==='email'||names.some(n=>/^(id|email|username|user_name|userid|user_id|loginid|login_id)$/i.test(n))) purpose='username';
       }
-      return {index,type:input.type,purpose,label:(input.labels?.[0]?.textContent||input.getAttribute('aria-label')||input.placeholder||input.name||input.type).slice(0,100)};
+      return {index,type:input.type,sensitive:(${sensitiveInput})(input),purpose,label:(input.labels?.[0]?.textContent||input.getAttribute('aria-label')||input.placeholder||input.name||input.type).slice(0,100)};
     })`, contextId);
     const fields = [];
     for (const field of metadata) {
-      const objectId = await this.evaluate<string>(`document.querySelectorAll('input')[${field.index}]`, contextId, false);
+      const objectId = await this.evaluate<string>(`document.querySelectorAll('input,textarea')[${field.index}]`, contextId, false);
       fields.push({ ...field, objectId, origin });
     }
+    const pageInfo = await this.evaluate<{ title: string; address: string }>("({title:document.title.slice(0,200),address:location.origin+location.pathname})", contextId);
+    const history = await this.call("Page.getNavigationHistory");
+    const canNavigate = (offset: number) => { try { browserUrl(history.entries[history.currentIndex + offset]?.url); return true; } catch { return false; } };
+    const navigation = { canGoBack: canNavigate(-1), canGoForward: canNavigate(1) };
     const size = await this.evaluate<{ width: number; height: number }>("({width:innerWidth,height:innerHeight})", contextId);
-    if (!capturePreview) return { origin, documentId, contextId, fields, screenshot: "", ...size };
-    // Opaque covers hide all input fields and embedded frames, not just password-type fields.
+    if (!capturePreview) return { origin, documentId, contextId, fields, screenshot: "", ...size, ...pageInfo, ...navigation };
+    // Login mode masks all inputs; general control masks sensitive inputs and embedded frames.
     // Covers exist only during capture, and are removed in finally even if capture fails.
-    const coverId = await this.evaluate<string>(`(()=>{const host=document.createElement('div');host.style.cssText='position:fixed;inset:0;z-index:2147483647;pointer-events:none';const shadow=host.attachShadow({mode:'closed'});for(const input of document.querySelectorAll('input,iframe')){const r=input.getBoundingClientRect();if(!r.width||!r.height)continue;const cover=document.createElement('div');cover.style.cssText='position:fixed;background:#d4d4d8;left:'+r.left+'px;top:'+r.top+'px;width:'+r.width+'px;height:'+r.height+'px';shadow.appendChild(cover)}document.documentElement.appendChild(host);return host})()`, contextId, false);
+    const coverId = await this.evaluate<string>(`(()=>{const host=document.createElement('div');host.style.cssText='position:fixed;inset:0;z-index:2147483647;pointer-events:none';const shadow=host.attachShadow({mode:'closed'});for(const input of document.querySelectorAll('input,textarea,iframe')){if(${mode === 'login' ? 'false' : 'true'}&&input.tagName!=='IFRAME'&&!(${sensitiveInput})(input))continue;const r=input.getBoundingClientRect();if(!r.width||!r.height)continue;const cover=document.createElement('div');cover.style.cssText='position:fixed;background:#d4d4d8;left:'+r.left+'px;top:'+r.top+'px;width:'+r.width+'px;height:'+r.height+'px';shadow.appendChild(cover)}document.documentElement.appendChild(host);return host})()`, contextId, false);
     let screenshot: string;
     try {
       screenshot = (await this.call("Page.captureScreenshot", { format: "jpeg", quality: 45, captureBeyondViewport: false })).data;
@@ -82,16 +97,17 @@ export class LoginTab {
       await this.call("Runtime.releaseObject", { objectId: coverId }).catch(() => undefined);
     }
     if (!await this.onObject<boolean>(documentId, "function(){return this.isConnected}").catch(() => false)) throw new Error("Page changed");
-    return { origin, documentId, contextId, fields, screenshot, ...size };
+    return { origin, documentId, contextId, fields, screenshot, ...size, ...pageInfo, ...navigation };
   }
-  async fill(objectId: string, origin: string, value: string) {
+  async fill(objectId: string, origin: string, value: string, allowSensitive = true) {
     return this.onObject<boolean>(objectId, `function(input){
       if(!this.isConnected||this.ownerDocument.location.origin!==input.origin||this.disabled||this.readOnly)return false;
+      if(!input.allowSensitive&&(${sensitiveInput})(this))return false;
       if(this.form&&new URL(this.form.action||location.href,location.href).origin!==input.origin)return false;
-      const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+      const setter=Object.getOwnPropertyDescriptor(this.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype,'value')?.set;
       if(!setter)return false;setter.call(this,input.value);
       this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}));return true;
-    }`, [{ origin, value }]);
+    }`, [{ origin, value, allowSensitive }]);
   }
   async canAutoSubmit(passwordId: string, usernameId: string, origin: string) {
     const result = await this.call("Runtime.callFunctionOn", { objectId: passwordId,
@@ -119,7 +135,7 @@ export class LoginTab {
     await this.call("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
   }
   async key(key: string) {
-    const codes: Record<string, number> = { Tab: 9, Enter: 13, Escape: 27, ArrowDown: 40, ArrowUp: 38 };
+    const codes: Record<string, number> = { Tab: 9, Enter: 13, Escape: 27, ArrowDown: 40, ArrowUp: 38, ArrowLeft: 37, ArrowRight: 39, PageDown: 34, PageUp: 33, Home: 36, End: 35, Backspace: 8 };
     const actual = key === "Shift+Tab" ? "Tab" : key;
     const params = { key: actual, code: actual, windowsVirtualKeyCode: codes[actual], modifiers: key === "Shift+Tab" ? 8 : 0 };
     await this.call("Input.dispatchKeyEvent", { ...params, type: "keyDown", ...(actual === "Enter" ? { text: "\r" } : {}) });

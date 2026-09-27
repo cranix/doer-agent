@@ -179,3 +179,90 @@ test("real Chromium handoff: fill, multi-step OTP, replay, navigation, cancel an
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test("general browser control: ordinary input, navigation, secure boundaries and exclusive human handoff", { skip: !process.env.DOER_BROWSER_TEST_EXECUTABLE }, async () => {
+  const server = createServer((req, res) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    if (req.url === "/login") return res.end('<title>Secure fixture</title><form><label>User<input name="username" autocomplete="username"></label><label>Secret<input id="secret" name="password" type="text"></label><button>Sign in</button></form>');
+    res.end(`<title>Control fixture</title><h1>${req.url === "/next" ? "Next page" : "First page"}</h1><form><label>Search<input name="search"></label><label>Note<textarea name="note"></textarea></label><button type="button" onclick="document.querySelector('h1').textContent='Clicked'">Choose</button></form><div style="height:1500px">Scroll content</div>`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+  const portServer = net.createServer();
+  await new Promise<void>((resolve) => portServer.listen(0, "127.0.0.1", resolve));
+  const port = (portServer.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => portServer.close(() => resolve()));
+  const browser = await chromium.launch({ executablePath: process.env.DOER_BROWSER_TEST_EXECUTABLE, headless: true, args: [`--remote-debugging-port=${port}`] });
+  const broker = new BrowserLoginBroker(`http://127.0.0.1:${port}`);
+  try {
+    const page = await browser.newPage(); await page.goto(base);
+    const tab = (await broker.tabs()).find((tab) => tab.origin === base)!;
+    let view = await broker.controlView(tab.id);
+    assert.equal(view.title, "Control fixture");
+    assert.ok(view.fields.every((field) => !field.sensitive));
+    const search = view.fields.find((field) => field.label === "Search")!;
+    await broker.controlAction(tab.id, view.revision, { action: "fill", fieldId: search.id, text: "ordinary search" });
+    assert.equal(await page.locator('[name=search]').inputValue(), "ordinary search");
+    await assert.rejects(broker.controlAction(tab.id, view.revision, { action: "reload" }), /stale/);
+    view = await broker.controlView(tab.id);
+    await broker.controlAction(tab.id, view.revision, { action: "fill", fieldId: view.fields.find((field) => field.type === "textarea")!.id, text: "line one\nline two" });
+    assert.equal(await page.locator("textarea").inputValue(), "line one\nline two");
+    // Human control invalidates agent snapshots and blocks actions/saved login on that tab.
+    view = await broker.controlView(tab.id);
+    const human = await broker.request(tab.id, "control", "Choose the desired option");
+    assert.equal(human.kind, "control"); assert.equal(human.reason, "Choose the desired option");
+    await assert.rejects(broker.controlView(tab.id), /user control/);
+    await assert.rejects(broker.controlAction(tab.id, view.revision, { action: "reload" }), /user control/);
+    assert.equal((await broker.loginSaved(tab.id)).status, "needs_user");
+    let humanView = await broker.view(human.id);
+    const ordinary = humanView.fields.find((field) => field.label === "Search")!;
+    assert.equal(ordinary.sensitive, false);
+    await broker.command(human.id, humanView.revision, await encryptBrowserLoginCommand(humanView.publicKey, human.id, humanView.revision, { action: "fill", origin: base, values: { [ordinary.id]: "human choice" } }));
+    humanView = await broker.view(human.id);
+    await broker.command(human.id, humanView.revision, await encryptBrowserLoginCommand(humanView.publicKey, human.id, humanView.revision, { action: "complete" }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(await page.locator('[name=search]').inputValue(), "human choice"); // Normal work is not erased on return.
+    assert.equal(broker.status(human.id).status, "completed");
+    view = await broker.controlView(tab.id);
+    await broker.controlAction(tab.id, view.revision, { action: "navigate", url: base + "/next" });
+    await page.waitForURL(base + "/next");
+    view = await broker.controlView(tab.id);
+    await broker.controlAction(tab.id, view.revision, { action: "back" }); await page.waitForURL(base + "/");
+    view = await broker.controlView(tab.id);
+    await broker.controlAction(tab.id, view.revision, { action: "forward" }); await page.waitForURL(base + "/next");
+    view = await broker.controlView(tab.id);
+    await broker.controlAction(tab.id, view.revision, { action: "scroll", delta: 500 });
+    await page.waitForFunction(() => scrollY > 0);
+    // Navigation after a snapshot cannot retarget a normal fill to a replacement document.
+    view = await broker.controlView(tab.id);
+    await page.goto(base + "/login");
+    await assert.rejects(broker.controlAction(tab.id, view.revision, { action: "fill", fieldId: view.fields[0].id, text: "must not write" }), /Page changed/);
+    view = await broker.controlView(tab.id);
+    assert.ok(view.fields.every((field) => field.sensitive));
+    const hidden = view.fields.find((field) => field.label === "Secret")!;
+    await assert.rejects(broker.controlAction(tab.id, view.revision, { action: "fill", fieldId: hidden.id, text: "must not write" }), /Sensitive/);
+    assert.equal(await page.locator("#secret").inputValue(), "");
+    await page.locator("#secret").evaluate((element) => { (element as HTMLInputElement).value = "visible-secret-one"; });
+    const redactedOne = await broker.controlView(tab.id);
+    await page.locator("#secret").evaluate((element) => { (element as HTMLInputElement).value = "a-very-different-visible-secret-two"; });
+    const redactedTwo = await broker.controlView(tab.id);
+    assert.equal(redactedOne.screenshot, redactedTwo.screenshot); // Even a visible-password field is actually masked in the image.
+    assert.ok(!JSON.stringify(redactedTwo).includes("visible-secret"));
+    // Changing an ordinary field to a sensitive one after capture is checked atomically on fill.
+    await page.goto(base); view = await broker.controlView(tab.id);
+    await page.locator('[name=search]').evaluate((element) => { element.setAttribute("autocomplete", "one-time-code"); });
+    await assert.rejects(broker.controlAction(tab.id, view.revision, { action: "fill", fieldId: view.fields[0].id, text: "123456" }), /secure input/);
+    assert.equal(await page.locator('[name=search]').inputValue(), "");
+    for (const url of ["javascript:alert(1)", "file:///etc/passwd", "https://user:secret@example.com", "data:text/html,test"]) await assert.rejects(broker.openTab(url));
+    const opened = await broker.openTab(base + "/next");
+    assert.ok((await broker.tabs()).some((tab) => tab.id === opened.tabId));
+    const second = await broker.request(tab.id, "control");
+    humanView = await broker.view(second.id);
+    await broker.command(second.id, humanView.revision, await encryptBrowserLoginCommand(humanView.publicKey, second.id, humanView.revision, { action: "navigate", origin: base, url: base + "/next" }));
+    await page.waitForURL(base + "/next");
+    broker.cancel(second.id);
+  } finally {
+    await broker.close(); await browser.close(); server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

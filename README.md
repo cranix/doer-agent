@@ -146,14 +146,30 @@ curl -X POST 'http://localhost:2020/api/users/<userId>/agent/secret' \
 - Playwright MCP 프록시는 에이전트 상태 디렉터리(`~/.doer-agent`) 아래 소켓을 사용합니다.
 - 이 저장소에는 예전 README에 있던 `scripts/build.sh`, `scripts/publish.sh`, `docker-compose.dev.yml`이 없습니다. 현재 문서는 실제 파일 구조 기준으로 정리되어 있습니다.
 
-## Browser login and saved accounts
+## Browser control, human handoff and saved accounts
 
-The built-in `doer_browser` MCP server can hand an existing Chromium tab to the
-signed-in Doer user. In Doer, select the same agent and open **Browser login**.
-The user can fill top-level login fields, click an updated browser preview, use
-Tab/Enter, and finish additional authentication from their phone. Click **Confirm
-login · Resume** only after checking the intended account. The waiting agent must
-then verify authentication before continuing the original task.
+The built-in `doer_browser` MCP server controls the existing Chromium browser.
+In Doer, select the same agent and open **Browser control**. Tabs load automatically;
+select one or open a new tab, navigate by address, go back/forward, reload, click,
+scroll and fill ordinary inputs/textareas. User commands are encrypted in transit.
+Sensitive fields use masked secure input; saved accounts remain a separate tab.
+
+The agent can use `browser_tabs`, `browser_open`, `browser_snapshot` and
+`browser_action` for ordinary browsing. Snapshots return a masked image, input
+field IDs and a single-use revision (60-second validity); actions bind to the same
+document. Ordinary fill cannot write recognized password, OTP or other sensitive
+fields, including fields that become sensitive after the snapshot. Treat all page
+content as untrusted. No general JavaScript evaluation tool is exposed.
+
+For a user choice, authentication, or unsupported control, the agent calls
+`browser_handoff_request` with a reason and waits using `browser_handoff_wait`.
+The default `control` mode supports ordinary page work; `login` mode masks every
+input. While a handoff is pending, this broker blocks all agent snapshots/actions
+and saved-login attempts on that tab. The user returns control using **Finish
+control · Resume**; the agent must verify the outcome before resuming. Ordinary
+input remains in the page; secure input is cleared best-effort on completion.
+Legacy `browser_login_tabs/request/wait` tools and `/browser-login` API routes
+remain compatible. New tools/UI use `/browser-control`.
 
 Requirements:
 
@@ -168,7 +184,8 @@ Requirements:
 - The Mac and doer-agent remain running. This does not unlock macOS/Keychain or
   automate Touch ID, device-bound passkeys, or OS-level authentication dialogs.
 
-Tools: `browser_login_tabs`, `browser_login_saved`, `browser_login_request`, `browser_login_wait`.
+Login remains a capability within browser control: `browser_login_saved` uses
+only a saved account permitted by the user for that exact login origin.
 When login is needed, first try `browser_login_saved` on the login tab. It only
 uses accounts explicitly enabled for automatic login at that exact origin.
 Unambiguous, top-level username/password POST forms with a login submit button
@@ -183,7 +200,7 @@ and are discarded on process restart. Cancel/expiry must not resume authenticate
 work. A disconnected tab cancels its request. Login need is identified by the
 calling agent; there is no background login watcher.
 
-In **Browser login → Saved logins**, users can add an account, edit its username
+In **Browser control → Saved logins**, users can add an account, edit its username
 or replace its password, delete it, and enable/disable automatic login. A blank
 password on edit keeps the existing password; passwords are never read back to
 the UI. To change a login origin, create a new account. During a human handoff,
@@ -210,20 +227,21 @@ Security boundaries:
   input. This is not protection against a compromised web client/server replacing
   the delivered code or public key.
 - The broker checks the exact document and origin before input; cross-origin form
-  submissions are rejected. Only top-level HTML input fields are supported in this
-  first version. Embedded frames are masked in previews; use a top-level provider
+  submissions are rejected. Only top-level HTML inputs and textareas are supported. Embedded frames are masked in previews; use a top-level provider
   login tab if the site offers one. Popups require a separate handoff for that tab.
 - Credentials are persisted only after explicit user choice. There is no screenshot
   file, trace, page console capture or secret in model tool results. Browser login sessions remain in the existing
   Chrome profile, following that site's rules. Inputs filled by the broker are
   cleared best-effort when a request ends; JavaScript/Node strings cannot provide
-  guaranteed memory zeroization. Screenshots are available only to the user and
-  can still contain sensitive page content outside masked input/frame elements.
+  guaranteed memory zeroization. Human-handoff screenshots are available only to the user. Agent snapshots
+  outside handoff may contain private page content beyond the masked inputs and
+  frames; masking is not a general content-redaction boundary.
 - **This is an application-level handoff, not an OS sandbox.** The current
   unrestricted agent shell, independent browser MCP tools, or another process
   running as the same Mac user can bypass it or inspect Chrome. Pausing other
   tools is cooperative. Strong isolation requires a separate restricted browser
-  service/account or VM with exclusive CDP ownership. The vault key is on the same
+  service/account or VM with exclusive CDP ownership. Broker-level exclusion does
+  not stop another browser tool or an unrestricted same-user shell. The vault key is on the same
   computer as the encrypted file; encryption protects against accidental plaintext
   exposure, not compromise of that OS account. The saved-login tool is a controlled
   capability and does not return passwords, but unrestricted shell/CDP access can
