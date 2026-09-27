@@ -246,7 +246,7 @@ test("general browser control: ordinary input, navigation, secure boundaries and
     const redactedOne = await broker.controlView(tab.id);
     await page.locator("#secret").evaluate((element) => { (element as HTMLInputElement).value = "a-very-different-visible-secret-two"; });
     const redactedTwo = await broker.controlView(tab.id);
-    assert.equal(redactedOne.screenshot, redactedTwo.screenshot); // Even a visible-password field is actually masked in the image.
+    assert.ok(redactedOne.screenshot === redactedTwo.screenshot, "Sensitive values must not change masked screenshot pixels");
     assert.ok(!JSON.stringify(redactedTwo).includes("visible-secret"));
     // Changing an ordinary field to a sensitive one after capture is checked atomically on fill.
     await page.goto(base); view = await broker.controlView(tab.id);
