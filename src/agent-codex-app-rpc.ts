@@ -1,3 +1,4 @@
+import { handleBrowserLoginRpc } from "./browser-login-rpc.js";
 import { StringCodec, type Msg, type NatsConnection } from "nats";
 import type { CodexAppServerManager } from "./codex-app-server-manager.js";
 import {
@@ -110,6 +111,10 @@ function normalizeCodexAppRpcRequest(args: {
   agentId: string;
 }): {
   requestId: string;
+  action: "browser-login";
+  params: unknown;
+} | {
+  requestId: string;
   action: "request";
   method: string;
   params: unknown;
@@ -154,6 +159,7 @@ function normalizeCodexAppRpcRequest(args: {
   if (!requestId || !requestAgentId || requestAgentId !== args.agentId) {
     throw new Error("invalid codex app rpc request");
   }
+  if (actionRaw === "browser-login") return { requestId, action: "browser-login", params: args.request.params };
   if (actionRaw === "mcp-oauth-callback") {
     const path = typeof args.request.path === "string" ? args.request.path.trim() : "";
     const search = typeof args.request.search === "string" ? args.request.search.trim() : "";
@@ -230,7 +236,9 @@ async function handleCodexAppRpcMessage(args: {
     requestId = request.requestId;
 
     let result: unknown;
-    if (request.action === "request") {
+    if (request.action === "browser-login") {
+      result = await handleBrowserLoginRpc(request.params);
+    } else if (request.action === "request") {
       const params = recordValue(request.params);
       if (request.method === "doer/serverRequest/list") {
         result = {

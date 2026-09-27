@@ -218,9 +218,23 @@ export function buildMobileMcpConfigArgs(args: {
   });
 }
 
+export function buildBrowserMcpConfigArgs(args: {
+  agentId: string; agentProjectDir: string; agentToken: string;
+  serverBaseUrl: string; userId: string; workspaceRoot: string;
+}): string[] {
+  return buildWorkspaceMcpConfigArgs({
+    agentProjectDir: args.agentProjectDir, workspaceRoot: args.workspaceRoot,
+    serverName: "doer_browser", distEntryRelativePath: path.join("dist", "browser-mcp-server.js"),
+    srcEntryRelativePath: path.join("src", "browser-mcp-server.ts"),
+    workspaceRootEnvName: "DOER_BROWSER_WORKSPACE_ROOT",
+    env: { DOER_BROWSER_SERVER_BASE_URL: args.serverBaseUrl, DOER_BROWSER_USER_ID: args.userId,
+      DOER_BROWSER_AGENT_ID: args.agentId, DOER_AGENT_TOKEN: args.agentToken },
+  });
+}
+
 export function buildCustomMcpConfigArgs(servers: AgentMcpServerConfig[]): string[] {
   const configArgs: string[] = [];
-  const reservedNames = new Set(["doer_daemon", "doer_mobile", "doer_threads"]);
+  const reservedNames = new Set(["doer_daemon", "doer_mobile", "doer_threads", "doer_browser"]);
   const seenNames = new Set<string>();
   for (const server of servers) {
     const serverName = server.name.trim();

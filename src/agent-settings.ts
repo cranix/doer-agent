@@ -319,7 +319,7 @@ function normalizeMcpServerName(value: unknown): string | null {
   if (!trimmed || !/^[A-Za-z0-9_-]+$/.test(trimmed)) {
     return null;
   }
-  if (trimmed === "doer_daemon" || trimmed === "doer_mobile" || trimmed === "doer_threads") {
+  if (trimmed === "doer_daemon" || trimmed === "doer_mobile" || trimmed === "doer_threads" || trimmed === "doer_browser") {
     return null;
   }
   return trimmed;

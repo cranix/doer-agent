@@ -6,6 +6,7 @@ import {
 } from "./agent-settings.js";
 import {
   buildCustomMcpConfigArgs,
+  buildBrowserMcpConfigArgs,
   buildDaemonMcpConfigArgs,
   buildMobileMcpConfigArgs,
   buildThreadsMcpConfigArgs,
@@ -165,6 +166,7 @@ async function buildCodexAppServerArgs(args: {
       userId: args.userId,
       workspaceRoot: args.workspaceRoot,
     }),
+    ...buildBrowserMcpConfigArgs(args),
     ...buildCustomMcpConfigArgs(args.settings.mcp.servers),
     ...buildFeatureArg(true, "goals"),
     ...buildFeatureArg(args.settings.codex.computerUseEnabled, "computer_use"),
