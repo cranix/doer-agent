@@ -243,3 +243,32 @@ MCP tool, enter synthetic credentials and an OTP from Doer at mobile width, then
 confirm completion. Verify that tool results contain only request metadata,
 commands sent to Doer contain encrypted envelopes, and the original tab retains
 its authenticated session. Do not record real credentials in test traces.
+
+## npm publishing without local Keychain approval
+
+`.github/workflows/publish.yml` publishes from GitHub-hosted runners using npm
+Trusted Publishing (OIDC). It stores no npm publishing password or long-lived
+publishing token. A release must be explicitly dispatched on `develop` with the
+exact package version and commit SHA. Every release runs the build and all tests,
+including real Chromium tests, before publishing.
+
+One-time npm package setup (requires the owner's npm authentication):
+
+- Package: `doer-agent`
+- Provider: GitHub Actions
+- Organization/user: `cranix`
+- Repository: `doer-agent`
+- Workflow filename: `publish.yml`
+- Allow direct `npm publish` (stage-only permission still requires manual approval)
+
+After connecting the trusted publisher, commit and push the desired release, then:
+
+```sh
+gh workflow run publish.yml --repo cranix/doer-agent --ref develop \
+  -f version="$(node -p 'require("./package.json").version')" \
+  -f commit="$(git rev-parse HEAD)"
+```
+
+Monitor the Actions run and verify the npm version and `gitHead` before reporting
+success. Do not restart the user's running agent as part of package publication.
+See https://docs.npmjs.com/trusted-publishers/ for the npm configuration details.

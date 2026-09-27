@@ -39,5 +39,9 @@
     "playwright-core": "1.58.2",
     "tsx": "^4.22.4",
     "typescript": "^5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cranix/doer-agent.git"
   }
 }
